@@ -5,12 +5,14 @@ import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from compass_collector.browser import BrowserSession, open_browser
 from compass_collector.config import AppConfig, TaskConfig
 from compass_collector.errors import (
     AuthRequiredError,
+    BrowserOperationError,
     CollectorError,
     PublicationError,
     ResponseContractError,
@@ -29,6 +31,8 @@ from compass_collector.product_rank import (
     validate_page_payload,
 )
 from compass_collector.raw_storage import RunStorage
+from compass_collector.retention import cleanup_runtime
+from compass_collector.runtime_logging import LogContext, RuntimeLogger
 
 
 # 所有业务日期和计划时间按北京时区固定。
@@ -155,6 +159,8 @@ def collect_task(
     plan: TaskExecutionPlan,
     config: AppConfig,
     client: ProductRankHttpClient,
+    runtime_logger: RuntimeLogger,
+    batch_id: str,
 ) -> CollectedTaskRun:
     """Collect, parse, and fully validate one task without publishing it."""
 
@@ -166,6 +172,20 @@ def collect_task(
         task_id=plan.task.id,
         business_date=plan.business_date,
         max_items=plan.task.pagination.max_items,
+    )
+    # 任务日志上下文从此处开始同时具备 batch_id、run_id 和 task_id。
+    log_context = LogContext(
+        batch_id=batch_id,
+        run_id=storage.run_id,
+        task_id=plan.task.id,
+    )
+    runtime_logger.emit(
+        level="INFO",
+        event="task_started",
+        message=f"[{plan.task.id}] 开始采集",
+        stage="collection",
+        context=log_context,
+        details={"planned_at": plan.planned_at.isoformat()},
     )
     # 首页成功后固定接口 total，后续分页不允许变化。
     expected_total: int | None = None
@@ -229,9 +249,22 @@ def collect_task(
                 saved_pages=saved_pages,
                 saved_items=saved_items,
             )
-            print(
-                f"[{plan.task.id}] 已保存并解析第 {page_no}/{pagination_plan.target_pages} 页，"
-                f"累计 {saved_items}/{pagination_plan.target_items} 条"
+            runtime_logger.emit(
+                level="INFO",
+                event="page_collected",
+                message=(
+                    f"[{plan.task.id}] 已保存并解析第 "
+                    f"{page_no}/{pagination_plan.target_pages} 页，"
+                    f"累计 {saved_items}/{pagination_plan.target_items} 条"
+                ),
+                stage="collection",
+                context=log_context,
+                details={
+                    "page_no": page_no,
+                    "target_pages": pagination_plan.target_pages,
+                    "saved_items": saved_items,
+                    "target_items": pagination_plan.target_items,
+                },
             )
             if page_no >= pagination_plan.target_pages:
                 break
@@ -240,7 +273,14 @@ def collect_task(
                 config.http.page_interval_seconds.min,
                 config.http.page_interval_seconds.max,
             )
-            print(f"[{plan.task.id}] 等待 {delay_seconds:.2f} 秒后请求下一页")
+            runtime_logger.emit(
+                level="INFO",
+                event="page_interval",
+                message=f"[{plan.task.id}] 等待 {delay_seconds:.2f} 秒后请求下一页",
+                stage="rate_control",
+                context=log_context,
+                details={"delay_seconds": round(delay_seconds, 2)},
+            )
             time.sleep(delay_seconds)
             page_no += 1
         if pagination_plan is None or saved_items != pagination_plan.target_items:
@@ -249,6 +289,14 @@ def collect_task(
                 category="incomplete_collection",
             )
         validate_complete_ranking(entries, target_items=pagination_plan.target_items)
+        runtime_logger.emit(
+            level="INFO",
+            event="ranking_validated",
+            message=f"[{plan.task.id}] 整榜校验通过，共 {len(entries)} 条",
+            stage="validation",
+            context=log_context,
+            details={"target_items": pagination_plan.target_items},
+        )
         # 完成时间在整榜契约通过后记录。
         finished_at = datetime.now(SHANGHAI_TIMEZONE)
         return CollectedTaskRun(
@@ -262,6 +310,14 @@ def collect_task(
         )
     except KeyboardInterrupt:
         storage.mark_interrupted(failed_page=page_no)
+        runtime_logger.emit(
+            level="WARNING",
+            event="task_interrupted",
+            message=f"[{plan.task.id}] 采集被人工中断",
+            stage="collection",
+            context=log_context,
+            details={"page_no": page_no, "error_category": "interrupted"},
+        )
         raise
     except CollectorError as error:
         # HTTP 错误自带当前 body，契约错误使用已解析的当前响应。
@@ -272,15 +328,54 @@ def collect_task(
         failure_status_code = error.status_code
         if failure_status_code is None and isinstance(error, ResponseContractError):
             failure_status_code = current_status_code
-        if failure_body:
-            storage.save_failure_response(
-                status_code=failure_status_code,
-                error_category=error.category,
-                response_body=failure_body,
-            )
+        storage.save_failure_response(
+            status_code=failure_status_code,
+            error_category=error.category,
+            response_body=failure_body,
+            failed_step="http_request_or_contract_validation",
+            exception_type=type(error).__name__,
+            safe_endpoint_path=plan.task.rank.endpoint_path,
+        )
         storage.mark_failed(failed_page=page_no, error_category=error.category)
-        print(f"[{plan.task.id}] 采集失败，category={error.category}")
+        runtime_logger.emit(
+            level="ERROR",
+            event="task_collection_failed",
+            message=f"[{plan.task.id}] 采集失败，category={error.category}",
+            stage="collection",
+            context=log_context,
+            details={
+                "page_no": page_no,
+                "status_code": failure_status_code,
+                "error_category": error.category,
+                "artifact_path": str(storage.artifact_dir),
+            },
+        )
         raise TaskCollectionError(error, storage) from error
+    except Exception as error:
+        # 未预期错误仅落稳定分类和异常类型，不保存异常文本。
+        safe_error = CollectorError(
+            "Unexpected collection failure",
+            category="internal_error",
+        )
+        storage.save_runtime_failure(
+            error_category=safe_error.category,
+            failed_step="collection_internal",
+            exception_type=type(error).__name__,
+        )
+        storage.mark_failed(failed_page=page_no, error_category=safe_error.category)
+        runtime_logger.emit(
+            level="ERROR",
+            event="task_internal_failed",
+            message=f"[{plan.task.id}] 采集内部失败，category=internal_error",
+            stage="collection",
+            context=log_context,
+            details={
+                "page_no": page_no,
+                "error_category": safe_error.category,
+                "artifact_path": str(storage.artifact_dir),
+            },
+        )
+        raise TaskCollectionError(safe_error, storage) from error
 
 
 def record_missing_auth(task: TaskConfig, business_date: date) -> RunStorage:
@@ -293,7 +388,37 @@ def record_missing_auth(task: TaskConfig, business_date: date) -> RunStorage:
         business_date=business_date,
         max_items=task.pagination.max_items,
     )
+    storage.save_runtime_failure(
+        error_category="auth_required",
+        failed_step="read_authentication",
+        exception_type="AuthRequiredError",
+    )
     storage.mark_failed(failed_page=1, error_category="auth_required")
+    return storage
+
+
+def record_browser_failure(
+    plan: TaskExecutionPlan,
+    error: BrowserOperationError,
+) -> RunStorage:
+    """Persist one browser failure using only the error's safe diagnostic fields."""
+
+    # 浏览器失败也创建独立 run_id，便于数据库、日志与材料互相定位。
+    storage = RunStorage(
+        runtime_root=RUNTIME_ROOT,
+        task_id=plan.task.id,
+        business_date=plan.business_date,
+        max_items=plan.task.pagination.max_items,
+    )
+    storage.save_browser_failure(
+        error_category=error.category,
+        failed_step=error.failed_step,
+        exception_type=error.exception_type,
+        safe_page_path=error.safe_page_path,
+        page_title=error.page_title,
+        screenshot=error.screenshot,
+    )
+    storage.mark_failed(failed_page=1, error_category=error.category)
     return storage
 
 
@@ -308,6 +433,23 @@ def run_collection(
 
     # 任务选择在任何数据库或浏览器操作前完成。
     selected_tasks = select_tasks(config, selected_task_id)
+    # 每次 CLI run 使用独立批次 ID 串联 JSONL 日志。
+    execution_batch_id = uuid4().hex
+    # JSONL 日志按北京时间自然日自动选择文件。
+    runtime_logger = RuntimeLogger(RUNTIME_ROOT / "logs")
+    # 保留清理在新运行材料创建前执行，且不触碰数据库、CSV 和 Profile。
+    cleanup_summary = cleanup_runtime(RUNTIME_ROOT, config.retention)
+    runtime_logger.emit(
+        level="WARNING" if cleanup_summary.failures else "INFO",
+        event="retention_cleanup_finished",
+        message=(
+            "运行时保留清理完成"
+            if not cleanup_summary.failures
+            else "运行时保留清理完成，但有项目删除失败"
+        ),
+        stage="retention",
+        details={"cleanup_counts": cleanup_summary.as_log_details()},
+    )
     # dry-run 不读写正式数据库。
     database: Database | None = None
     if not dry_run:
@@ -322,7 +464,12 @@ def run_collection(
             dry_run=dry_run,
         )
         if not task_plans:
-            print("没有需要采集的任务")
+            runtime_logger.emit(
+                level="INFO",
+                event="batch_skipped",
+                message="没有需要采集的任务",
+                stage="planning",
+            )
             return 0
         # 手动 run 的 Chrome 在本次命令中统一复用。
         browser_session: BrowserSession | None = None
@@ -334,7 +481,13 @@ def run_collection(
             browser_session = open_browser(config.browser)
             # 运行时仅读取白名单内且对目标 API 适用的 Cookie。
             cookies = browser_session.whitelisted_cookies(config.auth.cookie_names)
-            print(f"已从当前 Profile 读取 {len(cookies)} 个白名单 Cookie")
+            runtime_logger.emit(
+                level="INFO",
+                event="authentication_loaded",
+                message=f"已从当前 Profile 读取 {len(cookies)} 项白名单认证状态",
+                stage="authentication",
+                details={"authentication_item_count": len(cookies)},
+            )
             if not cookies:
                 # 鉴权缺失阻断整个手动批次。
                 first_plan = task_plans[0]
@@ -345,7 +498,23 @@ def run_collection(
                         planned_at=first_plan.planned_at,
                         error_category="auth_required",
                     )
-                print("未找到可用的白名单 Cookie，请先在当前 Chrome 中登录")
+                # 缺失登录态的任务日志具备完整三元上下文。
+                auth_log_context = LogContext(
+                    batch_id=execution_batch_id,
+                    run_id=storage.run_id,
+                    task_id=first_plan.task.id,
+                )
+                runtime_logger.emit(
+                    level="ERROR",
+                    event="authentication_required",
+                    message="未找到可用的白名单 Cookie，请先在当前 Chrome 中登录",
+                    stage="authentication",
+                    context=auth_log_context,
+                    details={
+                        "error_category": "auth_required",
+                        "artifact_path": str(storage.artifact_dir),
+                    },
+                )
                 has_failures = True
             else:
                 # User-Agent 从当前正式版 Chrome 动态读取。
@@ -355,7 +524,13 @@ def run_collection(
                 csv_exporter = CsvExporter(RUNTIME_ROOT / "exports")
                 for plan in task_plans:
                     try:
-                        collected_run = collect_task(plan, config, http_client)
+                        collected_run = collect_task(
+                            plan,
+                            config,
+                            http_client,
+                            runtime_logger,
+                            execution_batch_id,
+                        )
                     except TaskCollectionError as task_error:
                         has_failures = True
                         if database is not None:
@@ -365,14 +540,39 @@ def run_collection(
                                 error_category=task_error.cause.category,
                             )
                         if isinstance(task_error.cause, AuthRequiredError):
-                            print("登录态失效，本次手动运行停止后续任务")
+                            runtime_logger.emit(
+                                level="ERROR",
+                                event="authentication_expired",
+                                message="登录态失效，本次手动运行停止后续任务",
+                                stage="authentication",
+                                context=LogContext(
+                                    batch_id=execution_batch_id,
+                                    run_id=task_error.storage.run_id,
+                                    task_id=plan.task.id,
+                                ),
+                                details={"error_category": "auth_required"},
+                            )
                             break
                         continue
                     if dry_run:
                         collected_run.storage.mark_success()
-                        print(
-                            f"[{plan.task.id}] dry-run 通过，"
-                            f"已校验 {len(collected_run.entries)} 条，未写入 SQLite/CSV"
+                        runtime_logger.emit(
+                            level="INFO",
+                            event="dry_run_succeeded",
+                            message=(
+                                f"[{plan.task.id}] dry-run 通过，"
+                                f"已校验 {len(collected_run.entries)} 条，未写入 SQLite/CSV"
+                            ),
+                            stage="publication",
+                            context=LogContext(
+                                batch_id=execution_batch_id,
+                                run_id=collected_run.storage.run_id,
+                                task_id=plan.task.id,
+                            ),
+                            details={
+                                "dry_run": True,
+                                "target_items": len(collected_run.entries),
+                            },
                         )
                         continue
                     if database is None:
@@ -403,21 +603,83 @@ def run_collection(
                             planned_at=plan.planned_at,
                             error_category=error.category,
                         )
-                        print(f"[{plan.task.id}] 发布失败，category={error.category}")
+                        runtime_logger.emit(
+                            level="ERROR",
+                            event="publication_failed",
+                            message=f"[{plan.task.id}] 发布失败，category={error.category}",
+                            stage="publication",
+                            context=LogContext(
+                                batch_id=execution_batch_id,
+                                run_id=collected_run.storage.run_id,
+                                task_id=plan.task.id,
+                            ),
+                            details={
+                                "error_category": error.category,
+                                "artifact_path": str(collected_run.storage.artifact_dir),
+                            },
+                        )
                         has_failures = True
                         continue
                     collected_run.storage.mark_success()
-                    print(
-                        f"[{plan.task.id}] 已发布 v{published_batch.version}，"
-                        f"CSV={published_batch.csv_path}"
+                    runtime_logger.emit(
+                        level="INFO",
+                        event="publication_succeeded",
+                        message=(
+                            f"[{plan.task.id}] 已发布 v{published_batch.version}，"
+                            f"CSV={published_batch.csv_path}"
+                        ),
+                        stage="publication",
+                        context=LogContext(
+                            batch_id=execution_batch_id,
+                            run_id=collected_run.storage.run_id,
+                            task_id=plan.task.id,
+                        ),
+                        details={
+                            "version": published_batch.version,
+                            "csv_path": str(published_batch.csv_path),
+                        },
                     )
-            if config.browser.keep_open_after_manual_run:
+            if config.browser.keep_open_after_manual_run and browser_session is not None:
                 browser_session.wait_for_manual_exit(
                     "采集流程已结束。完成调试检查后，按 Enter 关闭浏览器\n"
                 )
+        except BrowserOperationError as error:
+            # 浏览器错误只记录内部步骤和异常类型，不输出底层异常文本。
+            failed_plan = task_plans[0]
+            storage = record_browser_failure(failed_plan, error)
+            if database is not None:
+                database.record_failed_run(
+                    storage,
+                    planned_at=failed_plan.planned_at,
+                    error_category=error.category,
+                )
+            has_failures = True
+            runtime_logger.emit(
+                level="ERROR",
+                event="browser_operation_failed",
+                message=(
+                    f"[{failed_plan.task.id}] 浏览器操作失败，"
+                    f"category={error.category}"
+                ),
+                stage="browser",
+                context=LogContext(
+                    batch_id=execution_batch_id,
+                    run_id=storage.run_id,
+                    task_id=failed_plan.task.id,
+                ),
+                details={
+                    "error_category": error.category,
+                    "artifact_path": str(storage.artifact_dir),
+                },
+            )
         except KeyboardInterrupt:
             has_failures = True
-            print("\n已中断手动运行")
+            runtime_logger.emit(
+                level="WARNING",
+                event="batch_interrupted",
+                message="已中断手动运行",
+                stage="manual_debug",
+            )
         finally:
             if http_client is not None:
                 http_client.close()

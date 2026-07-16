@@ -7,6 +7,7 @@ from typing import Any
 from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwright
 
 from compass_collector.config import BrowserConfig
+from compass_collector.errors import BrowserOperationError
 
 
 # 固定安全页面不包含追踪、签名或账号参数。
@@ -15,6 +16,37 @@ SAFE_RANKING_PAGE_URL = "https://compass.jinritemai.com/shop/chance/rank-product
 COMPASS_API_COOKIE_SCOPE = (
     "https://compass.jinritemai.com/compass_api/shop/product/product_rank/market_hot_sale"
 )
+# 诊断材料只记录固定安全入口的路径，不保存完整 URL。
+SAFE_RANKING_PAGE_PATH = "/shop/chance/rank-product"
+
+
+def build_page_error(
+    page: Page,
+    error: Exception,
+    *,
+    failed_step: str,
+) -> BrowserOperationError:
+    """Capture best-effort safe page metadata without exception text."""
+
+    try:
+        # 截图以字节形式返回，由 RunStorage 原子落盘。
+        screenshot = page.screenshot(type="png")
+    except Exception:
+        screenshot = None
+    try:
+        # 页面标题只作为可见诊断摘要并在错误类型中限长。
+        page_title = page.title()
+    except Exception:
+        page_title = None
+    return BrowserOperationError(
+        "Chrome page operation failed",
+        category="browser_page_error",
+        failed_step=failed_step,
+        exception_type=type(error).__name__,
+        safe_page_path=SAFE_RANKING_PAGE_PATH,
+        page_title=page_title,
+        screenshot=screenshot,
+    )
 
 
 @dataclass(slots=True)
@@ -28,8 +60,10 @@ class BrowserSession:
     def close(self) -> None:
         """Close the persistent context and then stop Playwright."""
 
-        self.context.close()
-        self.playwright.stop()
+        try:
+            self.context.close()
+        finally:
+            self.playwright.stop()
 
     def wait_for_manual_exit(self, message: str) -> None:
         """Keep Chrome visible until the developer explicitly finishes debugging."""
@@ -40,7 +74,13 @@ class BrowserSession:
         """Read the actual Chrome user agent instead of hard-coding a version."""
 
         # 页面返回的 User-Agent 不包含 Cookie 或 Token。
-        user_agent_value = self.page.evaluate("() => navigator.userAgent")
+        try:
+            # 页面表达式固定且不读取 Cookie 或本地存储。
+            user_agent_value = self.page.evaluate("() => navigator.userAgent")
+        except Exception as error:
+            raise build_page_error(
+                self.page, error, failed_step="read_user_agent"
+            ) from error
         if not isinstance(user_agent_value, str) or not user_agent_value:
             raise RuntimeError("Chrome returned an invalid user agent")
         return user_agent_value
@@ -51,7 +91,13 @@ class BrowserSession:
         # 名称集合用于快速过滤，不包含任何 Cookie 值。
         allowed_names = set(cookie_names)
         # Playwright 只返回对目标源实际适用的 Cookie。
-        applicable_cookies = self.context.cookies([COMPASS_API_COOKIE_SCOPE])
+        try:
+            # Cookie 值只返回给内存中的 httpx 客户端。
+            applicable_cookies = self.context.cookies([COMPASS_API_COOKIE_SCOPE])
+        except Exception as error:
+            raise build_page_error(
+                self.page, error, failed_step="read_authentication"
+            ) from error
         return [cookie for cookie in applicable_cookies if cookie["name"] in allowed_names]
 
 
@@ -72,10 +118,27 @@ def open_browser(config: BrowserConfig) -> BrowserSession:
             locale=config.locale,
             timezone_id=config.timezone_id,
         )
-    except Exception:
+    except Exception as error:
         playwright.stop()
-        raise
+        raise BrowserOperationError(
+            "Chrome could not start",
+            category="browser_launch_error",
+            failed_step="launch_browser",
+            exception_type=type(error).__name__,
+        ) from error
     # 复用 Chrome 自动创建的首个页面，没有时才新建。
     page = context.pages[0] if context.pages else context.new_page()
-    page.goto(SAFE_RANKING_PAGE_URL, wait_until="domcontentloaded")
+    try:
+        # 页面导航只访问已确认的固定安全入口。
+        page.goto(SAFE_RANKING_PAGE_URL, wait_until="domcontentloaded")
+    except Exception as error:
+        # 导航失败时尽量先捕获页面，再释放浏览器资源。
+        page_error = build_page_error(page, error, failed_step="open_safe_page")
+        try:
+            context.close()
+        except Exception:
+            # 诊断阶段的关闭错误不能覆盖原始安全页面错误。
+            pass
+        playwright.stop()
+        raise page_error from error
     return BrowserSession(playwright=playwright, context=context, page=page)

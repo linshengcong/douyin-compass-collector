@@ -45,6 +45,35 @@ class PublicationError(CollectorError):
     """Signal a database or CSV publication failure without leaking row data."""
 
 
+class BrowserOperationError(CollectorError):
+    """Carry a safe browser failure snapshot without retaining exception text."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str,
+        failed_step: str,
+        exception_type: str,
+        safe_page_path: str | None = None,
+        page_title: str | None = None,
+        screenshot: bytes | None = None,
+    ) -> None:
+        """Store only page metadata approved for failure.json and failure.png."""
+
+        super().__init__(message, category=category)
+        # 失败步骤使用内部稳定名称，不保存 Playwright 调用参数。
+        self.failed_step = failed_step
+        # 异常类型不包含可能携带 URL 的异常文本。
+        self.exception_type = exception_type
+        # 页面路径固定为已批准的安全入口路径。
+        self.safe_page_path = safe_page_path
+        # 页面标题来自可见页面并限制长度。
+        self.page_title = page_title[:200] if page_title else None
+        # 截图仅在页面已经创建且捕获成功时存在。
+        self.screenshot = screenshot
+
+
 class TaskCollectionError(Exception):
     """Carry a failed run's local storage to the orchestration boundary."""
 

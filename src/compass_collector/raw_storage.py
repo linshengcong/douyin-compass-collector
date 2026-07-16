@@ -164,26 +164,88 @@ class RunStorage:
         *,
         status_code: int | None,
         error_category: str,
-        response_body: bytes,
+        response_body: bytes | None,
+        failed_step: str = "http_request",
+        exception_type: str = "CollectorError",
+        safe_endpoint_path: str | None = None,
     ) -> None:
         """Save a bounded response body and a separate non-sensitive index."""
 
         # 截断标记让开发者知道本地材料不是完整 body。
-        body_was_truncated = len(response_body) > MAX_FAILURE_BODY_BYTES
+        body_was_truncated = (
+            response_body is not None and len(response_body) > MAX_FAILURE_BODY_BYTES
+        )
         # 留档 body 最多 1 MiB，避免异常 HTML 或大响应占满磁盘。
-        bounded_body = response_body[:MAX_FAILURE_BODY_BYTES]
+        bounded_body = (
+            response_body[:MAX_FAILURE_BODY_BYTES] if response_body is not None else None
+        )
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
-        # 失败正文不进入日志或 Manifest。
-        response_path = self.artifact_dir / "failure-response.txt"
-        self._write_bytes_atomic(response_path, bounded_body)
+        if bounded_body is not None:
+            # 只有实际收到响应正文时才创建 failure-response.txt。
+            response_path = self.artifact_dir / "failure-response.txt"
+            self._write_bytes_atomic(response_path, bounded_body)
         # 诊断索引只记录安全分类、状态码和大小摘要。
         failure_summary = {
             "run_id": self.run_id,
             "task_id": self.task_id,
             "status_code": status_code,
             "error_category": error_category,
-            "saved_bytes": len(bounded_body),
+            "failed_step": failed_step,
+            "exception_type": exception_type,
+            "safe_endpoint_path": safe_endpoint_path,
+            "response_saved": bounded_body is not None,
+            "saved_bytes": len(bounded_body) if bounded_body is not None else 0,
             "truncated": body_was_truncated,
+            "captured_at": current_time_iso(),
+        }
+        self._write_json_atomic(self.artifact_dir / "failure.json", failure_summary)
+
+    def save_runtime_failure(
+        self,
+        *,
+        error_category: str,
+        failed_step: str,
+        exception_type: str,
+    ) -> None:
+        """Save a generic safe diagnostic when no page or HTTP response exists."""
+
+        # 运行级错误只保留稳定分类和内部步骤。
+        failure_summary = {
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "error_category": error_category,
+            "failed_step": failed_step,
+            "exception_type": exception_type,
+            "captured_at": current_time_iso(),
+        }
+        self._write_json_atomic(self.artifact_dir / "failure.json", failure_summary)
+
+    def save_browser_failure(
+        self,
+        *,
+        error_category: str,
+        failed_step: str,
+        exception_type: str,
+        safe_page_path: str | None,
+        page_title: str | None,
+        screenshot: bytes | None,
+    ) -> None:
+        """Save a safe page diagnostic and an optional atomically published PNG."""
+
+        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        if screenshot is not None:
+            # Playwright 已在内存中完成 PNG 编码，存储层只负责原子发布。
+            self._write_bytes_atomic(self.artifact_dir / "failure.png", screenshot)
+        # 页面诊断不保存异常原文、完整 URL、HTML 或 Trace。
+        failure_summary = {
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "error_category": error_category,
+            "failed_step": failed_step,
+            "exception_type": exception_type,
+            "safe_page_path": safe_page_path,
+            "page_title": page_title,
+            "screenshot_saved": screenshot is not None,
             "captured_at": current_time_iso(),
         }
         self._write_json_atomic(self.artifact_dir / "failure.json", failure_summary)
