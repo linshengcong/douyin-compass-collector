@@ -1,6 +1,9 @@
 """Safe console and daily JSON Lines logging for collector runs."""
 
 import json
+import os
+from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +17,7 @@ SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 SAFE_DETAIL_FIELDS = {
     "artifact_path",
     "authentication_item_count",
+    "batch_status",
     "cleanup_counts",
     "csv_path",
     "delay_seconds",
@@ -37,6 +41,12 @@ FORBIDDEN_TEXT_MARKERS = (
     "verifyfp",
     "verify_fp",
 )
+# GUI Scheduler 子进程使用固定前缀传输同一份安全事件。
+EVENT_STREAM_PREFIX = "@@COMPASS_EVENT@@"
+# 环境变量只切换控制台编码方式，不改变持久化 JSONL。
+EVENT_STREAM_ENV = "COMPASS_EVENT_STREAM"
+# 安全事件订阅者只能收到完成字段审查后的 payload 副本。
+EventSink = Callable[[dict[str, Any]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,20 +56,22 @@ class LogContext:
     # 执行批次 ID 与数据库自增主键解耦，启动时即可用于串联日志。
     batch_id: str
     # 每次任务尝试的 run_id 与原始响应目录一致。
-    run_id: str
+    run_id: str | None = None
     # 任务 ID 用于多任务运行时过滤日志。
-    task_id: str
+    task_id: str | None = None
 
 
 class RuntimeLogger:
     """Append safe structured events to one Beijing-date JSONL file."""
 
-    def __init__(self, log_directory: Path) -> None:
+    def __init__(self, log_directory: Path, event_sink: EventSink | None = None) -> None:
         """Create the daily log directory without opening a long-lived handle."""
 
         # 日志目录在第一次事件写入前创建。
         self.log_directory = log_directory
         self.log_directory.mkdir(parents=True, exist_ok=True)
+        # event_sink 用于当前进程 GUI 实时展示，不拥有第二套日志。
+        self.event_sink = event_sink
 
     def _log_path(self, captured_at: datetime) -> Path:
         """Return the natural daily-rotation path for one event timestamp."""
@@ -117,4 +129,43 @@ class RuntimeLogger:
         with log_path.open("a", encoding="utf-8") as file_handle:
             file_handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
             file_handle.write("\n")
-        print(message)
+        if self.event_sink is not None:
+            # 回调收到副本，避免订阅者意外修改后续控制台输出。
+            self.event_sink(dict(payload))
+        if os.environ.get(EVENT_STREAM_ENV) == "1":
+            # GUI 子进程只输出带前缀的安全 JSON，避免消息重复展示。
+            print(
+                EVENT_STREAM_PREFIX
+                + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                flush=True,
+            )
+        else:
+            print(message)
+
+
+def read_latest_batch_events(log_directory: Path, limit: int = 500) -> list[dict[str, Any]]:
+    """Read at most one latest batch of persisted safe JSONL events."""
+
+    if limit <= 0 or not log_directory.exists():
+        return []
+    # 保留窗口内文件按日期排序后顺序读取，最终定位最新批次。
+    all_events: deque[dict[str, Any]] = deque()
+    for log_path in sorted(log_directory.glob("*.jsonl")):
+        # 单行损坏不应阻止 GUI 查看其他已落盘安全事件。
+        for line in log_path.read_text(encoding="utf-8").splitlines():
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                continue
+            if isinstance(event, dict):
+                all_events.append(event)
+    # 从最新事件向前查找最后一个真实采集批次 ID。
+    latest_batch_id = next(
+        (event.get("batch_id") for event in reversed(all_events) if event.get("batch_id")),
+        None,
+    )
+    if latest_batch_id is None:
+        return list(all_events)[-limit:]
+    # 只恢复最近批次，系统级 Scheduler 日志由实时通道继续追加。
+    batch_events = [event for event in all_events if event.get("batch_id") == latest_batch_id]
+    return batch_events[-limit:]

@@ -7,7 +7,8 @@ PYTHON := $(UV) run --frozen python
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install login run dry-run force status scheduler test check \
+.PHONY: help install login app run dry-run force run-cli dry-run-cli force-cli \
+	notify-test status scheduler test check \
 	launchd-check launchd-install launchd-status launchd-uninstall
 
 help: ## 显示所有快捷命令
@@ -19,14 +20,29 @@ install: ## 按 uv.lock 安装依赖
 login: ## 打开独立 Chrome，人工登录
 	$(PYTHON) -m compass_collector login
 
-run: ## 正式采集并发布 SQLite/CSV
+app: ## 打开空闲 PySide6 采集控制台
+	$(PYTHON) -m compass_collector app --task $(TASK)
+
+run: ## 打开 GUI 并立即正式采集
 	$(PYTHON) -m compass_collector run --task $(TASK)
 
-dry-run: ## 真实采集和校验，但不发布 SQLite/CSV
+dry-run: ## 打开 GUI 并立即试运行，不发布 SQLite/CSV
 	$(PYTHON) -m compass_collector run --task $(TASK) --dry-run
 
-force: ## 强制创建同一计划时间的新版本
+force: ## 打开 GUI，确认后强制创建新版本
 	$(PYTHON) -m compass_collector run --task $(TASK) --force
+
+run-cli: ## 终端正式采集，不启动 GUI
+	$(PYTHON) -m compass_collector run --task $(TASK) --no-gui
+
+dry-run-cli: ## 终端试运行，不启动 GUI
+	$(PYTHON) -m compass_collector run --task $(TASK) --dry-run --no-gui
+
+force-cli: ## 终端强制采集，不启动 GUI
+	$(PYTHON) -m compass_collector run --task $(TASK) --force --no-gui
+
+notify-test: ## 真实发送一条钉钉配置测试消息
+	$(PYTHON) -m compass_collector notify-test
 
 status: ## 查看最近运行状态
 	$(PYTHON) -m compass_collector status

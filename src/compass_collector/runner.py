@@ -13,6 +13,7 @@ from compass_collector.config import AppConfig, TaskConfig
 from compass_collector.errors import (
     AuthRequiredError,
     BrowserOperationError,
+    CollectionInterruptedError,
     CollectorError,
     PublicationError,
     ResponseContractError,
@@ -21,6 +22,14 @@ from compass_collector.errors import (
 from compass_collector.exporter import CsvExporter
 from compass_collector.http_client import ProductRankHttpClient
 from compass_collector.models import CollectedTaskRun, ProductRankEntry, RawPageRecord
+from compass_collector.notifier import (
+    BatchMode,
+    BatchNotificationSummary,
+    BatchSource,
+    TaskNotificationResult,
+    TaskNotificationStatus,
+    deliver_batch_notification,
+)
 from compass_collector.persistence import Database, upgrade_database
 from compass_collector.product_rank import (
     PaginationPlan,
@@ -32,6 +41,8 @@ from compass_collector.product_rank import (
 )
 from compass_collector.raw_storage import RunStorage
 from compass_collector.retention import cleanup_runtime
+from compass_collector.run_control import CollectionControl
+from compass_collector.runtime_locks import ProcessLock, RuntimeLockBusy
 from compass_collector.runtime_logging import LogContext, RuntimeLogger
 
 
@@ -39,6 +50,8 @@ from compass_collector.runtime_logging import LogContext, RuntimeLogger
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 # 运行时文件统一位于仓库 runtime 目录下。
 RUNTIME_ROOT = Path("runtime")
+# Chrome Profile、登录态读取和采集共用同一执行锁。
+COLLECTION_LOCK_NAME = "collection.lock"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +62,31 @@ class TaskExecutionPlan:
     business_date: date
     planned_at: datetime
     version: int
+
+
+def build_task_notification_result(
+    task: TaskConfig,
+    status: TaskNotificationStatus,
+    *,
+    storage: RunStorage | None = None,
+    csv_path: Path | None = None,
+    error_category: str | None = None,
+) -> TaskNotificationResult:
+    """Build one external-safe task result from config and Manifest counters."""
+
+    # Manifest 只包含已审查计数，不读取原始响应或失败正文。
+    manifest = storage.manifest if storage is not None else {}
+    # 对外只发送 CSV 文件名，绝不发送本机目录。
+    csv_filename = csv_path.name if csv_path is not None else None
+    return TaskNotificationResult(
+        task_id=task.id,
+        display_name=task.display_name,
+        status=status,
+        saved_pages=int(manifest.get("saved_pages") or 0),
+        saved_items=int(manifest.get("saved_items") or 0),
+        csv_filename=csv_filename,
+        error_category=error_category,
+    )
 
 
 def select_tasks(config: AppConfig, selected_task_id: str | None) -> list[TaskConfig]:
@@ -159,14 +197,17 @@ def prepare_task_plans(
 def run_login(config: AppConfig) -> int:
     """Open the persistent profile for manual login and close on Enter."""
 
-    # 登录命令仅管理 Chrome，不创建 HTTP 客户端或数据库。
-    browser_session = open_browser(config.browser)
-    try:
-        browser_session.wait_for_manual_exit(
-            "Chrome 已打开。完成登录和检查后，按 Enter 关闭浏览器\n"
-        )
-    finally:
-        browser_session.close()
+    # 登录与采集不能同时打开同一个持久化 Chrome Profile。
+    login_lock = ProcessLock(RUNTIME_ROOT / "locks" / COLLECTION_LOCK_NAME, "collection")
+    with login_lock:
+        # 登录命令仅管理 Chrome，不创建 HTTP 客户端或数据库。
+        browser_session = open_browser(config.browser)
+        try:
+            browser_session.wait_for_manual_exit(
+                "Chrome 已打开。完成登录和检查后，按 Enter 关闭浏览器\n"
+            )
+        finally:
+            browser_session.close()
     return 0
 
 
@@ -176,6 +217,7 @@ def collect_task(
     client: ProductRankHttpClient,
     runtime_logger: RuntimeLogger,
     batch_id: str,
+    control: CollectionControl | None = None,
 ) -> CollectedTaskRun:
     """Collect, parse, and fully validate one task without publishing it."""
 
@@ -219,10 +261,20 @@ def collect_task(
     raw_pages: list[RawPageRecord] = []
     try:
         while pagination_plan is None or page_no <= pagination_plan.target_pages:
+            if control is not None and control.stop_requested():
+                raise CollectionInterruptedError(
+                    "Collection interrupted by developer",
+                    category="interrupted",
+                )
             # 请求参数只包含已确认的业务字段。
             params = build_request_params(plan.task, plan.business_date, page_no)
             # 当前页不做任何自动重试。
             page_response = client.get_page(plan.task, params)
+            if control is not None and control.stop_requested():
+                raise CollectionInterruptedError(
+                    "Collection interrupted after current request",
+                    category="interrupted",
+                )
             current_response_body = page_response.body
             current_status_code = page_response.status_code
             # 响应在写入 gzip 前完成分页契约校验。
@@ -296,7 +348,13 @@ def collect_task(
                 context=log_context,
                 details={"delay_seconds": round(delay_seconds, 2)},
             )
-            time.sleep(delay_seconds)
+            if control is None:
+                time.sleep(delay_seconds)
+            elif control.wait_for_delay(delay_seconds):
+                raise CollectionInterruptedError(
+                    "Collection interrupted during page interval",
+                    category="interrupted",
+                )
             page_no += 1
         if pagination_plan is None or saved_items != pagination_plan.target_items:
             raise ResponseContractError(
@@ -323,7 +381,7 @@ def collect_task(
             entries=tuple(entries),
             raw_pages=tuple(raw_pages),
         )
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, CollectionInterruptedError) as error:
         storage.mark_interrupted(failed_page=page_no)
         runtime_logger.emit(
             level="WARNING",
@@ -333,7 +391,16 @@ def collect_task(
             context=log_context,
             details={"page_no": page_no, "error_category": "interrupted"},
         )
-        raise
+        # Ctrl-C 与 GUI 中止统一转换为可汇总的 interrupted 任务终态。
+        interrupted_error = (
+            error
+            if isinstance(error, CollectionInterruptedError)
+            else CollectionInterruptedError(
+                "Collection interrupted by developer",
+                category="interrupted",
+            )
+        )
+        raise TaskCollectionError(interrupted_error, storage) from error
     except CollectorError as error:
         # HTTP 错误自带当前 body，契约错误使用已解析的当前响应。
         failure_body = error.response_body
@@ -481,7 +548,7 @@ def record_browser_failure(
     return storage
 
 
-def run_collection(
+def _run_collection_unlocked(
     config: AppConfig,
     selected_task_id: str | None,
     *,
@@ -490,6 +557,8 @@ def run_collection(
     manual: bool = True,
     scheduled_tasks: list[TaskConfig] | None = None,
     planned_at_overrides: dict[str, datetime] | None = None,
+    control: CollectionControl | None = None,
+    run_source: BatchSource = BatchSource.TERMINAL,
 ) -> int:
     """Run selected tasks and optionally publish SQLite plus CSV snapshots."""
 
@@ -501,10 +570,51 @@ def run_collection(
     )
     if not selected_tasks:
         raise ValueError("no scheduled tasks were provided")
+    # 批次开始时间早于清理和规划，用于通知展示完整命令耗时。
+    batch_started_at = datetime.now(SHANGHAI_TIMEZONE)
     # 每次 CLI run 使用独立批次 ID 串联 JSONL 日志。
     execution_batch_id = uuid4().hex
     # JSONL 日志按北京时间自然日自动选择文件。
-    runtime_logger = RuntimeLogger(RUNTIME_ROOT / "logs")
+    runtime_logger = RuntimeLogger(
+        RUNTIME_ROOT / "logs",
+        event_sink=control.event_sink if control is not None else None,
+    )
+    # 每个选中任务先标记 not_started，后续分支只覆盖真实结果。
+    task_results = {
+        task.id: build_task_notification_result(
+            task,
+            TaskNotificationStatus.NOT_STARTED,
+        )
+        for task in selected_tasks
+    }
+    # 当前命令模式在整个批次内保持不变。
+    batch_mode = (
+        BatchMode.DRY_RUN
+        if dry_run
+        else BatchMode.FORCE
+        if force
+        else BatchMode.OFFICIAL
+    )
+    # 防止异常分支和正常分支重复发送同一批次。
+    notification_sent = False
+
+    def send_batch_notification_once() -> None:
+        """Deliver one ordered batch summary without changing collection state."""
+
+        nonlocal notification_sent
+        if notification_sent:
+            return
+        # selected_tasks 顺序是汇总消息的稳定任务顺序。
+        summary = BatchNotificationSummary(
+            batch_id=execution_batch_id,
+            source=run_source,
+            mode=batch_mode,
+            started_at=batch_started_at,
+            finished_at=datetime.now(SHANGHAI_TIMEZONE),
+            tasks=tuple(task_results[task.id] for task in selected_tasks),
+        )
+        deliver_batch_notification(summary, runtime_logger)
+        notification_sent = True
     # 保留清理在新运行材料创建前执行，且不触碰数据库、CSV 和 Profile。
     cleanup_summary = cleanup_runtime(RUNTIME_ROOT, config.retention)
     runtime_logger.emit(
@@ -533,6 +643,14 @@ def run_collection(
             planned_at_overrides=planned_at_overrides,
             skip_any_existing_attempt=not manual,
         )
+        # 未进入计划的人工任务因已有成功终态而幂等跳过。
+        planned_task_ids = {plan.task.id for plan in task_plans}
+        for selected_task in selected_tasks:
+            if selected_task.id not in planned_task_ids:
+                task_results[selected_task.id] = build_task_notification_result(
+                    selected_task,
+                    TaskNotificationStatus.SKIPPED,
+                )
         if not task_plans:
             runtime_logger.emit(
                 level="INFO",
@@ -540,6 +658,9 @@ def run_collection(
                 message="没有需要采集的任务",
                 stage="planning",
             )
+            # 人工显式命令的幂等跳过也发送一次 skipped 汇总。
+            if manual:
+                send_batch_notification_once()
             return 0
         # 手动 run 的 Chrome 在本次命令中统一复用。
         browser_session: BrowserSession | None = None
@@ -566,6 +687,12 @@ def run_collection(
                     runtime_logger=runtime_logger,
                     execution_batch_id=execution_batch_id,
                 )
+                for blocked_plan in task_plans:
+                    task_results[blocked_plan.task.id] = build_task_notification_result(
+                        blocked_plan.task,
+                        TaskNotificationStatus.AUTH_REQUIRED,
+                        error_category="auth_required",
+                    )
                 runtime_logger.emit(
                     level="ERROR",
                     event="authentication_batch_blocked",
@@ -587,6 +714,7 @@ def run_collection(
                             http_client,
                             runtime_logger,
                             execution_batch_id,
+                            control,
                         )
                     except TaskCollectionError as task_error:
                         has_failures = True
@@ -596,7 +724,33 @@ def run_collection(
                                 planned_at=plan.planned_at,
                                 error_category=task_error.cause.category,
                             )
+                        if isinstance(task_error.cause, CollectionInterruptedError):
+                            task_results[plan.task.id] = build_task_notification_result(
+                                plan.task,
+                                TaskNotificationStatus.INTERRUPTED,
+                                storage=task_error.storage,
+                                error_category="interrupted",
+                            )
+                            runtime_logger.emit(
+                                level="WARNING",
+                                event="batch_interrupted",
+                                message="已中止本次采集，未发布不完整数据",
+                                stage="collection",
+                                context=LogContext(
+                                    batch_id=execution_batch_id,
+                                    run_id=task_error.storage.run_id,
+                                    task_id=plan.task.id,
+                                ),
+                                details={"error_category": "interrupted"},
+                            )
+                            break
                         if isinstance(task_error.cause, AuthRequiredError):
+                            task_results[plan.task.id] = build_task_notification_result(
+                                plan.task,
+                                TaskNotificationStatus.AUTH_REQUIRED,
+                                storage=task_error.storage,
+                                error_category="auth_required",
+                            )
                             runtime_logger.emit(
                                 level="ERROR",
                                 event="authentication_expired",
@@ -609,7 +763,7 @@ def run_collection(
                                 ),
                                 details={"error_category": "auth_required"},
                             )
-                            # 当前任务之后的同批次任务不再请求接口，并写入阻断终态。
+                            # 后续同批次任务不再请求接口，并写入阻断终态。
                             blocked_plans = task_plans[plan_index + 1 :]
                             record_auth_required_plans(
                                 blocked_plans,
@@ -617,10 +771,29 @@ def run_collection(
                                 runtime_logger=runtime_logger,
                                 execution_batch_id=execution_batch_id,
                             )
+                            for blocked_plan in blocked_plans:
+                                task_results[blocked_plan.task.id] = (
+                                    build_task_notification_result(
+                                        blocked_plan.task,
+                                        TaskNotificationStatus.AUTH_REQUIRED,
+                                        error_category="auth_required",
+                                    )
+                                )
                             break
+                        task_results[plan.task.id] = build_task_notification_result(
+                            plan.task,
+                            TaskNotificationStatus.FAILED,
+                            storage=task_error.storage,
+                            error_category=task_error.cause.category,
+                        )
                         continue
                     if dry_run:
                         collected_run.storage.mark_success()
+                        task_results[plan.task.id] = build_task_notification_result(
+                            plan.task,
+                            TaskNotificationStatus.SUCCESS,
+                            storage=collected_run.storage,
+                        )
                         runtime_logger.emit(
                             level="INFO",
                             event="dry_run_succeeded",
@@ -684,8 +857,20 @@ def run_collection(
                             },
                         )
                         has_failures = True
+                        task_results[plan.task.id] = build_task_notification_result(
+                            plan.task,
+                            TaskNotificationStatus.FAILED,
+                            storage=collected_run.storage,
+                            error_category=error.category,
+                        )
                         continue
                     collected_run.storage.mark_success()
+                    task_results[plan.task.id] = build_task_notification_result(
+                        plan.task,
+                        TaskNotificationStatus.SUCCESS,
+                        storage=collected_run.storage,
+                        csv_path=published_batch.csv_path,
+                    )
                     runtime_logger.emit(
                         level="INFO",
                         event="publication_succeeded",
@@ -704,14 +889,25 @@ def run_collection(
                             "csv_path": str(published_batch.csv_path),
                         },
                     )
+            # 通知在任务终态形成后立即发送，不等待人工关闭 Chrome。
+            send_batch_notification_once()
             if (
                 manual
                 and config.browser.keep_open_after_manual_run
                 and browser_session is not None
             ):
-                browser_session.wait_for_manual_exit(
-                    "采集流程已结束。完成调试检查后，按 Enter 关闭浏览器\n"
+                runtime_logger.emit(
+                    level="WARNING" if has_failures else "INFO",
+                    event="manual_inspection_ready",
+                    message="采集流程已结束，Chrome 已保留供调试检查",
+                    stage="manual_debug",
                 )
+                if control is not None and control.keep_browser_open:
+                    control.wait_for_browser_close()
+                else:
+                    browser_session.wait_for_manual_exit(
+                        "采集流程已结束。完成调试检查后，按 Enter 关闭浏览器\n"
+                    )
         except BrowserOperationError as error:
             # 浏览器错误只记录内部步骤和异常类型，不输出底层异常文本。
             failed_plan = task_plans[0]
@@ -723,6 +919,12 @@ def run_collection(
                     error_category=error.category,
                 )
             has_failures = True
+            task_results[failed_plan.task.id] = build_task_notification_result(
+                failed_plan.task,
+                TaskNotificationStatus.FAILED,
+                storage=storage,
+                error_category=error.category,
+            )
             runtime_logger.emit(
                 level="ERROR",
                 event="browser_operation_failed",
@@ -741,14 +943,50 @@ def run_collection(
                     "artifact_path": str(storage.artifact_dir),
                 },
             )
+            send_batch_notification_once()
+            if (
+                manual
+                and config.browser.keep_open_after_manual_run
+                and browser_session is not None
+            ):
+                # 浏览器阶段失败也保留当前页面，便于 GUI 或终端人工检查。
+                runtime_logger.emit(
+                    level="WARNING",
+                    event="manual_inspection_ready",
+                    message="采集流程已结束，Chrome 已保留供调试检查",
+                    stage="manual_debug",
+                )
+                if control is not None and control.keep_browser_open:
+                    control.wait_for_browser_close()
+                else:
+                    browser_session.wait_for_manual_exit(
+                        "采集流程已结束。完成调试检查后，按 Enter 关闭浏览器\n"
+                    )
         except KeyboardInterrupt:
             has_failures = True
+            # 如果 Ctrl-C 发生在任务创建 Manifest 之前，仍为首个未开始任务记录中止。
+            interrupted_task = next(
+                (
+                    task
+                    for task in selected_tasks
+                    if task_results[task.id].status
+                    is TaskNotificationStatus.NOT_STARTED
+                ),
+                None,
+            )
+            if interrupted_task is not None:
+                task_results[interrupted_task.id] = build_task_notification_result(
+                    interrupted_task,
+                    TaskNotificationStatus.INTERRUPTED,
+                    error_category="interrupted",
+                )
             runtime_logger.emit(
                 level="WARNING",
                 event="batch_interrupted",
                 message="已中断手动运行",
                 stage="manual_debug",
             )
+            send_batch_notification_once()
         finally:
             if http_client is not None:
                 http_client.close()
@@ -760,24 +998,126 @@ def run_collection(
             database.close()
 
 
+def run_collection(
+    config: AppConfig,
+    selected_task_id: str | None,
+    *,
+    force: bool,
+    dry_run: bool,
+    manual: bool = True,
+    scheduled_tasks: list[TaskConfig] | None = None,
+    planned_at_overrides: dict[str, datetime] | None = None,
+    control: CollectionControl | None = None,
+    run_source: BatchSource = BatchSource.TERMINAL,
+) -> int:
+    """Run one mutually exclusive Chrome-backed collection operation."""
+
+    # 执行锁覆盖采集和手动 Chrome 检查期，避免 Profile 被第二个进程打开。
+    collection_lock = ProcessLock(
+        RUNTIME_ROOT / "locks" / COLLECTION_LOCK_NAME,
+        "collection",
+    )
+    with collection_lock:
+        return _run_collection_unlocked(
+            config,
+            selected_task_id,
+            force=force,
+            dry_run=dry_run,
+            manual=manual,
+            scheduled_tasks=scheduled_tasks,
+            planned_at_overrides=planned_at_overrides,
+            control=control,
+            run_source=run_source,
+        )
+
+
 def run_scheduled_collection(
     config: AppConfig,
     tasks: list[TaskConfig],
     planned_at: datetime,
+    control: CollectionControl | None = None,
 ) -> int:
     """Execute one due task group without waiting for keyboard input."""
 
     # 同一计划时刻的任务共享覆盖时间，并在一个 Chrome 批次内串行执行。
     planned_at_overrides = {task.id: planned_at for task in tasks}
-    return run_collection(
-        config,
-        selected_task_id=None,
-        force=False,
-        dry_run=False,
-        manual=False,
-        scheduled_tasks=tasks,
-        planned_at_overrides=planned_at_overrides,
-    )
+    try:
+        return run_collection(
+            config,
+            selected_task_id=None,
+            force=False,
+            dry_run=False,
+            manual=False,
+            scheduled_tasks=tasks,
+            planned_at_overrides=planned_at_overrides,
+            control=control,
+            run_source=BatchSource.SCHEDULER,
+        )
+    except RuntimeLockBusy:
+        # 手动调试占用 Chrome 时，本次计划只记终态，不排队或自动重试。
+        upgrade_database(config.database.path)
+        busy_database = Database(config.database.path)
+        busy_logger = RuntimeLogger(
+            RUNTIME_ROOT / "logs",
+            event_sink=control.event_sink if control is not None else None,
+        )
+        # 同一冲突批次使用稳定 batch_id 串联所有任务。
+        busy_batch_id = uuid4().hex
+        # 冲突任务汇总使用同一 recorded_at，确保消息耗时为零附近。
+        busy_recorded_at = datetime.now(SHANGHAI_TIMEZONE)
+        # 只有实际写入 skipped_busy 终态的任务进入本次通知。
+        busy_results: list[TaskNotificationResult] = []
+        try:
+            for task in tasks:
+                # 每个任务仍拥有独立 run_id，便于 status 明确显示 skipped_busy。
+                run_id = busy_database.record_skipped_busy_run(
+                    task_id=task.id,
+                    business_date=planned_at.date(),
+                    planned_at=planned_at,
+                    recorded_at=busy_recorded_at,
+                )
+                if run_id is None:
+                    continue
+                busy_results.append(
+                    build_task_notification_result(
+                        task,
+                        TaskNotificationStatus.SKIPPED_BUSY,
+                        error_category="skipped_busy",
+                    )
+                )
+                busy_logger.emit(
+                    level="WARNING",
+                    event="scheduled_task_skipped_busy",
+                    message=(
+                        f"[{task.id}] Chrome 正被其他任务使用，"
+                        "本次定时采集已跳过"
+                    ),
+                    stage="scheduling",
+                    context=LogContext(
+                        batch_id=busy_batch_id,
+                        run_id=run_id,
+                        task_id=task.id,
+                    ),
+                    details={
+                        "planned_at": planned_at.isoformat(),
+                        "error_category": "skipped_busy",
+                    },
+                )
+        finally:
+            busy_database.close()
+        if busy_results:
+            deliver_batch_notification(
+                BatchNotificationSummary(
+                    batch_id=busy_batch_id,
+                    source=BatchSource.SCHEDULER,
+                    mode=BatchMode.OFFICIAL,
+                    started_at=busy_recorded_at,
+                    finished_at=datetime.now(SHANGHAI_TIMEZONE),
+                    tasks=tuple(busy_results),
+                ),
+                busy_logger,
+            )
+        return 0
 
 
 def run_status(config: AppConfig, limit: int) -> int:

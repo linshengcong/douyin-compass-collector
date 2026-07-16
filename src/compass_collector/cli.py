@@ -6,13 +6,18 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from compass_collector.config import load_config
+from compass_collector.config import AppConfig, load_config
+from compass_collector.notifier import load_project_environment, run_notification_test
 from compass_collector.runner import run_collection, run_login, run_status
+from compass_collector.runtime_locks import RuntimeLockBusy
+from compass_collector.runtime_logging import RuntimeLogger
 from compass_collector.scheduler import run_scheduler
 
 
 # 默认配置路径与工程方案保持一致。
 DEFAULT_CONFIG_PATH = Path("config/tasks.yaml")
+# CLI 级通知测试复用现有安全日志目录。
+RUNTIME_LOG_DIRECTORY = Path("runtime/logs")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,12 +32,21 @@ def build_parser() -> argparse.ArgumentParser:
     login_parser = subparsers.add_parser("login", help="open the persistent Chrome profile")
     login_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
 
-    # run 命令执行全部启用任务或一个指定任务。
+    # app 命令只打开空闲 GUI 控制台，不自动启动采集。
+    app_parser = subparsers.add_parser("app", help="open the idle desktop console")
+    app_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    app_parser.add_argument("--task", dest="task_id")
+
+    # notify-test 显式发送一条真实测试消息，不需要加载业务任务配置。
+    subparsers.add_parser("notify-test", help="send one DingTalk test message")
+
+    # run 命令默认使用 GUI，--no-gui 显式回退终端模式。
     run_parser = subparsers.add_parser(
         "run", help="collect and publish a ranking snapshot"
     )
     run_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     run_parser.add_argument("--task", dest="task_id")
+    run_parser.add_argument("--no-gui", action="store_true")
     # --force 和 --dry-run 语义冲突，同一次命令只允许选择一个。
     run_mode = run_parser.add_mutually_exclusive_group()
     run_mode.add_argument("--force", action="store_true")
@@ -57,23 +71,17 @@ def main() -> None:
     # CLI 参数在任何配置或浏览器操作前解析。
     arguments = build_parser().parse_args()
     try:
-        # 严格配置在启动 Chrome 前完成全量校验。
-        config = load_config(arguments.config)
-        if arguments.command == "login":
-            exit_code = run_login(config)
-        elif arguments.command == "run":
-            exit_code = run_collection(
-                config,
-                arguments.task_id,
-                force=arguments.force,
-                dry_run=arguments.dry_run,
-            )
-        elif arguments.command == "status":
-            if arguments.limit <= 0:
-                raise ValueError("status --limit must be positive")
-            exit_code = run_status(config, arguments.limit)
+        # .env 只补充当前进程缺失值，系统环境变量保持最高优先级。
+        load_project_environment()
+        if arguments.command == "notify-test":
+            exit_code = run_notification_test(RuntimeLogger(RUNTIME_LOG_DIRECTORY))
         else:
-            exit_code = run_scheduler(config)
+            # 严格业务配置在启动 Chrome 前完成全量校验。
+            config = load_config(arguments.config)
+            exit_code = _dispatch_configured_command(arguments, config)
+    except RuntimeLockBusy as error:
+        print(f"启动失败：{error.role} 已被其他进程占用", file=sys.stderr)
+        exit_code = 2
     except (OSError, ValueError, ValidationError) as error:
         print(f"启动失败：{error}", file=sys.stderr)
         exit_code = 2
@@ -82,3 +90,55 @@ def main() -> None:
         print(f"运行失败：{type(error).__name__}", file=sys.stderr)
         exit_code = 1
     raise SystemExit(exit_code)
+
+
+def _dispatch_configured_command(
+    arguments: argparse.Namespace,
+    config: AppConfig,
+) -> int:
+    """Dispatch one command that already has a validated business config."""
+
+    if arguments.command == "login":
+        exit_code = run_login(config)
+    elif arguments.command == "app":
+        # PySide6 延迟导入，status、login 和后台 Scheduler 不初始化 Qt。
+        from compass_collector.gui import GuiLaunchRequest, run_gui
+
+        exit_code = run_gui(
+            config,
+            GuiLaunchRequest(
+                config_path=arguments.config,
+                task_id=arguments.task_id,
+                auto_start=False,
+            ),
+        )
+    elif arguments.command == "run":
+        if arguments.no_gui:
+            exit_code = run_collection(
+                config,
+                arguments.task_id,
+                force=arguments.force,
+                dry_run=arguments.dry_run,
+            )
+        else:
+            # GUI 命令锁定 run/dry-run/force 的启动语义并自动执行。
+            from compass_collector.gui import GuiLaunchRequest, run_gui
+
+            exit_code = run_gui(
+                config,
+                GuiLaunchRequest(
+                    config_path=arguments.config,
+                    task_id=arguments.task_id,
+                    auto_start=True,
+                    dry_run=arguments.dry_run,
+                    force=arguments.force,
+                    lock_mode=True,
+                ),
+            )
+    elif arguments.command == "status":
+        if arguments.limit <= 0:
+            raise ValueError("status --limit must be positive")
+        exit_code = run_status(config, arguments.limit)
+    else:
+        exit_code = run_scheduler(config)
+    return exit_code

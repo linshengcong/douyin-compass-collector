@@ -9,6 +9,8 @@ dependencies = [
   "httpx>=0.28,<0.29",
   "playwright>=1.53,<2",
   "pydantic>=2.11,<3",
+  "pyside6>=6.8,<7",
+  "python-dotenv>=1.1,<2",
   "pyyaml>=6.0,<7",
   "sqlalchemy>=2.0,<3",
 ]

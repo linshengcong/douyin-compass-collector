@@ -41,6 +41,10 @@ class ResponseContractError(CollectorError):
     """Signal a successful JSON response that violates the verified contract."""
 
 
+class CollectionInterruptedError(CollectorError):
+    """Signal a cooperative developer interruption without treating it as a failure."""
+
+
 class PublicationError(CollectorError):
     """Signal a database or CSV publication failure without leaking row data."""
 

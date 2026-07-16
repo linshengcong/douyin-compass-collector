@@ -364,6 +364,49 @@ class Database:
             )
         return run_id
 
+    def record_skipped_busy_run(
+        self,
+        *,
+        task_id: str,
+        business_date: date,
+        planned_at: datetime,
+        recorded_at: datetime,
+    ) -> str | None:
+        """Persist one due task skipped because another process owns Chrome."""
+
+        # 同一计划时间已有任何终态时不重复创建 skipped_busy。
+        stored_planned_at = normalize_datetime(planned_at)
+        # 独立 UUID 让日志、status 和计划时间能够互相定位。
+        run_id = uuid4().hex
+        with self.session_factory.begin() as session:
+            # Scheduler 只允许一个终态代表本次到期任务。
+            existing_run_id = session.scalar(
+                select(CollectionRun.id)
+                .where(
+                    CollectionRun.task_id == task_id,
+                    CollectionRun.planned_at == stored_planned_at,
+                )
+                .limit(1)
+            )
+            if existing_run_id is not None:
+                return None
+            # skipped_busy 不创建浏览器、原始响应或正式批次。
+            stored_recorded_at = normalize_datetime(recorded_at)
+            session.add(
+                CollectionRun(
+                    id=run_id,
+                    batch_id=None,
+                    task_id=task_id,
+                    business_date=business_date,
+                    planned_at=stored_planned_at,
+                    status="skipped_busy",
+                    started_at=stored_recorded_at,
+                    finished_at=stored_recorded_at,
+                    error_category="skipped_busy",
+                )
+            )
+        return run_id
+
     def scheduler_checkpoint(self, task_id: str) -> datetime | None:
         """Read one task's last durable reconciliation time."""
 

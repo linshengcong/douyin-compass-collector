@@ -4,6 +4,9 @@ from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
+import signal
+import time
+from threading import Event, Thread
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -13,8 +16,18 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from compass_collector.config import AppConfig, TaskConfig
+from compass_collector.notifier import (
+    BatchMode,
+    BatchNotificationSummary,
+    BatchSource,
+    TaskNotificationResult,
+    TaskNotificationStatus,
+    deliver_batch_notification,
+)
 from compass_collector.persistence import Database, upgrade_database
 from compass_collector.runner import planned_at_for_task, run_scheduled_collection
+from compass_collector.run_control import CollectionControl
+from compass_collector.runtime_locks import ProcessLock
 from compass_collector.runtime_logging import LogContext, RuntimeLogger
 
 
@@ -22,6 +35,8 @@ from compass_collector.runtime_logging import LogContext, RuntimeLogger
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 # 调度日志复用阶段三按日 JSONL 目录。
 RUNTIME_ROOT = Path("runtime")
+# Scheduler 实例锁与实际采集执行锁相互独立。
+SCHEDULER_LOCK_NAME = "scheduler.lock"
 # 运行回调签名允许测试替换真实浏览器采集。
 ScheduledRunCallback = Callable[[AppConfig, list[TaskConfig], datetime], int]
 
@@ -89,6 +104,8 @@ def mark_missed_tasks(
 
     # 同一 missed 处理使用一个执行批次 ID 串联多任务日志。
     execution_batch_id = uuid4().hex
+    # 只汇总本次真正新建 missed 终态的任务。
+    missed_results: list[TaskNotificationResult] = []
     for task in tasks:
         # 数据库存在任意终态时不会创建重复 missed。
         run_id = database.record_missed_run(
@@ -100,6 +117,14 @@ def mark_missed_tasks(
         )
         if run_id is None:
             continue
+        missed_results.append(
+            TaskNotificationResult(
+                task_id=task.id,
+                display_name=task.display_name,
+                status=TaskNotificationStatus.MISSED,
+                error_category=error_category,
+            )
+        )
         runtime_logger.emit(
             level="WARNING",
             event="scheduled_task_missed",
@@ -117,6 +142,19 @@ def mark_missed_tasks(
                 "planned_at": planned_at.isoformat(),
                 "error_category": error_category,
             },
+        )
+    if missed_results:
+        # 一个计划时刻的 missed 任务只发送一条 Scheduler 汇总。
+        deliver_batch_notification(
+            BatchNotificationSummary(
+                batch_id=execution_batch_id,
+                source=BatchSource.SCHEDULER,
+                mode=BatchMode.OFFICIAL,
+                started_at=recorded_at,
+                finished_at=recorded_at,
+                tasks=tuple(missed_results),
+            ),
+            runtime_logger,
         )
 
 
@@ -170,6 +208,7 @@ def reconcile_scheduler_once(
     *,
     now: datetime | None = None,
     run_callback: ScheduledRunCallback = run_scheduled_collection,
+    runtime_logger: RuntimeLogger | None = None,
 ) -> None:
     """Reconcile downtime occurrences and durably advance every task checkpoint."""
 
@@ -179,7 +218,8 @@ def reconcile_scheduler_once(
     # 一次 reconcile 使用短生命周期数据库连接。
     database = Database(config.database.path)
     # missed 事件写入与采集一致的安全 JSONL。
-    runtime_logger = RuntimeLogger(RUNTIME_ROOT / "logs")
+    # GUI 子进程可复用同一个日志器，默认路径保持既有终端行为。
+    active_logger = runtime_logger or RuntimeLogger(RUNTIME_ROOT / "logs")
     try:
         # 计划时刻映射让相同时间的任务共享一个浏览器批次。
         occurrence_tasks: dict[datetime, list[TaskConfig]] = defaultdict(list)
@@ -204,7 +244,7 @@ def reconcile_scheduler_once(
             handle_occurrence(
                 config,
                 database,
-                runtime_logger,
+                active_logger,
                 occurrence_tasks[planned_at],
                 planned_at,
                 current_time,
@@ -216,13 +256,80 @@ def reconcile_scheduler_once(
         database.close()
 
 
-def run_scheduler(config: AppConfig) -> int:
+def _run_scheduler_unlocked(config: AppConfig) -> int:
     """Run a foreground APScheduler with serial cron jobs and startup reconciliation."""
 
     # Scheduler 生命周期事件写入现有按日 JSONL，而不是另建固定守护日志。
     runtime_logger = RuntimeLogger(RUNTIME_ROOT / "logs")
+    # 终止信号只停止未来调度，正在运行的批次允许安全完成。
+    shutdown_requested = Event()
+    # 当前批次控制器用于 GUI 显式“中止当前采集”。
+    active_control: list[CollectionControl | None] = [None]
+
+    def run_group_with_control(
+        callback_config: AppConfig,
+        callback_tasks: list[TaskConfig],
+        callback_planned_at: datetime,
+    ) -> int:
+        """Execute one scheduled group with a signal-addressable control object."""
+
+        # 每个计划批次使用独立停止信号，不能污染下一次执行。
+        group_control = CollectionControl(keep_browser_open=False)
+        active_control[0] = group_control
+        runtime_logger.emit(
+            level="INFO",
+            event="scheduled_group_started",
+            message="定时采集批次开始",
+            stage="scheduling",
+        )
+        try:
+            return run_scheduled_collection(
+                callback_config,
+                callback_tasks,
+                callback_planned_at,
+                control=group_control,
+            )
+        finally:
+            active_control[0] = None
+            runtime_logger.emit(
+                level="INFO",
+                event="scheduled_group_finished",
+                message="定时采集批次结束",
+                stage="scheduling",
+            )
+
+    def request_graceful_shutdown(signum, frame) -> None:
+        """Record SIGTERM so reconciliation or APScheduler can stop gracefully."""
+
+        shutdown_requested.set()
+
+    def request_active_interruption(signum, frame) -> None:
+        """Forward SIGUSR1 only to the currently running scheduled collection."""
+
+        # Scheduler 空闲时不保留中止信号，避免误伤下一次计划。
+        current_control = active_control[0]
+        if current_control is not None:
+            current_control.request_stop()
+
+    # GUI QProcess terminate 使用 SIGTERM，立即中止使用显式 SIGUSR1。
+    previous_term_handler = signal.signal(signal.SIGTERM, request_graceful_shutdown)
+    previous_interrupt_handler = signal.signal(signal.SIGUSR1, request_active_interruption)
     # 启动时先补齐进程停止期间的到期或 missed 状态。
-    reconcile_scheduler_once(config)
+    reconcile_scheduler_once(
+        config,
+        run_callback=run_group_with_control,
+        runtime_logger=runtime_logger,
+    )
+    if shutdown_requested.is_set():
+        runtime_logger.emit(
+            level="INFO",
+            event="scheduler_stopped",
+            message="Scheduler 已停止",
+            stage="scheduling",
+        )
+        signal.signal(signal.SIGTERM, previous_term_handler)
+        signal.signal(signal.SIGUSR1, previous_interrupt_handler)
+        return 0
     # 单工作线程保证不同 cron 组也不会并发操作同一 Chrome Profile。
     executors = {"default": ThreadPoolExecutor(max_workers=1)}
     # 调度器本身使用配置中已限制的北京时间。
@@ -261,7 +368,7 @@ def run_scheduler(config: AppConfig) -> int:
                     grouped_tasks,
                     planned_at,
                     actual_at,
-                    run_scheduled_collection,
+                    run_group_with_control,
                 )
                 for grouped_task in grouped_tasks:
                     callback_database.set_scheduler_checkpoint(
@@ -315,11 +422,32 @@ def run_scheduler(config: AppConfig) -> int:
         stage="scheduling",
     )
     try:
+        # 轻量线程监听终止标记并调用 APScheduler 的等待式 shutdown。
+        def stop_scheduler_when_requested() -> None:
+            """Wait for SIGTERM and stop future jobs after the active job completes."""
+
+            shutdown_requested.wait()
+            # 信号可能恰好早于 scheduler.start，等待 running 避免丢失停止请求。
+            while not scheduler.running:
+                time.sleep(0.05)
+            scheduler.shutdown(wait=True)
+
+        # APScheduler 启动前创建守护监听线程，不阻止进程自然退出。
+        shutdown_thread = Thread(
+            target=stop_scheduler_when_requested,
+            name="scheduler-graceful-stop",
+            daemon=True,
+        )
+        shutdown_thread.start()
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
         # 前台开发运行通过 Ctrl-C 正常退出，不等待 Enter。
         if scheduler.running:
             scheduler.shutdown(wait=True)
+    finally:
+        # 测试或嵌入调用结束后恢复进程原有信号处理器。
+        signal.signal(signal.SIGTERM, previous_term_handler)
+        signal.signal(signal.SIGUSR1, previous_interrupt_handler)
     runtime_logger.emit(
         level="INFO",
         event="scheduler_stopped",
@@ -327,3 +455,15 @@ def run_scheduler(config: AppConfig) -> int:
         stage="scheduling",
     )
     return 0
+
+
+def run_scheduler(config: AppConfig) -> int:
+    """Run exactly one Scheduler process for this runtime directory."""
+
+    # Scheduler 锁在空闲期持续持有，用于阻止终端、launchd 和 GUI 重复启动。
+    scheduler_lock = ProcessLock(
+        RUNTIME_ROOT / "locks" / SCHEDULER_LOCK_NAME,
+        "scheduler",
+    )
+    with scheduler_lock:
+        return _run_scheduler_unlocked(config)
