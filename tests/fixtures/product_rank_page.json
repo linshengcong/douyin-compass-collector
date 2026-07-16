@@ -1,0 +1,63 @@
+{
+  "st": 0,
+  "msg": "",
+  "data": {
+    "page_result": {
+      "page_no": 1,
+      "page_size": 10,
+      "total": 200
+    },
+    "data_result": [
+      {
+        "new_pay_amt": {"value_range": [{"unit": "price", "value": 1000000000}, {"unit": "price", "value": 2500000000}]},
+        "pay_combo_cnt": {"value_range": [{"unit": "number", "value": 100000}, {"unit": "number", "value": 250000}]},
+        "product_info": {"id": "fixture-product-1", "name": "示例商品1", "rank": 1, "newly_on_ranking": false, "brand_type": 0, "category_id": 0, "second_category_id": 0, "third_category_id": 0, "leaf_category_id": 1000001889, "price_bin": "¥99.9", "shop_list": [{"shop_id": "fixture-shop-1-1", "shop_name": "示例店铺1-1"}]}
+      },
+      {
+        "new_pay_amt": {"value_range": [{"unit": "price", "value": 750000000}, {"unit": "price", "value": 1000000000}]},
+        "pay_combo_cnt": {"value_range": [{"unit": "number", "value": 100000}, {"unit": "number", "value": 250000}]},
+        "product_info": {"id": "fixture-product-2", "name": "示例商品2", "rank": 2, "newly_on_ranking": false, "brand_type": 0, "category_id": 0, "second_category_id": 0, "third_category_id": 0, "leaf_category_id": 1000001955, "price_bin": "¥39.9-¥129.9", "shop_list": [{"shop_id": "fixture-shop-2-1", "shop_name": "示例店铺2-1"}]}
+      },
+      {
+        "new_pay_amt": {"value_range": [{"unit": "price", "value": 750000000}, {"unit": "price", "value": 1000000000}]},
+        "pay_combo_cnt": {"value_range": [{"unit": "number", "value": 75000}, {"unit": "number", "value": 100000}]},
+        "product_info": {"id": "fixture-product-3", "name": "示例商品3", "rank": 3, "newly_on_ranking": false, "brand_type": 0, "category_id": 0, "second_category_id": 0, "third_category_id": 0, "leaf_category_id": 1000001885, "price_bin": "¥99.9", "shop_list": [{"shop_id": "fixture-shop-3-1", "shop_name": "示例店铺3-1"}]}
+      },
+      {
+        "new_pay_amt": {"value_range": [{"unit": "price", "value": 500000000}, {"unit": "price", "value": 750000000}]},
+        "pay_combo_cnt": {"value_range": [{"unit": "number", "value": 100000}, {"unit": "number", "value": 250000}]},
+        "product_info": {"id": "fixture-product-4", "name": "示例商品4", "rank": 4, "newly_on_ranking": false, "brand_type": 0, "category_id": 0, "second_category_id": 0, "third_category_id": 0, "leaf_category_id": 1000001935, "price_bin": "¥39.9", "shop_list": [{"shop_id": "fixture-shop-4-1", "shop_name": "示例店铺4-1"}]}
+      },
+      {
+        "new_pay_amt": {"value_range": [{"unit": "price", "value": 500000000}, {"unit": "price", "value": 750000000}]},
+        "pay_combo_cnt": {"value_range": [{"unit": "number", "value": 75000}, {"unit": "number", "value": 100000}]},
+        "product_info": {"id": "fixture-product-5", "name": "示例商品5", "rank": 5, "newly_on_ranking": false, "brand_type": 0, "category_id": 0, "second_category_id": 0, "third_category_id": 0, "leaf_category_id": 1000001955, "price_bin": "¥68-¥186", "shop_list": [{"shop_id": "fixture-shop-5-1", "shop_name": "示例店铺5-1"}]}
+      },
+      {
+        "new_pay_amt": {"value_range": [{"unit": "price", "value": 500000000}, {"unit": "price", "value": 750000000}]},
+        "pay_combo_cnt": {"value_range": [{"unit": "number", "value": 50000}, {"unit": "number", "value": 75000}]},
+        "product_info": {"id": "fixture-product-6", "name": "示例商品6", "rank": 6, "newly_on_ranking": true, "brand_type": 0, "category_id": 0, "second_category_id": 0, "third_category_id": 0, "leaf_category_id": 1000001900, "price_bin": "¥119", "shop_list": [{"shop_id": "fixture-shop-6-1", "shop_name": "示例店铺6-1"}]}
+      },
+      {
+        "new_pay_amt": {"value_range": [{"unit": "price", "value": 500000000}, {"unit": "price", "value": 750000000}]},
+        "pay_combo_cnt": {"value_range": [{"unit": "number", "value": 50000}, {"unit": "number", "value": 75000}]},
+        "product_info": {"id": "fixture-product-7", "name": "示例商品7", "rank": 7, "newly_on_ranking": false, "brand_type": 0, "category_id": 0, "second_category_id": 0, "third_category_id": 0, "leaf_category_id": 1000001884, "price_bin": "¥99", "shop_list": [{"shop_id": "fixture-shop-7-1", "shop_name": "示例店铺7-1"}]}
+      },
+      {
+        "new_pay_amt": {"value_range": [{"unit": "price", "value": 500000000}, {"unit": "price", "value": 750000000}]},
+        "pay_combo_cnt": {"value_range": [{"unit": "number", "value": 50000}, {"unit": "number", "value": 75000}]},
+        "product_info": {"id": "fixture-product-8", "name": "示例商品8", "rank": 8, "newly_on_ranking": false, "brand_type": 0, "category_id": 0, "second_category_id": 0, "third_category_id": 0, "leaf_category_id": 1000001885, "price_bin": "¥99.9", "shop_list": [{"shop_id": "fixture-shop-8-1", "shop_name": "示例店铺8-1"}]}
+      },
+      {
+        "new_pay_amt": {"value_range": [{"unit": "price", "value": 500000000}, {"unit": "price", "value": 750000000}]},
+        "pay_combo_cnt": {"value_range": [{"unit": "number", "value": 50000}, {"unit": "number", "value": 75000}]},
+        "product_info": {"id": "fixture-product-9", "name": "示例商品9", "rank": 9, "newly_on_ranking": false, "brand_type": 0, "category_id": 0, "second_category_id": 0, "third_category_id": 0, "leaf_category_id": 1000010306, "price_bin": "¥89", "shop_list": [{"shop_id": "fixture-shop-9-1", "shop_name": "示例店铺9-1"}]}
+      },
+      {
+        "new_pay_amt": {"value_range": [{"unit": "price", "value": 500000000}, {"unit": "price", "value": 750000000}]},
+        "pay_combo_cnt": {"value_range": [{"unit": "number", "value": 10000}, {"unit": "number", "value": 25000}]},
+        "product_info": {"id": "fixture-product-10", "name": "示例商品10", "rank": 10, "newly_on_ranking": false, "brand_type": 0, "category_id": 0, "second_category_id": 0, "third_category_id": 0, "leaf_category_id": 1000001918, "price_bin": "¥399", "shop_list": [{"shop_id": "fixture-shop-10-1", "shop_name": "示例店铺10-1"}]}
+      }
+    ]
+  }
+}

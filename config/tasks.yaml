@@ -1,0 +1,77 @@
+browser:
+  channel: chrome
+  headless: false
+  profile_dir: runtime/browser-profile
+  locale: zh-CN
+  timezone_id: Asia/Shanghai
+  keep_open_after_manual_run: true
+
+auth:
+  # 白名单只包含 Cookie 名称，永远不要在此文件写入 Cookie 值。
+  # 下列名称来自已失效的真实会话样本，运行时只传递当前 Profile 中实际存在的项。
+  cookie_names:
+    - s_v_web_id
+    - passport_csrf_token
+    - passport_csrf_token_default
+    - ttwid
+    - odin_tt
+    - passport_auth_status
+    - passport_auth_status_ss
+    - uid_tt
+    - uid_tt_ss
+    - sid_tt
+    - sessionid
+    - sessionid_ss
+    - ucas_c0_compass
+    - ucas_c0_ss_compass
+    - sid_guard
+    - session_tlb_tag
+    - sid_ucp_v1
+    - ssid_ucp_v1
+    - LUOPAN_DT
+    - COMPASS_LUOPAN_DT
+    - ecom_us_lt_compass
+    - ecom_us_lt_ss_compass
+    - x-web-secsdk-uid
+    - csrf_session_id
+
+http:
+  concurrency: 1
+  page_interval_seconds:
+    min: 1
+    max: 2
+  connect_timeout_seconds: 10
+  read_timeout_seconds: 30
+
+retention:
+  raw_response_days: 30
+  failure_artifact_days: 10
+  log_days: 10
+  delete_database_records: false
+  delete_exports: false
+
+tasks:
+  - id: product_hot_sale_drinks
+    enabled: true
+    display_name: 水饮冲调商品实时总榜
+    schedule: "0 14 * * *"
+    rank:
+      type: product_hot_sale
+      endpoint_path: /compass_api/shop/product/product_rank/market_hot_sale
+      rank_data_type: 1
+      activity_id: ""
+    filters:
+      industry:
+        id: 13
+        name: 食品饮料
+      category:
+        id: 1000001823
+        name: 水饮冲调
+      brand_type: -1
+      price_bin: 不限
+      search_info: ""
+    date:
+      strategy: today
+      date_type: 1
+    pagination:
+      max_items: 200
