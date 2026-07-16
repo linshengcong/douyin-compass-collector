@@ -1,28 +1,50 @@
-"""Stage-one login and raw product-ranking collection workflows."""
+"""Stage-two login, collection, publication, idempotence, and status workflows."""
 
 import random
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from compass_collector.browser import BrowserSession, open_browser
 from compass_collector.config import AppConfig, TaskConfig
-from compass_collector.errors import AuthRequiredError, CollectorError, ResponseContractError
+from compass_collector.errors import (
+    AuthRequiredError,
+    CollectorError,
+    PublicationError,
+    ResponseContractError,
+    TaskCollectionError,
+)
+from compass_collector.exporter import CsvExporter
 from compass_collector.http_client import ProductRankHttpClient
+from compass_collector.models import CollectedTaskRun, ProductRankEntry, RawPageRecord
+from compass_collector.persistence import Database, upgrade_database
 from compass_collector.product_rank import (
     PaginationPlan,
     build_request_params,
     calculate_pagination_plan,
+    parse_page_entries,
+    validate_complete_ranking,
     validate_page_payload,
 )
 from compass_collector.raw_storage import RunStorage
 
 
-# 阶段一所有业务日期按北京时间固定。
+# 所有业务日期和计划时间按北京时区固定。
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 # 运行时文件统一位于仓库 runtime 目录下。
 RUNTIME_ROOT = Path("runtime")
+
+
+@dataclass(frozen=True, slots=True)
+class TaskExecutionPlan:
+    """Bind one task to its business date, planned time, and publication version."""
+
+    task: TaskConfig
+    business_date: date
+    planned_at: datetime
+    version: int
 
 
 def select_tasks(config: AppConfig, selected_task_id: str | None) -> list[TaskConfig]:
@@ -41,10 +63,84 @@ def select_tasks(config: AppConfig, selected_task_id: str | None) -> list[TaskCo
     return matching_tasks
 
 
+def planned_at_for_task(task: TaskConfig, business_date: date) -> datetime:
+    """Map a manual run to the task's same-day fixed cron time."""
+
+    # 阶段二只需要解析每日固定时分的五段 cron。
+    cron_parts = task.schedule.split()
+    if len(cron_parts) != 5 or cron_parts[2:] != ["*", "*", "*"]:
+        raise ValueError("stage two requires a daily '<minute> <hour> * * *' schedule")
+    try:
+        # cron 第一和第二段分别是分钟和小时。
+        minute = int(cron_parts[0])
+        hour = int(cron_parts[1])
+    except ValueError as error:
+        raise ValueError("schedule minute and hour must be integers") from error
+    if not 0 <= minute <= 59 or not 0 <= hour <= 23:
+        raise ValueError("schedule minute or hour is out of range")
+    return datetime(
+        business_date.year,
+        business_date.month,
+        business_date.day,
+        hour,
+        minute,
+        tzinfo=SHANGHAI_TIMEZONE,
+    )
+
+
+def prepare_task_plans(
+    tasks: list[TaskConfig],
+    *,
+    database: Database | None,
+    force: bool,
+    dry_run: bool,
+) -> list[TaskExecutionPlan]:
+    """Apply idempotence before Chrome starts and allocate immutable versions."""
+
+    # 手动命令中全部任务共用同一个北京业务日期。
+    business_date = datetime.now(SHANGHAI_TIMEZONE).date()
+    # 只有真正需要采集的任务才会进入浏览器阶段。
+    task_plans: list[TaskExecutionPlan] = []
+    for task in tasks:
+        # 手动 run 归属到当天配置的计划时间。
+        planned_at = planned_at_for_task(task, business_date)
+        if dry_run:
+            task_plans.append(
+                TaskExecutionPlan(
+                    task=task,
+                    business_date=business_date,
+                    planned_at=planned_at,
+                    version=1,
+                )
+            )
+            continue
+        if database is None:
+            raise RuntimeError("database is required for an official run")
+        # 已成功快照让默认 run 在打开 Chrome 前跳过。
+        successful_batch = database.successful_batch(task.id, planned_at)
+        if successful_batch is not None and not force:
+            print(
+                f"[{task.id}] 计划时间 {planned_at.strftime('%Y-%m-%d %H:%M')} "
+                f"已成功发布 v{successful_batch.version}，默认跳过"
+            )
+            continue
+        # 首次发布为 v1，只有 --force 在已有版本上递增。
+        version = database.next_version(task.id, planned_at)
+        task_plans.append(
+            TaskExecutionPlan(
+                task=task,
+                business_date=business_date,
+                planned_at=planned_at,
+                version=version,
+            )
+        )
+    return task_plans
+
+
 def run_login(config: AppConfig) -> int:
     """Open the persistent profile for manual login and close on Enter."""
 
-    # 登录命令仅管理 Chrome，不创建 HTTP 客户端。
+    # 登录命令仅管理 Chrome，不创建 HTTP 客户端或数据库。
     browser_session = open_browser(config.browser)
     try:
         browser_session.wait_for_manual_exit(
@@ -56,20 +152,20 @@ def run_login(config: AppConfig) -> int:
 
 
 def collect_task(
-    task: TaskConfig,
+    plan: TaskExecutionPlan,
     config: AppConfig,
     client: ProductRankHttpClient,
-) -> RunStorage:
-    """Collect and atomically persist all raw pages for one task."""
+) -> CollectedTaskRun:
+    """Collect, parse, and fully validate one task without publishing it."""
 
-    # 业务日期在任务启动时只计算一次。
-    business_date = datetime.now(SHANGHAI_TIMEZONE).date()
+    # 开始时间在创建 Manifest 前记录，供数据库 run 使用。
+    started_at = datetime.now(SHANGHAI_TIMEZONE)
     # 每个任务尝试拥有独立的 run_id 和原始数据目录。
     storage = RunStorage(
         runtime_root=RUNTIME_ROOT,
-        task_id=task.id,
-        business_date=business_date,
-        max_items=task.pagination.max_items,
+        task_id=plan.task.id,
+        business_date=plan.business_date,
+        max_items=plan.task.pagination.max_items,
     )
     # 首页成功后固定接口 total，后续分页不允许变化。
     expected_total: int | None = None
@@ -77,18 +173,21 @@ def collect_task(
     pagination_plan: PaginationPlan | None = None
     # 当前请求从第 1 页开始串行递增。
     page_no = 1
-    # 进度计数只包含已校验并原子发布的分页。
+    # 进度计数只包含已校验、解析并原子发布的分页。
     saved_pages = 0
     saved_items = 0
     # 当前响应仅在契约失败时用于本地留档。
     current_response_body = b""
     current_status_code: int | None = None
+    # 整榜商品与原始页索引在全部分页成功前仅存在内存。
+    entries: list[ProductRankEntry] = []
+    raw_pages: list[RawPageRecord] = []
     try:
         while pagination_plan is None or page_no <= pagination_plan.target_pages:
             # 请求参数只包含已确认的业务字段。
-            params = build_request_params(task, business_date, page_no)
+            params = build_request_params(plan.task, plan.business_date, page_no)
             # 当前页不做任何自动重试。
-            page_response = client.get_page(task, params)
+            page_response = client.get_page(plan.task, params)
             current_response_body = page_response.body
             current_status_code = page_response.status_code
             # 响应在写入 gzip 前完成分页契约校验。
@@ -101,9 +200,27 @@ def collect_task(
                 expected_total = page_contract.total
                 pagination_plan = calculate_pagination_plan(
                     total=expected_total,
-                    max_items=task.pagination.max_items,
+                    max_items=plan.task.pagination.max_items,
                 )
-            storage.write_page(page_no, page_response.payload)
+            # 每页捕获时间在 HTTP 响应通过页级契约后记录。
+            captured_at = datetime.now(SHANGHAI_TIMEZONE)
+            # 原始响应先于商品解析落盘，解析失败时仍可排查现场。
+            page_path = storage.write_page(page_no, page_response.payload)
+            # 商品字段解析不对原始数值做展示换算。
+            page_entries = parse_page_entries(
+                page_response.payload,
+                page_no=page_no,
+                captured_at=captured_at,
+            )
+            entries.extend(page_entries)
+            raw_pages.append(
+                RawPageRecord(
+                    page_no=page_no,
+                    path=page_path,
+                    item_count=page_contract.item_count,
+                    captured_at=captured_at,
+                )
+            )
             saved_pages += 1
             saved_items += page_contract.item_count
             storage.update_progress(
@@ -113,7 +230,7 @@ def collect_task(
                 saved_items=saved_items,
             )
             print(
-                f"[{task.id}] 已保存第 {page_no}/{pagination_plan.target_pages} 页，"
+                f"[{plan.task.id}] 已保存并解析第 {page_no}/{pagination_plan.target_pages} 页，"
                 f"累计 {saved_items}/{pagination_plan.target_items} 条"
             )
             if page_no >= pagination_plan.target_pages:
@@ -123,7 +240,7 @@ def collect_task(
                 config.http.page_interval_seconds.min,
                 config.http.page_interval_seconds.max,
             )
-            print(f"[{task.id}] 等待 {delay_seconds:.2f} 秒后请求下一页")
+            print(f"[{plan.task.id}] 等待 {delay_seconds:.2f} 秒后请求下一页")
             time.sleep(delay_seconds)
             page_no += 1
         if pagination_plan is None or saved_items != pagination_plan.target_items:
@@ -131,9 +248,18 @@ def collect_task(
                 "saved item count does not equal target items",
                 category="incomplete_collection",
             )
-        storage.mark_success()
-        print(f"[{task.id}] 采集成功，run_id={storage.run_id}")
-        return storage
+        validate_complete_ranking(entries, target_items=pagination_plan.target_items)
+        # 完成时间在整榜契约通过后记录。
+        finished_at = datetime.now(SHANGHAI_TIMEZONE)
+        return CollectedTaskRun(
+            task_id=plan.task.id,
+            business_date=plan.business_date,
+            started_at=started_at,
+            finished_at=finished_at,
+            storage=storage,
+            entries=tuple(entries),
+            raw_pages=tuple(raw_pages),
+        )
     except KeyboardInterrupt:
         storage.mark_interrupted(failed_page=page_no)
         raise
@@ -153,15 +279,13 @@ def collect_task(
                 response_body=failure_body,
             )
         storage.mark_failed(failed_page=page_no, error_category=error.category)
-        print(f"[{task.id}] 采集失败，category={error.category}")
-        raise
+        print(f"[{plan.task.id}] 采集失败，category={error.category}")
+        raise TaskCollectionError(error, storage) from error
 
 
-def record_missing_auth(task: TaskConfig) -> RunStorage:
+def record_missing_auth(task: TaskConfig, business_date: date) -> RunStorage:
     """Create a failed run manifest when no allowlisted Cookie is available."""
 
-    # 缺失登录态也使用当天业务日期建立可追踪尝试。
-    business_date = datetime.now(SHANGHAI_TIMEZONE).date()
     # 失败 Manifest 不包含缺失的 Cookie 名称。
     storage = RunStorage(
         runtime_root=RUNTIME_ROOT,
@@ -173,50 +297,158 @@ def record_missing_auth(task: TaskConfig) -> RunStorage:
     return storage
 
 
-def run_collection(config: AppConfig, selected_task_id: str | None) -> int:
-    """Run selected stage-one tasks in one authenticated browser lifecycle."""
+def run_collection(
+    config: AppConfig,
+    selected_task_id: str | None,
+    *,
+    force: bool,
+    dry_run: bool,
+) -> int:
+    """Run selected tasks and optionally publish SQLite plus CSV snapshots."""
 
-    # 任务选择在启动 Chrome 前完成，避免配置错误仍打开浏览器。
+    # 任务选择在任何数据库或浏览器操作前完成。
     selected_tasks = select_tasks(config, selected_task_id)
-    # 手动 run 的 Chrome 在本次命令中统一复用。
-    browser_session: BrowserSession | None = None
-    # HTTP 客户端可能在登录态检查失败前尚未创建。
-    http_client: ProductRankHttpClient | None = None
-    # 任何任务失败都让 CLI 返回非零状态。
-    has_failures = False
+    # dry-run 不读写正式数据库。
+    database: Database | None = None
+    if not dry_run:
+        upgrade_database(config.database.path)
+        database = Database(config.database.path)
     try:
-        browser_session = open_browser(config.browser)
-        # 运行时仅读取白名单内且对目标源适用的 Cookie。
-        cookies = browser_session.whitelisted_cookies(config.auth.cookie_names)
-        print(f"已从当前 Profile 读取 {len(cookies)} 个白名单 Cookie")
-        if not cookies:
-            record_missing_auth(selected_tasks[0])
-            print("未找到可用的白名单 Cookie，请先在当前 Chrome 中登录")
+        # 幂等检查和版本分配在打开 Chrome 前完成。
+        task_plans = prepare_task_plans(
+            selected_tasks,
+            database=database,
+            force=force,
+            dry_run=dry_run,
+        )
+        if not task_plans:
+            print("没有需要采集的任务")
+            return 0
+        # 手动 run 的 Chrome 在本次命令中统一复用。
+        browser_session: BrowserSession | None = None
+        # HTTP 客户端可能在登录态检查失败前尚未创建。
+        http_client: ProductRankHttpClient | None = None
+        # 任何任务失败都让 CLI 返回非零状态。
+        has_failures = False
+        try:
+            browser_session = open_browser(config.browser)
+            # 运行时仅读取白名单内且对目标 API 适用的 Cookie。
+            cookies = browser_session.whitelisted_cookies(config.auth.cookie_names)
+            print(f"已从当前 Profile 读取 {len(cookies)} 个白名单 Cookie")
+            if not cookies:
+                # 鉴权缺失阻断整个手动批次。
+                first_plan = task_plans[0]
+                storage = record_missing_auth(first_plan.task, first_plan.business_date)
+                if database is not None:
+                    database.record_failed_run(
+                        storage,
+                        planned_at=first_plan.planned_at,
+                        error_category="auth_required",
+                    )
+                print("未找到可用的白名单 Cookie，请先在当前 Chrome 中登录")
+                has_failures = True
+            else:
+                # User-Agent 从当前正式版 Chrome 动态读取。
+                user_agent = browser_session.user_agent()
+                http_client = ProductRankHttpClient(config.http, cookies, user_agent)
+                # CSV 展示层只在正式发布路径使用。
+                csv_exporter = CsvExporter(RUNTIME_ROOT / "exports")
+                for plan in task_plans:
+                    try:
+                        collected_run = collect_task(plan, config, http_client)
+                    except TaskCollectionError as task_error:
+                        has_failures = True
+                        if database is not None:
+                            database.record_failed_run(
+                                task_error.storage,
+                                planned_at=plan.planned_at,
+                                error_category=task_error.cause.category,
+                            )
+                        if isinstance(task_error.cause, AuthRequiredError):
+                            print("登录态失效，本次手动运行停止后续任务")
+                            break
+                        continue
+                    if dry_run:
+                        collected_run.storage.mark_success()
+                        print(
+                            f"[{plan.task.id}] dry-run 通过，"
+                            f"已校验 {len(collected_run.entries)} 条，未写入 SQLite/CSV"
+                        )
+                        continue
+                    if database is None:
+                        raise RuntimeError("database is required for publication")
+                    try:
+                        # CSV 先写完临时文件，正式文件由数据库事务内发布。
+                        staged_csv = csv_exporter.prepare(
+                            task_id=plan.task.id,
+                            planned_at=plan.planned_at,
+                            version=plan.version,
+                            run_id=collected_run.storage.run_id,
+                            entries=collected_run.entries,
+                        )
+                        # 数据库记录和 CSV 原子替换作为一次协调发布。
+                        published_batch = database.publish_snapshot(
+                            collected_run,
+                            planned_at=plan.planned_at,
+                            version=plan.version,
+                            staged_csv=staged_csv,
+                        )
+                    except PublicationError as error:
+                        collected_run.storage.mark_failed(
+                            failed_page=len(collected_run.raw_pages),
+                            error_category=error.category,
+                        )
+                        database.record_failed_run(
+                            collected_run.storage,
+                            planned_at=plan.planned_at,
+                            error_category=error.category,
+                        )
+                        print(f"[{plan.task.id}] 发布失败，category={error.category}")
+                        has_failures = True
+                        continue
+                    collected_run.storage.mark_success()
+                    print(
+                        f"[{plan.task.id}] 已发布 v{published_batch.version}，"
+                        f"CSV={published_batch.csv_path}"
+                    )
+            if config.browser.keep_open_after_manual_run:
+                browser_session.wait_for_manual_exit(
+                    "采集流程已结束。完成调试检查后，按 Enter 关闭浏览器\n"
+                )
+        except KeyboardInterrupt:
             has_failures = True
-        else:
-            # User-Agent 从当前正式版 Chrome 动态读取。
-            user_agent = browser_session.user_agent()
-            http_client = ProductRankHttpClient(config.http, cookies, user_agent)
-            for task in selected_tasks:
-                try:
-                    collect_task(task, config, http_client)
-                except AuthRequiredError:
-                    has_failures = True
-                    print("登录态失效，本次手动运行停止后续任务")
-                    break
-                except CollectorError:
-                    has_failures = True
-                    continue
-        if config.browser.keep_open_after_manual_run:
-            browser_session.wait_for_manual_exit(
-                "采集流程已结束。完成调试检查后，按 Enter 关闭浏览器\n"
-            )
-    except KeyboardInterrupt:
-        has_failures = True
-        print("\n已中断手动运行")
+            print("\n已中断手动运行")
+        finally:
+            if http_client is not None:
+                http_client.close()
+            if browser_session is not None:
+                browser_session.close()
+        return 1 if has_failures else 0
     finally:
-        if http_client is not None:
-            http_client.close()
-        if browser_session is not None:
-            browser_session.close()
-    return 1 if has_failures else 0
+        if database is not None:
+            database.close()
+
+
+def run_status(config: AppConfig, limit: int) -> int:
+    """Upgrade the database and print recent task-attempt status rows."""
+
+    upgrade_database(config.database.path)
+    # status 查询使用独立短生命周期数据库对象。
+    database = Database(config.database.path)
+    try:
+        # 最近 run 列表同时包含成功发布和失败尝试。
+        rows = database.recent_status(limit=limit)
+    finally:
+        database.close()
+    if not rows:
+        print("暂无运行记录")
+        return 0
+    print("planned_at          task_id                         status       version  run_id")
+    for row in rows:
+        # 无正式批次的失败 run 使用短横线表示无版本。
+        version_text = "-" if row.version is None else f"v{row.version}"
+        print(
+            f"{row.planned_at:%Y-%m-%d %H:%M}  "
+            f"{row.task_id:<31} {row.status:<12} {version_text:<8} {row.run_id}"
+        )
+    return 0

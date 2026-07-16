@@ -81,6 +81,12 @@ class RetentionConfig(StrictModel):
     delete_exports: Literal[False] = False
 
 
+class DatabaseConfig(StrictModel):
+    """Configure the local SQLite database managed by Alembic."""
+
+    path: Path
+
+
 class FilterOption(StrictModel):
     """Pair a platform ID with its human-readable name."""
 
@@ -141,6 +147,7 @@ class AppConfig(StrictModel):
     browser: BrowserConfig
     auth: AuthConfig
     http: HttpConfig
+    database: DatabaseConfig
     retention: RetentionConfig
     tasks: list[TaskConfig] = Field(min_length=1)
 

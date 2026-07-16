@@ -1,5 +1,7 @@
 """Safe error types that never embed request URLs, headers, or Cookie values."""
 
+from typing import Any
+
 
 class CollectorError(Exception):
     """Base error carrying only a safe category and optional response metadata."""
@@ -37,3 +39,20 @@ class HttpResponseError(CollectorError):
 
 class ResponseContractError(CollectorError):
     """Signal a successful JSON response that violates the verified contract."""
+
+
+class PublicationError(CollectorError):
+    """Signal a database or CSV publication failure without leaking row data."""
+
+
+class TaskCollectionError(Exception):
+    """Carry a failed run's local storage to the orchestration boundary."""
+
+    def __init__(self, cause: CollectorError, storage: Any) -> None:
+        """Wrap a safe collector error without changing its message or category."""
+
+        super().__init__(str(cause))
+        # 原始安全错误用于区分鉴权、契约和网络失败。
+        self.cause = cause
+        # 运行存储对象仅用于记录失败 run，不包含 Cookie。
+        self.storage = storage

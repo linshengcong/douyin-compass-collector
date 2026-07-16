@@ -7,7 +7,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from compass_collector.config import load_config
-from compass_collector.runner import run_collection, run_login
+from compass_collector.runner import run_collection, run_login, run_status
 
 
 # 默认配置路径与工程方案保持一致。
@@ -17,7 +17,7 @@ DEFAULT_CONFIG_PATH = Path("config/tasks.yaml")
 def build_parser() -> argparse.ArgumentParser:
     """Build the two-command stage-one CLI parser."""
 
-    # 顶层解析器只提供阶段一已授权命令。
+    # 顶层解析器只提供阶段二已授权命令。
     parser = argparse.ArgumentParser(prog="python -m compass_collector")
     # 子命令必填，避免无意启动 Chrome。
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -27,9 +27,20 @@ def build_parser() -> argparse.ArgumentParser:
     login_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
 
     # run 命令执行全部启用任务或一个指定任务。
-    run_parser = subparsers.add_parser("run", help="collect raw ranking responses")
+    run_parser = subparsers.add_parser(
+        "run", help="collect and publish a ranking snapshot"
+    )
     run_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     run_parser.add_argument("--task", dest="task_id")
+    # --force 和 --dry-run 语义冲突，同一次命令只允许选择一个。
+    run_mode = run_parser.add_mutually_exclusive_group()
+    run_mode.add_argument("--force", action="store_true")
+    run_mode.add_argument("--dry-run", action="store_true")
+
+    # status 命令只读取最近 run 摘要，不启动 Chrome。
+    status_parser = subparsers.add_parser("status", help="show recent task runs")
+    status_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    status_parser.add_argument("--limit", type=int, default=20)
     return parser
 
 
@@ -43,8 +54,17 @@ def main() -> None:
         config = load_config(arguments.config)
         if arguments.command == "login":
             exit_code = run_login(config)
+        elif arguments.command == "run":
+            exit_code = run_collection(
+                config,
+                arguments.task_id,
+                force=arguments.force,
+                dry_run=arguments.dry_run,
+            )
         else:
-            exit_code = run_collection(config, arguments.task_id)
+            if arguments.limit <= 0:
+                raise ValueError("status --limit must be positive")
+            exit_code = run_status(config, arguments.limit)
     except (OSError, ValueError, ValidationError) as error:
         print(f"启动失败：{error}", file=sys.stderr)
         exit_code = 2

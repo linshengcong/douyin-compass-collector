@@ -43,6 +43,9 @@ http:
   connect_timeout_seconds: 10
   read_timeout_seconds: 30
 
+database:
+  path: runtime/data/collector.db
+
 retention:
   raw_response_days: 30
   failure_artifact_days: 10
