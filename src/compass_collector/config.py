@@ -87,6 +87,16 @@ class DatabaseConfig(StrictModel):
     path: Path
 
 
+class SchedulerConfig(StrictModel):
+    """Configure Beijing-time cron execution and delayed-run boundaries."""
+
+    # 首版只支持已经确认的北京时间业务语义。
+    timezone: Literal["Asia/Shanghai"] = "Asia/Shanghai"
+    # 误点宽限以分钟配置，默认 10 小时且不允许跨天补实时榜单。
+    misfire_grace_minutes: int = Field(gt=0, le=1440)
+    cross_day_backfill: Literal[False] = False
+
+
 class FilterOption(StrictModel):
     """Pair a platform ID with its human-readable name."""
 
@@ -140,11 +150,31 @@ class TaskConfig(StrictModel):
     date: DateConfig
     pagination: PaginationConfig
 
+    @field_validator("schedule")
+    @classmethod
+    def validate_daily_schedule(cls, value: str) -> str:
+        """Restrict v1 Scheduler semantics to one fixed Beijing time per day."""
+
+        # 首版只接受分钟、小时和三个通配符，避免猜测复杂 cron 的业务日期。
+        cron_parts = value.split()
+        if len(cron_parts) != 5 or cron_parts[2:] != ["*", "*", "*"]:
+            raise ValueError("schedule must be '<minute> <hour> * * *'")
+        try:
+            # 固定分钟和小时必须是十进制整数。
+            minute = int(cron_parts[0])
+            hour = int(cron_parts[1])
+        except ValueError as error:
+            raise ValueError("schedule minute and hour must be integers") from error
+        if not 0 <= minute <= 59 or not 0 <= hour <= 23:
+            raise ValueError("schedule minute or hour is out of range")
+        return value
+
 
 class AppConfig(StrictModel):
-    """Aggregate all stage-one configuration sections."""
+    """Aggregate all currently supported configuration sections."""
 
     browser: BrowserConfig
+    scheduler: SchedulerConfig
     auth: AuthConfig
     http: HttpConfig
     database: DatabaseConfig

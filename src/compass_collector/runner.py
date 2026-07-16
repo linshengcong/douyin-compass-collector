@@ -70,10 +70,10 @@ def select_tasks(config: AppConfig, selected_task_id: str | None) -> list[TaskCo
 def planned_at_for_task(task: TaskConfig, business_date: date) -> datetime:
     """Map a manual run to the task's same-day fixed cron time."""
 
-    # 阶段二只需要解析每日固定时分的五段 cron。
+    # 当前实时榜单只支持每日固定时分的五段 cron。
     cron_parts = task.schedule.split()
     if len(cron_parts) != 5 or cron_parts[2:] != ["*", "*", "*"]:
-        raise ValueError("stage two requires a daily '<minute> <hour> * * *' schedule")
+        raise ValueError("a daily '<minute> <hour> * * *' schedule is required")
     try:
         # cron 第一和第二段分别是分钟和小时。
         minute = int(cron_parts[0])
@@ -98,16 +98,25 @@ def prepare_task_plans(
     database: Database | None,
     force: bool,
     dry_run: bool,
+    planned_at_overrides: dict[str, datetime] | None = None,
+    skip_any_existing_attempt: bool = False,
 ) -> list[TaskExecutionPlan]:
     """Apply idempotence before Chrome starts and allocate immutable versions."""
 
-    # 手动命令中全部任务共用同一个北京业务日期。
-    business_date = datetime.now(SHANGHAI_TIMEZONE).date()
+    # Scheduler 可传入真实计划时间；手动命令仍使用当前北京业务日期。
+    override_times = planned_at_overrides or {}
+    # 手动命令中没有覆盖时间时共用当前北京业务日期。
+    current_business_date = datetime.now(SHANGHAI_TIMEZONE).date()
     # 只有真正需要采集的任务才会进入浏览器阶段。
     task_plans: list[TaskExecutionPlan] = []
     for task in tasks:
         # 手动 run 归属到当天配置的计划时间。
-        planned_at = planned_at_for_task(task, business_date)
+        # 调度运行固定使用触发器给出的计划时间，避免延迟后日期漂移。
+        planned_at = override_times.get(task.id)
+        if planned_at is None:
+            planned_at = planned_at_for_task(task, current_business_date)
+        # 业务日期永远从计划时间确定，全部分页保持不变。
+        business_date = planned_at.astimezone(SHANGHAI_TIMEZONE).date()
         if dry_run:
             task_plans.append(
                 TaskExecutionPlan(
@@ -120,6 +129,12 @@ def prepare_task_plans(
             continue
         if database is None:
             raise RuntimeError("database is required for an official run")
+        if skip_any_existing_attempt and database.has_terminal_run(task.id, planned_at):
+            print(
+                f"[{task.id}] 计划时间 {planned_at.strftime('%Y-%m-%d %H:%M')} "
+                "已有终态记录，Scheduler 跳过"
+            )
+            continue
         # 已成功快照让默认 run 在打开 Chrome 前跳过。
         successful_batch = database.successful_batch(task.id, planned_at)
         if successful_batch is not None and not force:
@@ -336,7 +351,11 @@ def collect_task(
             exception_type=type(error).__name__,
             safe_endpoint_path=plan.task.rank.endpoint_path,
         )
-        storage.mark_failed(failed_page=page_no, error_category=error.category)
+        if isinstance(error, AuthRequiredError):
+            # 鉴权失败是独立终态，Scheduler 据此阻断同批次后续任务。
+            storage.mark_auth_required(failed_page=page_no)
+        else:
+            storage.mark_failed(failed_page=page_no, error_category=error.category)
         runtime_logger.emit(
             level="ERROR",
             event="task_collection_failed",
@@ -393,8 +412,48 @@ def record_missing_auth(task: TaskConfig, business_date: date) -> RunStorage:
         failed_step="read_authentication",
         exception_type="AuthRequiredError",
     )
-    storage.mark_failed(failed_page=1, error_category="auth_required")
+    storage.mark_auth_required(failed_page=1)
     return storage
+
+
+def record_auth_required_plans(
+    plans: list[TaskExecutionPlan],
+    *,
+    database: Database | None,
+    runtime_logger: RuntimeLogger,
+    execution_batch_id: str,
+) -> None:
+    """Record every task blocked by one batch-level authentication failure."""
+
+    for plan in plans:
+        # 每个被阻断任务拥有独立 run_id，status 可完整展示批次影响范围。
+        storage = record_missing_auth(plan.task, plan.business_date)
+        if database is not None:
+            database.record_failed_run(
+                storage,
+                planned_at=plan.planned_at,
+                error_category="auth_required",
+            )
+        # auth_required 任务日志使用完整批次、运行和任务上下文。
+        auth_log_context = LogContext(
+            batch_id=execution_batch_id,
+            run_id=storage.run_id,
+            task_id=plan.task.id,
+        )
+        runtime_logger.emit(
+            level="ERROR",
+            event="authentication_required",
+            message=(
+                f"[{plan.task.id}] 未找到可用的白名单认证状态，"
+                "本批次任务已阻断"
+            ),
+            stage="authentication",
+            context=auth_log_context,
+            details={
+                "error_category": "auth_required",
+                "artifact_path": str(storage.artifact_dir),
+            },
+        )
 
 
 def record_browser_failure(
@@ -428,11 +487,20 @@ def run_collection(
     *,
     force: bool,
     dry_run: bool,
+    manual: bool = True,
+    scheduled_tasks: list[TaskConfig] | None = None,
+    planned_at_overrides: dict[str, datetime] | None = None,
 ) -> int:
     """Run selected tasks and optionally publish SQLite plus CSV snapshots."""
 
     # 任务选择在任何数据库或浏览器操作前完成。
-    selected_tasks = select_tasks(config, selected_task_id)
+    selected_tasks = (
+        scheduled_tasks
+        if scheduled_tasks is not None
+        else select_tasks(config, selected_task_id)
+    )
+    if not selected_tasks:
+        raise ValueError("no scheduled tasks were provided")
     # 每次 CLI run 使用独立批次 ID 串联 JSONL 日志。
     execution_batch_id = uuid4().hex
     # JSONL 日志按北京时间自然日自动选择文件。
@@ -462,6 +530,8 @@ def run_collection(
             database=database,
             force=force,
             dry_run=dry_run,
+            planned_at_overrides=planned_at_overrides,
+            skip_any_existing_attempt=not manual,
         )
         if not task_plans:
             runtime_logger.emit(
@@ -490,30 +560,17 @@ def run_collection(
             )
             if not cookies:
                 # 鉴权缺失阻断整个手动批次。
-                first_plan = task_plans[0]
-                storage = record_missing_auth(first_plan.task, first_plan.business_date)
-                if database is not None:
-                    database.record_failed_run(
-                        storage,
-                        planned_at=first_plan.planned_at,
-                        error_category="auth_required",
-                    )
-                # 缺失登录态的任务日志具备完整三元上下文。
-                auth_log_context = LogContext(
-                    batch_id=execution_batch_id,
-                    run_id=storage.run_id,
-                    task_id=first_plan.task.id,
+                record_auth_required_plans(
+                    task_plans,
+                    database=database,
+                    runtime_logger=runtime_logger,
+                    execution_batch_id=execution_batch_id,
                 )
                 runtime_logger.emit(
                     level="ERROR",
-                    event="authentication_required",
-                    message="未找到可用的白名单 Cookie，请先在当前 Chrome 中登录",
+                    event="authentication_batch_blocked",
+                    message="未找到可用的白名单认证状态，请先在当前 Chrome 中登录",
                     stage="authentication",
-                    context=auth_log_context,
-                    details={
-                        "error_category": "auth_required",
-                        "artifact_path": str(storage.artifact_dir),
-                    },
                 )
                 has_failures = True
             else:
@@ -522,7 +579,7 @@ def run_collection(
                 http_client = ProductRankHttpClient(config.http, cookies, user_agent)
                 # CSV 展示层只在正式发布路径使用。
                 csv_exporter = CsvExporter(RUNTIME_ROOT / "exports")
-                for plan in task_plans:
+                for plan_index, plan in enumerate(task_plans):
                     try:
                         collected_run = collect_task(
                             plan,
@@ -551,6 +608,14 @@ def run_collection(
                                     task_id=plan.task.id,
                                 ),
                                 details={"error_category": "auth_required"},
+                            )
+                            # 当前任务之后的同批次任务不再请求接口，并写入阻断终态。
+                            blocked_plans = task_plans[plan_index + 1 :]
+                            record_auth_required_plans(
+                                blocked_plans,
+                                database=database,
+                                runtime_logger=runtime_logger,
+                                execution_batch_id=execution_batch_id,
                             )
                             break
                         continue
@@ -639,7 +704,11 @@ def run_collection(
                             "csv_path": str(published_batch.csv_path),
                         },
                     )
-            if config.browser.keep_open_after_manual_run and browser_session is not None:
+            if (
+                manual
+                and config.browser.keep_open_after_manual_run
+                and browser_session is not None
+            ):
                 browser_session.wait_for_manual_exit(
                     "采集流程已结束。完成调试检查后，按 Enter 关闭浏览器\n"
                 )
@@ -689,6 +758,26 @@ def run_collection(
     finally:
         if database is not None:
             database.close()
+
+
+def run_scheduled_collection(
+    config: AppConfig,
+    tasks: list[TaskConfig],
+    planned_at: datetime,
+) -> int:
+    """Execute one due task group without waiting for keyboard input."""
+
+    # 同一计划时刻的任务共享覆盖时间，并在一个 Chrome 批次内串行执行。
+    planned_at_overrides = {task.id: planned_at for task in tasks}
+    return run_collection(
+        config,
+        selected_task_id=None,
+        force=False,
+        dry_run=False,
+        manual=False,
+        scheduled_tasks=tasks,
+        planned_at_overrides=planned_at_overrides,
+    )
 
 
 def run_status(config: AppConfig, limit: int) -> int:

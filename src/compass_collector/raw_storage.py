@@ -146,6 +146,19 @@ class RunStorage:
         )
         self._write_manifest()
 
+    def mark_auth_required(self, *, failed_page: int) -> None:
+        """Finalize an authentication-blocked run with its distinct terminal state."""
+
+        self.manifest.update(
+            {
+                "status": "auth_required",
+                "failed_page": failed_page,
+                "error_category": "auth_required",
+                "finished_at": current_time_iso(),
+            }
+        )
+        self._write_manifest()
+
     def mark_interrupted(self, *, failed_page: int) -> None:
         """Record an explicit developer interruption as a terminal state."""
 

@@ -1,4 +1,4 @@
-"""Command-line interface for stage-one login and collection."""
+"""Command-line interface for login, collection, status, and scheduling."""
 
 import argparse
 import sys
@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from compass_collector.config import load_config
 from compass_collector.runner import run_collection, run_login, run_status
+from compass_collector.scheduler import run_scheduler
 
 
 # 默认配置路径与工程方案保持一致。
@@ -15,9 +16,9 @@ DEFAULT_CONFIG_PATH = Path("config/tasks.yaml")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the two-command stage-one CLI parser."""
+    """Build the currently authorized stage-one through stage-four commands."""
 
-    # 顶层解析器只提供阶段二已授权命令。
+    # 顶层解析器只提供当前已授权阶段的命令。
     parser = argparse.ArgumentParser(prog="python -m compass_collector")
     # 子命令必填，避免无意启动 Chrome。
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -41,11 +42,17 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="show recent task runs")
     status_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     status_parser.add_argument("--limit", type=int, default=20)
+
+    # scheduler 命令以前台常驻方式执行，不实现 launchd 守护。
+    scheduler_parser = subparsers.add_parser(
+        "scheduler", help="run the foreground APScheduler"
+    )
+    scheduler_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     return parser
 
 
 def main() -> None:
-    """Validate configuration and dispatch a stage-one command."""
+    """Validate configuration and dispatch one authorized command."""
 
     # CLI 参数在任何配置或浏览器操作前解析。
     arguments = build_parser().parse_args()
@@ -61,10 +68,12 @@ def main() -> None:
                 force=arguments.force,
                 dry_run=arguments.dry_run,
             )
-        else:
+        elif arguments.command == "status":
             if arguments.limit <= 0:
                 raise ValueError("status --limit must be positive")
             exit_code = run_status(config, arguments.limit)
+        else:
+            exit_code = run_scheduler(config)
     except (OSError, ValueError, ValidationError) as error:
         print(f"启动失败：{error}", file=sys.stderr)
         exit_code = 2

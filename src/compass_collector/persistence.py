@@ -156,6 +156,18 @@ class ProductRankEntryShopModel(Base):
     shop_name: Mapped[str] = mapped_column(String(1024), nullable=False)
 
 
+class SchedulerCheckpoint(Base):
+    """Persist the last reconciliation boundary for one configured task."""
+
+    __tablename__ = "scheduler_checkpoints"
+
+    # 任务 ID 是调度检查点的稳定主键。
+    task_id: Mapped[str] = mapped_column(String(120), primary_key=True)
+    # SQLite 保存北京时间无时区墙上时间，与其他计划字段一致。
+    last_checked_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 @dataclass(frozen=True, slots=True)
 class PublishedBatch:
     """Expose non-sensitive publication metadata to the runner and status command."""
@@ -290,6 +302,99 @@ class Database:
                 )
             )
         return 1 if maximum_version is None else maximum_version + 1
+
+    def has_terminal_run(self, task_id: str, planned_at: datetime) -> bool:
+        """Return whether Scheduler has any completed attempt for a planned time."""
+
+        # Scheduler 与人工补跑不同：任意终态都阻止自动再次执行。
+        stored_planned_at = normalize_datetime(planned_at)
+        with self.session_factory() as session:
+            # collection_runs 只在任务已结束后写入，因此存在即为终态。
+            run_id = session.scalar(
+                select(CollectionRun.id)
+                .where(
+                    CollectionRun.task_id == task_id,
+                    CollectionRun.planned_at == stored_planned_at,
+                )
+                .limit(1)
+            )
+        return run_id is not None
+
+    def record_missed_run(
+        self,
+        *,
+        task_id: str,
+        business_date: date,
+        planned_at: datetime,
+        error_category: str,
+        recorded_at: datetime,
+    ) -> str | None:
+        """Persist one synthetic missed terminal state without raw runtime files."""
+
+        # 检查与写入在同一事务中完成，单进程 Scheduler 下保持幂等。
+        stored_planned_at = normalize_datetime(planned_at)
+        # missed run 使用独立 UUID，可被 status 稳定引用。
+        run_id = uuid4().hex
+        with self.session_factory.begin() as session:
+            # 已有成功、失败、鉴权或 missed 状态时不重复造记录。
+            existing_run_id = session.scalar(
+                select(CollectionRun.id)
+                .where(
+                    CollectionRun.task_id == task_id,
+                    CollectionRun.planned_at == stored_planned_at,
+                )
+                .limit(1)
+            )
+            if existing_run_id is not None:
+                return None
+            # missed 没有浏览器、HTTP 或原始响应目录。
+            stored_recorded_at = normalize_datetime(recorded_at)
+            session.add(
+                CollectionRun(
+                    id=run_id,
+                    batch_id=None,
+                    task_id=task_id,
+                    business_date=business_date,
+                    planned_at=stored_planned_at,
+                    status="missed",
+                    started_at=stored_recorded_at,
+                    finished_at=stored_recorded_at,
+                    error_category=error_category,
+                )
+            )
+        return run_id
+
+    def scheduler_checkpoint(self, task_id: str) -> datetime | None:
+        """Read one task's last durable reconciliation time."""
+
+        with self.session_factory() as session:
+            # 主键查询避免扫描其他任务的调度状态。
+            checkpoint = session.get(SchedulerCheckpoint, task_id)
+        return checkpoint.last_checked_at if checkpoint is not None else None
+
+    def set_scheduler_checkpoint(
+        self,
+        task_id: str,
+        checked_at: datetime,
+    ) -> None:
+        """Upsert one task checkpoint only after its due occurrences are handled."""
+
+        # 检查时间按 SQLite 统一墙上时间保存。
+        stored_checked_at = normalize_datetime(checked_at)
+        with self.session_factory.begin() as session:
+            # 主键存在时原地推进，不存在时初始化。
+            checkpoint = session.get(SchedulerCheckpoint, task_id)
+            if checkpoint is None:
+                session.add(
+                    SchedulerCheckpoint(
+                        task_id=task_id,
+                        last_checked_at=stored_checked_at,
+                        updated_at=stored_checked_at,
+                    )
+                )
+            else:
+                checkpoint.last_checked_at = stored_checked_at
+                checkpoint.updated_at = stored_checked_at
 
     def record_failed_run(
         self,

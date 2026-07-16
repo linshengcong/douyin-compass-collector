@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.zhuanz1.douyin-compass-collector</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UV_PATH__</string>
+        <string>run</string>
+        <string>--frozen</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>compass_collector</string>
+        <string>scheduler</string>
+        <string>--config</string>
+        <string>__CONFIG_PATH__</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_ROOT__</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>

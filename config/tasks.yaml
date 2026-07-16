@@ -1,3 +1,8 @@
+scheduler:
+  timezone: Asia/Shanghai
+  misfire_grace_minutes: 600
+  cross_day_backfill: false
+
 browser:
   channel: chrome
   headless: false
