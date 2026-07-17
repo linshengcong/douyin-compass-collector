@@ -102,20 +102,21 @@ def mark_missed_tasks(
 ) -> None:
     """Persist and log idempotent missed states for one planned task group."""
 
-    # 同一 missed 处理使用一个执行批次 ID 串联多任务日志。
-    execution_batch_id = uuid4().hex
+    # 同一 missed 处理使用一个通知批次 ID 汇总多任务结果。
+    notification_batch_id = uuid4().hex
     # 只汇总本次真正新建 missed 终态的任务。
     missed_results: list[TaskNotificationResult] = []
     for task in tasks:
         # 数据库存在任意终态时不会创建重复 missed。
-        run_id = database.record_missed_run(
+        # 持久化返回的是顶层 CollectionBatch.id，不是分类运行 ID。
+        persisted_batch_id = database.record_missed_run(
             task_id=task.id,
             business_date=planned_at.date(),
             planned_at=planned_at,
             error_category=error_category,
             recorded_at=recorded_at,
         )
-        if run_id is None:
+        if persisted_batch_id is None:
             continue
         missed_results.append(
             TaskNotificationResult(
@@ -134,8 +135,8 @@ def mark_missed_tasks(
             ),
             stage="scheduling",
             context=LogContext(
-                batch_id=execution_batch_id,
-                run_id=run_id,
+                batch_id=persisted_batch_id,
+                execution_batch_id=notification_batch_id,
                 task_id=task.id,
             ),
             details={
@@ -147,7 +148,7 @@ def mark_missed_tasks(
         # 一个计划时刻的 missed 任务只发送一条 Scheduler 汇总。
         deliver_batch_notification(
             BatchNotificationSummary(
-                batch_id=execution_batch_id,
+                batch_id=notification_batch_id,
                 source=BatchSource.SCHEDULER,
                 mode=BatchMode.OFFICIAL,
                 started_at=recorded_at,

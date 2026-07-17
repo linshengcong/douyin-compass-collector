@@ -41,6 +41,25 @@ class ResponseContractError(CollectorError):
     """Signal a successful JSON response that violates the verified contract."""
 
 
+class CategoryDiscoveryEmptyError(ResponseContractError):
+    """Signal that no target category exists in the selected category scope."""
+
+    def __init__(
+        self,
+        root_category_id: str | None = None,
+        root_category_name: str | None = None,
+    ) -> None:
+        """Create the stable empty-discovery error with an optional root snapshot."""
+
+        super().__init__(
+            "Category scope has no target level-three categories",
+            category="category_discovery_empty",
+        )
+        # 单根兼容路径可带根快照；全一级分类范围保持两个字段同时为空。
+        self.root_category_id = root_category_id
+        self.root_category_name = root_category_name
+
+
 class CollectionInterruptedError(CollectorError):
     """Signal a cooperative developer interruption without treating it as a failure."""
 
@@ -76,16 +95,34 @@ class BrowserOperationError(CollectorError):
         self.page_title = page_title[:200] if page_title else None
         # 截图仅在页面已经创建且捕获成功时存在。
         self.screenshot = screenshot
-
-
-class TaskCollectionError(Exception):
-    """Carry a failed run's local storage to the orchestration boundary."""
+class CategoryBatchPreparationError(Exception):
+    """Carry a failed stage-two batch and its safe collector error."""
 
     def __init__(self, cause: CollectorError, storage: Any) -> None:
-        """Wrap a safe collector error without changing its message or category."""
+        """Keep the finalized BatchStorage available to the orchestration layer."""
 
         super().__init__(str(cause))
-        # 原始安全错误用于区分鉴权、契约和网络失败。
+        # cause 只包含稳定错误分类和可选安全响应元数据。
         self.cause = cause
-        # 运行存储对象仅用于记录失败 run，不包含 Cookie。
+        # storage 仅指向本地批次路径和脱敏 Manifest。
         self.storage = storage
+
+
+class CategoryBatchCollectionError(Exception):
+    """Carry one terminal stage-three batch without exposing partial entries."""
+
+    def __init__(
+        self,
+        cause: CollectorError,
+        storage: Any,
+        completed_category_runs: tuple[Any, ...] = (),
+    ) -> None:
+        """Keep safe diagnostics while preventing a terminated batch publication."""
+
+        super().__init__(str(cause))
+        # cause 只包含稳定错误分类和可选本地失败响应。
+        self.cause = cause
+        # storage 让顶层编排可继续展示已经收口的批次 Manifest。
+        self.storage = storage
+        # 已完成分类仅供安全日志统计，终止批次不得发布这些结果。
+        self.completed_category_runs = completed_category_runs

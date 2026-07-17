@@ -13,8 +13,9 @@ from compass_collector.errors import BrowserOperationError
 # 固定安全页面不包含追踪、签名或账号参数。
 SAFE_RANKING_PAGE_URL = "https://compass.jinritemai.com/shop/chance/rank-product"
 # Cookie 查询使用完整 API 路径，让 Playwright 自动应用 domain/path/secure 规则。
-COMPASS_API_COOKIE_SCOPE = (
-    "https://compass.jinritemai.com/compass_api/shop/product/product_rank/market_hot_sale"
+COMPASS_API_COOKIE_SCOPES = (
+    "https://compass.jinritemai.com/compass_api/config_center/category/cate_list",
+    "https://compass.jinritemai.com/compass_api/shop/product/product_rank/market_hot_sale",
 )
 # 诊断材料只记录固定安全入口的路径，不保存完整 URL。
 SAFE_RANKING_PAGE_PATH = "/shop/chance/rank-product"
@@ -29,7 +30,7 @@ def build_page_error(
     """Capture best-effort safe page metadata without exception text."""
 
     try:
-        # 截图以字节形式返回，由 RunStorage 原子落盘。
+        # 截图以字节形式返回，由 BatchStorage 原子落盘。
         screenshot = page.screenshot(type="png")
     except Exception:
         screenshot = None
@@ -82,7 +83,13 @@ class BrowserSession:
                 self.page, error, failed_step="read_user_agent"
             ) from error
         if not isinstance(user_agent_value, str) or not user_agent_value:
-            raise RuntimeError("Chrome returned an invalid user agent")
+            # validation_error 只提供稳定异常类型，错误文本不会进入诊断材料。
+            validation_error = ValueError("invalid browser user agent")
+            raise build_page_error(
+                self.page,
+                validation_error,
+                failed_step="read_user_agent",
+            ) from validation_error
         return user_agent_value
 
     def whitelisted_cookies(self, cookie_names: list[str]) -> list[dict[str, Any]]:
@@ -93,7 +100,7 @@ class BrowserSession:
         # Playwright 只返回对目标源实际适用的 Cookie。
         try:
             # Cookie 值只返回给内存中的 httpx 客户端。
-            applicable_cookies = self.context.cookies([COMPASS_API_COOKIE_SCOPE])
+            applicable_cookies = self.context.cookies(list(COMPASS_API_COOKIE_SCOPES))
         except Exception as error:
             raise build_page_error(
                 self.page, error, failed_step="read_authentication"

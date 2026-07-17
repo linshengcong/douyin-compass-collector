@@ -7,6 +7,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from compass_collector.config import AppConfig, load_config
+from compass_collector.local_data import clear_local_data_with_locks
 from compass_collector.notifier import load_project_environment, run_notification_test
 from compass_collector.runner import run_collection, run_login, run_status
 from compass_collector.runtime_locks import RuntimeLockBusy
@@ -21,7 +22,7 @@ RUNTIME_LOG_DIRECTORY = Path("runtime/logs")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build the currently authorized stage-one through stage-four commands."""
+    """Build all currently supported local collector commands."""
 
     # 顶层解析器只提供当前已授权阶段的命令。
     parser = argparse.ArgumentParser(prog="python -m compass_collector")
@@ -40,6 +41,14 @@ def build_parser() -> argparse.ArgumentParser:
     # notify-test 显式发送一条真实测试消息，不需要加载业务任务配置。
     subparsers.add_parser("notify-test", help="send one DingTalk test message")
 
+    # clear-data 是开发期破坏性操作，必须显式提供 --yes。
+    clear_data_parser = subparsers.add_parser(
+        "clear-data",
+        help="clear local collection data but preserve the Chrome profile",
+    )
+    clear_data_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    clear_data_parser.add_argument("--yes", action="store_true")
+
     # run 命令默认使用 GUI，--no-gui 显式回退终端模式。
     run_parser = subparsers.add_parser(
         "run", help="collect and publish a ranking snapshot"
@@ -52,7 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_mode.add_argument("--force", action="store_true")
     run_mode.add_argument("--dry-run", action="store_true")
 
-    # status 命令只读取最近 run 摘要，不启动 Chrome。
+    # status 命令只读取最近批次摘要，不启动 Chrome。
     status_parser = subparsers.add_parser("status", help="show recent task runs")
     status_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     status_parser.add_argument("--limit", type=int, default=20)
@@ -135,6 +144,21 @@ def _dispatch_configured_command(
                     lock_mode=True,
                 ),
             )
+    elif arguments.command == "clear-data":
+        if not arguments.yes:
+            raise ValueError("clear-data requires --yes")
+        # 只在同时获得 Scheduler 和采集锁后执行白名单删除。
+        cleanup_summary = clear_local_data_with_locks(
+            Path("runtime"),
+            config.database.path,
+        )
+        print(
+            "本地采集数据清理完成："
+            f"数据库文件 {cleanup_summary.database_files}，"
+            f"数据目录 {cleanup_summary.runtime_directories}，"
+            f"失败 {cleanup_summary.failures}"
+        )
+        exit_code = 0 if cleanup_summary.succeeded else 1
     elif arguments.command == "status":
         if arguments.limit <= 0:
             raise ValueError("status --limit must be positive")

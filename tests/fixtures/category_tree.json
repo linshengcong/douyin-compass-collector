@@ -1,0 +1,94 @@
+{
+  "data": {
+    "cate_id": "fixture-level2-drinks",
+    "cate_list": [
+      {
+        "cate_id": "fixture-level1-other",
+        "cate_name": "服饰内衣",
+        "children": [
+          {
+            "cate_id": "fixture-level2-womenswear",
+            "cate_name": "女装",
+            "children": [
+              {
+                "cate_id": "fixture-level3-dresses",
+                "cate_name": "连衣裙",
+                "children": []
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "cate_id": "13",
+        "cate_name": "食品饮料",
+        "children": [
+          {
+            "cate_id": "fixture-level2-snacks",
+            "cate_name": "休闲食品",
+            "children": [
+              {
+                "cate_id": "0",
+                "cate_name": "全部",
+                "children": []
+              },
+              {
+                "cate_id": "fixture-level3-biscuit",
+                "cate_name": "饼干",
+                "children": []
+              },
+              {
+                "cate_id": "fixture-level3-seafood",
+                "cate_name": "海味零食",
+                "children": [
+                  {
+                    "cate_id": "fixture-level4-fish",
+                    "cate_name": "鱼类零食",
+                    "children": [
+                      {
+                        "cate_id": "fixture-level5-all",
+                        "cate_name": "全部",
+                        "children": []
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "cate_id": "fixture-level2-drinks",
+            "cate_name": "水饮冲调",
+            "children": [
+              {
+                "cate_id": "fixture-all-by-name",
+                "cate_name": "全部",
+                "children": []
+              },
+              {
+                "cate_id": "0",
+                "cate_name": "二级分类汇总",
+                "children": []
+              },
+              {
+                "cate_id": "fixture-level3-tea",
+                "cate_name": "茶叶",
+                "children": []
+              }
+            ]
+          },
+          {
+            "cate_id": "fixture-level2-empty",
+            "cate_name": "空二级分类",
+            "children": []
+          }
+        ]
+      }
+    ],
+    "cate_name": "水饮冲调",
+    "industry_id": "13",
+    "industry_name": "食品饮料"
+  },
+  "msg": "",
+  "st": 0
+}

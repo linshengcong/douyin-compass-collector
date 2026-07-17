@@ -1,14 +1,13 @@
 """Stage-three safety logging, diagnostics, and retention tests."""
 
 import json
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from compass_collector.config import RetentionConfig
-from compass_collector.raw_storage import RunStorage
 from compass_collector.retention import cleanup_runtime
 from compass_collector.runtime_logging import LogContext, RuntimeLogger
 
@@ -23,7 +22,11 @@ def test_jsonl_logging_requires_safe_fields_and_task_context(tmp_path: Path) -> 
     # 独立日志目录避免污染真实 runtime。
     logger = RuntimeLogger(tmp_path / "logs")
     # 三元上下文用于验证每条任务日志可完整定位。
-    context = LogContext(batch_id="batch-safe", run_id="run-safe", task_id="task_safe")
+    context = LogContext(
+        batch_id="batch-safe",
+        task_id="task_safe",
+        category_run_id="category-safe",
+    )
     logger.emit(
         level="INFO",
         event="page_collected",
@@ -38,7 +41,8 @@ def test_jsonl_logging_requires_safe_fields_and_task_context(tmp_path: Path) -> 
     payload = json.loads(log_path.read_text(encoding="utf-8"))
 
     assert payload["batch_id"] == "batch-safe"
-    assert payload["run_id"] == "run-safe"
+    assert payload["category_run_id"] == "category-safe"
+    assert "run_id" not in payload
     assert payload["task_id"] == "task_safe"
     assert payload["stage"] == "collection"
     with pytest.raises(ValueError):
@@ -109,61 +113,3 @@ def test_retention_deletes_only_expired_disposable_material(tmp_path: Path) -> N
     assert database_path.read_text() == "keep"
     assert export_path.read_text() == "keep"
     assert profile_path.read_text() == "keep"
-
-
-def test_browser_failure_artifacts_are_atomic_and_sanitized(tmp_path: Path) -> None:
-    """Persist an optional screenshot plus safe page metadata only."""
-
-    # 独立运行存储用于验证页面失败材料。
-    storage = RunStorage(
-        runtime_root=tmp_path,
-        task_id="product_hot_sale_drinks",
-        business_date=date(2026, 7, 16),
-        max_items=200,
-    )
-    # PNG 字节仅验证存储边界，截图生成本身由 Playwright 负责。
-    screenshot = b"\x89PNG\r\n\x1a\nfixture"
-    storage.save_browser_failure(
-        error_category="browser_page_error",
-        failed_step="open_safe_page",
-        exception_type="TimeoutError",
-        safe_page_path="/shop/chance/rank-product",
-        page_title="电商罗盘",
-        screenshot=screenshot,
-    )
-    # 诊断 JSON 用于确认只包含安全路径而非完整 URL。
-    diagnostic_path = storage.artifact_dir / "failure.json"
-    diagnostic = json.loads(diagnostic_path.read_text(encoding="utf-8"))
-
-    assert (storage.artifact_dir / "failure.png").read_bytes() == screenshot
-    assert diagnostic["safe_page_path"] == "/shop/chance/rank-product"
-    assert "http" not in diagnostic_path.read_text(encoding="utf-8")
-    assert not list(storage.artifact_dir.glob("*.tmp"))
-
-
-def test_network_failure_without_response_still_has_diagnostic(tmp_path: Path) -> None:
-    """Create failure.json without inventing an HTTP response body file."""
-
-    # 超时类错误没有响应正文，但仍需要独立诊断目录。
-    storage = RunStorage(
-        runtime_root=tmp_path,
-        task_id="product_hot_sale_drinks",
-        business_date=date(2026, 7, 16),
-        max_items=200,
-    )
-    storage.save_failure_response(
-        status_code=None,
-        error_category="timeout",
-        response_body=None,
-        failed_step="http_request_or_contract_validation",
-        exception_type="HttpRequestError",
-        safe_endpoint_path="/compass_api/shop/product/product_rank/market_hot_sale",
-    )
-    # 诊断摘要明确说明本次没有可保存的响应正文。
-    diagnostic = json.loads(
-        (storage.artifact_dir / "failure.json").read_text(encoding="utf-8")
-    )
-
-    assert diagnostic["response_saved"] is False
-    assert diagnostic["saved_bytes"] == 0
-    assert not (storage.artifact_dir / "failure-response.txt").exists()

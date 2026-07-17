@@ -176,6 +176,45 @@ def test_summary_reports_partial_failure_and_never_exposes_csv_path() -> None:
     assert len(markdown.encode("utf-8")) <= MAX_MARKDOWN_BYTES
 
 
+def test_summary_renders_signed_csv_url_only_as_a_dingtalk_link() -> None:
+    """Keep the temporary OSS URL out of local paths while making CSV downloadable."""
+
+    signed_url = "https://oss.example.invalid/exports/safe.csv?signature=fake"
+    _, markdown = render_batch_markdown(
+        _summary(
+            TaskNotificationResult(
+                task_id="success-task",
+                display_name="成功任务",
+                status=TaskNotificationStatus.SUCCESS,
+                csv_filename="safe.csv",
+                csv_download_url=signed_url,
+            )
+        )
+    )
+
+    assert "[safe.csv](https://oss.example.invalid/exports/safe.csv?signature=fake)" in markdown
+    assert "/Users/" not in markdown
+
+
+def test_summary_marks_oss_upload_failure_without_changing_collection_status() -> None:
+    """Show that the CSV stayed published when only its optional OSS upload failed."""
+
+    _, markdown = render_batch_markdown(
+        _summary(
+            TaskNotificationResult(
+                task_id="success-task",
+                display_name="成功任务",
+                status=TaskNotificationStatus.SUCCESS,
+                csv_filename="safe.csv",
+                oss_error_category="oss_upload_failed",
+            )
+        )
+    )
+
+    assert "`success`" in markdown
+    assert "OSS 上传失败：oss_upload_failed" in markdown
+
+
 def test_summary_treats_success_plus_idempotent_skip_as_success() -> None:
     """Avoid calling an already-successful skipped task a partial failure."""
 
@@ -194,6 +233,72 @@ def test_summary_treats_success_plus_idempotent_skip_as_success() -> None:
     )
 
     assert summary.status is BatchNotificationStatus.SUCCESS
+
+
+def test_summary_reports_published_partial_success_without_calling_it_failure() -> None:
+    """Distinguish one published partial result from a failed task batch."""
+
+    # 单任务已发布 CSV，但内部有一个分类失败。
+    summary = _summary(
+        TaskNotificationResult(
+            task_id="partial-task",
+            display_name="部分成功任务",
+            status=TaskNotificationStatus.PARTIAL_SUCCESS,
+            saved_pages=2,
+            saved_items=20,
+            csv_filename="partial.csv",
+        )
+    )
+
+    title, markdown = render_batch_markdown(summary)
+
+    assert summary.status is BatchNotificationStatus.PARTIAL_SUCCESS
+    assert "部分成功" in title
+    assert "部分失败" not in title
+    assert "partial_success" in markdown
+    assert "partial.csv" in markdown
+
+
+def test_dry_run_partial_success_uses_its_own_summary_state() -> None:
+    """Label an accepted dry-run partial result without implying publication."""
+
+    # dry-run 同样允许一至两个普通分类失败，但不会产生 CSV。
+    summary = _summary(
+        TaskNotificationResult(
+            task_id="dry-partial-task",
+            display_name="试运行部分成功",
+            status=TaskNotificationStatus.PARTIAL_SUCCESS,
+            saved_items=10,
+        ),
+        mode=BatchMode.DRY_RUN,
+    )
+
+    title, _ = render_batch_markdown(summary)
+
+    assert summary.status is BatchNotificationStatus.DRY_RUN_PARTIAL_SUCCESS
+    assert "试运行部分成功" in title
+
+
+def test_partial_success_plus_failed_task_remains_partial_failure() -> None:
+    """Use partial_failure only when another top-level task truly failed."""
+
+    # 一个已发布部分成功任务和一个失败任务构成命令级部分失败。
+    summary = _summary(
+        TaskNotificationResult(
+            task_id="partial-task",
+            display_name="已发布部分成功",
+            status=TaskNotificationStatus.PARTIAL_SUCCESS,
+            csv_filename="partial.csv",
+        ),
+        TaskNotificationResult(
+            task_id="failed-task",
+            display_name="失败任务",
+            status=TaskNotificationStatus.FAILED,
+            error_category="network_error",
+        ),
+    )
+
+    assert summary.status is BatchNotificationStatus.PARTIAL_FAILURE
 
 
 def test_summary_truncates_task_rows_at_utf8_limit() -> None:
@@ -308,6 +413,8 @@ def test_delivery_failure_never_raises_or_changes_batch_result(
     monkeypatch.setenv("DINGTALK_ENABLED", "true")
     monkeypatch.setenv("DINGTALK_WEBHOOK_URL", FAKE_WEBHOOK)
     monkeypatch.setenv("DINGTALK_SECRET", FAKE_SECRET)
+    # log_events 捕获通知边界发出的已脱敏生命周期事件。
+    log_events: list[dict] = []
     summary = _summary(
         TaskNotificationResult(
             task_id="task",
@@ -318,7 +425,7 @@ def test_delivery_failure_never_raises_or_changes_batch_result(
 
     result = deliver_batch_notification(
         summary,
-        RuntimeLogger(tmp_path / "logs"),
+        RuntimeLogger(tmp_path / "logs", event_sink=log_events.append),
         transport=httpx.MockTransport(timeout_request),
     )
 
@@ -326,6 +433,10 @@ def test_delivery_failure_never_raises_or_changes_batch_result(
     assert result.status is NotificationDeliveryStatus.FAILED
     assert result.error_category == "notification_timeout"
     assert request_count == 1
+    assert {event["execution_batch_id"] for event in log_events} == {
+        summary.batch_id
+    }
+    assert {event["batch_id"] for event in log_events} == {None}
     # 持久事件只能包含安全分类，不得落盘假凭证。
     log_text = next((tmp_path / "logs").glob("*.jsonl")).read_text(encoding="utf-8")
     assert "fake_test_value" not in log_text

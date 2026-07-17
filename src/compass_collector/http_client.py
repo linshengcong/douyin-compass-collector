@@ -1,40 +1,61 @@
-"""Minimal synchronous HTTP client for the verified Compass endpoint."""
+"""Minimal synchronous HTTP client shared by all Compass API requests."""
 
+import random
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
 from compass_collector.browser import SAFE_RANKING_PAGE_URL
+from compass_collector.category_discovery import CATEGORY_TREE_ENDPOINT_PATH
 from compass_collector.config import HttpConfig, TaskConfig
-from compass_collector.errors import AuthRequiredError, HttpRequestError, HttpResponseError
+from compass_collector.errors import (
+    AuthRequiredError,
+    CollectionInterruptedError,
+    HttpRequestError,
+    HttpResponseError,
+)
 
 
 # 固定接口源不包含任何账号或签名参数。
 COMPASS_API_ORIGIN = "https://compass.jinritemai.com"
-# 标准重定向状态对预期 JSON 接口而言视为登录态异常。
+# 标准重定向对预期 JSON 接口而言视为登录态异常。
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+# 等待函数返回 True 表示用户在间隔中请求中止。
+DelayWaiter = Callable[[float], bool]
 
 
 @dataclass(frozen=True, slots=True)
-class HttpPageResponse:
+class HttpJsonResponse:
     """Keep parsed JSON and local-only response bytes together for diagnostics."""
 
+    # payload 进入契约校验，body 只在失败时进入本地受限材料。
     payload: dict[str, Any]
     body: bytes
     status_code: int
 
 
-class ProductRankHttpClient:
-    """Call product ranking pages serially with runtime browser authentication."""
+def _sleep_without_interruption(delay_seconds: float) -> bool:
+    """Sleep in terminal mode and report that no cooperative stop occurred."""
+
+    time.sleep(delay_seconds)
+    return False
+
+
+class CompassHttpClient:
+    """Call category and ranking APIs serially with one authenticated Cookie jar."""
 
     def __init__(
         self,
         config: HttpConfig,
         cookies: list[dict[str, Any]],
         user_agent: str,
+        *,
+        wait_for_delay: DelayWaiter | None = None,
     ) -> None:
-        """Create an httpx client with only the agreed minimal request surface."""
+        """Create one minimal httpx client and unified request throttle."""
 
         # 超时对象分别限制连接和响应读取阶段。
         timeout = httpx.Timeout(
@@ -65,21 +86,44 @@ class ProductRankHttpClient:
                 domain=cookie.get("domain"),
                 path=cookie.get("path", "/"),
             )
+        # 请求间隔边界同时覆盖分类、分页和分类切换。
+        self._minimum_interval = config.request_interval_seconds.min
+        self._maximum_interval = config.request_interval_seconds.max
+        # GUI 传入可中断 waiter，终端模式默认使用 sleep。
+        self._wait_for_delay = wait_for_delay or _sleep_without_interruption
+        # 第一个罗盘 API 请求立即发送，后续请求才等待。
+        self._has_requested = False
 
     def close(self) -> None:
         """Release connections and the in-memory Cookie jar."""
 
         self._client.close()
 
-    def get_page(
-        self,
-        task: TaskConfig,
-        params: dict[str, str | int],
-    ) -> HttpPageResponse:
-        """Request one page without retries and return its parsed JSON."""
+    def _wait_before_request(self) -> None:
+        """Apply one random delay before every request after the first attempt."""
 
-        # 固定源和经验证路径组成不含动态签名的接口地址。
-        endpoint_url = f"{COMPASS_API_ORIGIN}{task.rank.endpoint_path}"
+        if not self._has_requested:
+            return
+        # 间隔每次独立随机生成，不使用固定频率。
+        delay_seconds = random.uniform(self._minimum_interval, self._maximum_interval)
+        if self._wait_for_delay(delay_seconds):
+            raise CollectionInterruptedError(
+                "Collection interrupted during request interval",
+                category="interrupted",
+            )
+
+    def _get_json(
+        self,
+        endpoint_path: str,
+        params: dict[str, str | int],
+    ) -> HttpJsonResponse:
+        """Request one fixed Compass endpoint without retries and parse its JSON."""
+
+        self._wait_before_request()
+        # 请求尝试开始后立即记录，失败后的下一次请求仍会等待。
+        self._has_requested = True
+        # 固定源与代码内部路径组成不含动态签名的接口地址。
+        endpoint_url = f"{COMPASS_API_ORIGIN}{endpoint_path}"
         try:
             # 业务参数由 httpx 编码，请求 URL 不写入日志。
             response = self._client.get(endpoint_url, params=params)
@@ -133,8 +177,25 @@ class ProductRankHttpClient:
                 status_code=response.status_code,
                 response_body=response_body,
             )
-        return HttpPageResponse(
+        return HttpJsonResponse(
             payload=payload,
             body=response_body,
             status_code=response.status_code,
         )
+
+    def get_category_tree(
+        self,
+        params: dict[str, str | int],
+    ) -> HttpJsonResponse:
+        """Request the fixed category-tree endpoint once per top-level task."""
+
+        return self._get_json(CATEGORY_TREE_ENDPOINT_PATH, params)
+
+    def get_product_rank_page(
+        self,
+        task: TaskConfig,
+        params: dict[str, str | int],
+    ) -> HttpJsonResponse:
+        """Request one product ranking page through the shared throttle."""
+
+        return self._get_json(task.rank.endpoint_path, params)

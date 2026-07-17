@@ -54,6 +54,7 @@ class TaskNotificationStatus(str, Enum):
     """Represent one task outcome without exposing internal exception text."""
 
     SUCCESS = "success"
+    PARTIAL_SUCCESS = "partial_success"
     FAILED = "failed"
     AUTH_REQUIRED = "auth_required"
     INTERRUPTED = "interrupted"
@@ -68,6 +69,8 @@ class BatchNotificationStatus(str, Enum):
 
     SUCCESS = "success"
     DRY_RUN_SUCCESS = "dry_run_success"
+    PARTIAL_SUCCESS = "partial_success"
+    DRY_RUN_PARTIAL_SUCCESS = "dry_run_partial_success"
     PARTIAL_FAILURE = "partial_failure"
     FAILED = "failed"
     INTERRUPTED = "interrupted"
@@ -122,6 +125,10 @@ class TaskNotificationResult:
     saved_items: int = 0
     # csv_filename 只允许文件名，不允许本机绝对路径。
     csv_filename: str | None = None
+    # csv_download_url 仅存在于本次进程内，作为钉钉消息中的短期下载凭证。
+    csv_download_url: str | None = None
+    # oss_error_category 不改变采集结果，只说明附加上传步骤失败。
+    oss_error_category: str | None = None
     # error_category 使用采集器稳定安全分类。
     error_category: str | None = None
 
@@ -130,7 +137,7 @@ class TaskNotificationResult:
 class BatchNotificationSummary:
     """Aggregate one explicit runner or Scheduler occurrence into one message."""
 
-    # batch_id 用于与 JSONL 安全事件互相定位。
+    # batch_id 是通知执行批次 ID，对应 JSONL 的 execution_batch_id。
     batch_id: str
     # source 和 mode 决定通知标题中的运行语义。
     source: BatchSource
@@ -162,19 +169,31 @@ class BatchNotificationSummary:
         # 已成功和幂等跳过的混合批次不应误报“部分失败”。
         successful_statuses = {
             TaskNotificationStatus.SUCCESS,
+            TaskNotificationStatus.PARTIAL_SUCCESS,
             TaskNotificationStatus.SKIPPED,
         }
         if task_statuses and all(
             status in successful_statuses for status in task_statuses
         ):
+            if TaskNotificationStatus.PARTIAL_SUCCESS in task_statuses:
+                return (
+                    BatchNotificationStatus.DRY_RUN_PARTIAL_SUCCESS
+                    if self.mode is BatchMode.DRY_RUN
+                    else BatchNotificationStatus.PARTIAL_SUCCESS
+                )
             return (
                 BatchNotificationStatus.DRY_RUN_SUCCESS
                 if self.mode is BatchMode.DRY_RUN
                 else BatchNotificationStatus.SUCCESS
             )
-        # 只有任务真实 success 才计入部分成功数量。
+        # 已发布 success/partial_success 都可与其他失败任务组成 partial_failure。
         success_count = sum(
-            status is TaskNotificationStatus.SUCCESS for status in task_statuses
+            status
+            in {
+                TaskNotificationStatus.SUCCESS,
+                TaskNotificationStatus.PARTIAL_SUCCESS,
+            }
+            for status in task_statuses
         )
         if success_count > 0:
             return BatchNotificationStatus.PARTIAL_FAILURE
@@ -294,6 +313,8 @@ def _batch_title(status: BatchNotificationStatus, *, test: bool = False) -> str:
     titles = {
         BatchNotificationStatus.SUCCESS: "✅ 罗盘采集成功",
         BatchNotificationStatus.DRY_RUN_SUCCESS: "✅ 罗盘试运行成功",
+        BatchNotificationStatus.PARTIAL_SUCCESS: "⚠️ 罗盘采集部分成功",
+        BatchNotificationStatus.DRY_RUN_PARTIAL_SUCCESS: "⚠️ 罗盘试运行部分成功",
         BatchNotificationStatus.PARTIAL_FAILURE: "⚠️ 罗盘采集部分失败",
         BatchNotificationStatus.FAILED: "❌ 罗盘采集失败",
         BatchNotificationStatus.INTERRUPTED: "⏹️ 罗盘采集已中止",
@@ -342,8 +363,20 @@ def render_batch_markdown(summary: BatchNotificationSummary) -> tuple[str, str]:
     task_lines: list[str] = []
     omitted_count = 0
     for task_index, task in enumerate(summary.tasks):
-        # 结果列优先显示 CSV 文件名，其次显示稳定错误分类。
-        result_text = task.csv_filename or task.error_category or "-"
+        # 下载链接仅写入钉钉正文，不写入运行时日志、Manifest 或 SQLite。
+        if task.csv_filename and task.csv_download_url:
+            result_text = (
+                f"[{_escape_markdown_cell(task.csv_filename)}]"
+                f"({task.csv_download_url})"
+            )
+        elif task.csv_filename and task.oss_error_category:
+            result_text = (
+                f"{_escape_markdown_cell(task.csv_filename)} "
+                f"(OSS 上传失败：{_escape_markdown_cell(task.oss_error_category)})"
+            )
+        else:
+            # 未启用 OSS 时保持已有 CSV 文件名展示语义。
+            result_text = task.csv_filename or task.error_category or "-"
         task_line = (
             f"| {_escape_markdown_cell(task.display_name)} "
             f"| `{task.status.value}` | {task.saved_pages} | {task.saved_items} "
@@ -482,8 +515,8 @@ def deliver_batch_notification(
 ) -> NotificationDeliveryResult:
     """Send one batch summary and emit safe lifecycle events without raising."""
 
-    # 批次级日志上下文不伪造 run_id 或 task_id。
-    log_context = LogContext(batch_id=summary.batch_id)
+    # 通知汇总批次不伪装成可定位 SQLite/raw 的任务业务批次。
+    log_context = LogContext(execution_batch_id=summary.batch_id)
     try:
         # 配置、渲染和网络 Adapter 都收口在通知边界内。
         settings = load_dingtalk_settings()
@@ -568,7 +601,8 @@ def run_notification_test(
 
     # 测试批次 ID 只用于串联安全 JSONL，不包含主机或用户信息。
     test_batch_id = f"notify_test_{uuid4().hex}"
-    log_context = LogContext(batch_id=test_batch_id)
+    # 测试消息只有独立执行身份，不占用业务 batch_id。
+    log_context = LogContext(execution_batch_id=test_batch_id)
     settings = load_dingtalk_settings()
     if not settings.enabled or not settings.valid:
         runtime_logger.emit(

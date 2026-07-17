@@ -18,16 +18,21 @@ SAFE_DETAIL_FIELDS = {
     "artifact_path",
     "authentication_item_count",
     "batch_status",
+    "category_id",
+    "category_path",
     "cleanup_counts",
     "csv_path",
     "delay_seconds",
+    "discovered_category_count",
+    "discovery_order",
     "dry_run",
     "error_category",
+    "level1_category_count",
     "page_no",
     "planned_at",
+    "root_category_name",
     "saved_items",
     "status_code",
-    "target_items",
     "target_pages",
     "version",
 }
@@ -53,18 +58,26 @@ EventSink = Callable[[dict[str, Any]], None]
 class LogContext:
     """Identify one task attempt in every task-scoped log entry."""
 
-    # 执行批次 ID 与数据库自增主键解耦，启动时即可用于串联日志。
-    batch_id: str
-    # 每次任务尝试的 run_id 与原始响应目录一致。
-    run_id: str | None = None
+    # 业务批次 ID 连接 SQLite、raw、分类分页和正式发布结果。
+    batch_id: str | None = None
+    # 执行批次 ID 连接一次多任务运行及其批次汇总通知。
+    execution_batch_id: str | None = None
     # 任务 ID 用于多任务运行时过滤日志。
     task_id: str | None = None
+    # 分类运行 ID 只在进入某个三级分类边界后存在。
+    category_run_id: str | None = None
 
 
 class RuntimeLogger:
     """Append safe structured events to one Beijing-date JSONL file."""
 
-    def __init__(self, log_directory: Path, event_sink: EventSink | None = None) -> None:
+    def __init__(
+        self,
+        log_directory: Path,
+        event_sink: EventSink | None = None,
+        *,
+        execution_batch_id: str | None = None,
+    ) -> None:
         """Create the daily log directory without opening a long-lived handle."""
 
         # 日志目录在第一次事件写入前创建。
@@ -72,6 +85,8 @@ class RuntimeLogger:
         self.log_directory.mkdir(parents=True, exist_ok=True)
         # event_sink 用于当前进程 GUI 实时展示，不拥有第二套日志。
         self.event_sink = event_sink
+        # execution_batch_id 让无须逐层传参的任务日志仍归属同一次运行。
+        self.execution_batch_id = execution_batch_id
 
     def _log_path(self, captured_at: datetime) -> Path:
         """Return the natural daily-rotation path for one event timestamp."""
@@ -112,15 +127,20 @@ class RuntimeLogger:
             raise ValueError(f"sensitive markers in log event: {matched_markers}")
         # 单条日志时间戳只计算一次，文件名与正文保持一致。
         captured_at = datetime.now(SHANGHAI_TIMEZONE)
-        # 无任务上下文的系统事件显式输出 null，不伪造 run_id。
+        # 无任务上下文的系统事件显式输出 null，不伪造分类运行 ID。
         payload: dict[str, Any] = {
             "timestamp": captured_at.isoformat(),
             "level": level,
             "event": event,
             "message": message,
             "batch_id": context.batch_id if context else None,
-            "run_id": context.run_id if context else None,
+            "execution_batch_id": (
+                context.execution_batch_id
+                if context is not None and context.execution_batch_id is not None
+                else self.execution_batch_id
+            ),
             "task_id": context.task_id if context else None,
+            "category_run_id": context.category_run_id if context else None,
             "stage": stage,
             **safe_details,
         }
@@ -144,7 +164,7 @@ class RuntimeLogger:
 
 
 def read_latest_batch_events(log_directory: Path, limit: int = 500) -> list[dict[str, Any]]:
-    """Read at most one latest batch of persisted safe JSONL events."""
+    """Read the latest execution or legacy business batch from safe JSONL."""
 
     if limit <= 0 or not log_directory.exists():
         return []
@@ -159,13 +179,36 @@ def read_latest_batch_events(log_directory: Path, limit: int = 500) -> list[dict
                 continue
             if isinstance(event, dict):
                 all_events.append(event)
-    # 从最新事件向前查找最后一个真实采集批次 ID。
+    # 新日志优先按执行批次恢复，保留同次多任务及通知的完整事件链。
+    latest_execution_batch_id = next(
+        (
+            event.get("execution_batch_id")
+            for event in reversed(all_events)
+            if event.get("execution_batch_id")
+        ),
+        None,
+    )
+    if latest_execution_batch_id is not None:
+        # execution_events 同时包含任务业务批次和无业务 batch_id 的通知事件。
+        execution_events = [
+            event
+            for event in all_events
+            if event.get("execution_batch_id") == latest_execution_batch_id
+        ]
+        return execution_events[-limit:]
+    # 兼容升级前日志：通知汇总 ID 不能冒充可定位的任务业务批次。
     latest_batch_id = next(
-        (event.get("batch_id") for event in reversed(all_events) if event.get("batch_id")),
+        (
+            event.get("batch_id")
+            for event in reversed(all_events)
+            if event.get("batch_id") and event.get("task_id")
+        ),
         None,
     )
     if latest_batch_id is None:
         return list(all_events)[-limit:]
-    # 只恢复最近批次，系统级 Scheduler 日志由实时通道继续追加。
-    batch_events = [event for event in all_events if event.get("batch_id") == latest_batch_id]
+    # 旧格式只恢复最近任务批次，避免最后写入的通知汇总遮蔽业务日志。
+    batch_events = [
+        event for event in all_events if event.get("batch_id") == latest_batch_id
+    ]
     return batch_events[-limit:]

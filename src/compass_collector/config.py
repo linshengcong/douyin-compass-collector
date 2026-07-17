@@ -45,10 +45,12 @@ class AuthConfig(StrictModel):
 
 
 class IntervalConfig(StrictModel):
-    """Configure the randomized delay between successful page requests."""
+    """Configure the randomized delay between serial Compass API requests."""
 
-    min: float = Field(ge=1, le=2)
-    max: float = Field(ge=1, le=2)
+    # 所有罗盘 API 请求的最小随机间隔。
+    min: float = Field(ge=0.1, le=1)
+    # 所有罗盘 API 请求的最大随机间隔。
+    max: float = Field(ge=0.1, le=1)
 
     @field_validator("max")
     @classmethod
@@ -58,15 +60,16 @@ class IntervalConfig(StrictModel):
         # Pydantic 已校验的最小值用于比较间隔上下界。
         minimum = info.data.get("min")
         if minimum is not None and value < minimum:
-            raise ValueError("page interval max must be greater than or equal to min")
+            raise ValueError("request interval max must be greater than or equal to min")
         return value
 
 
 class HttpConfig(StrictModel):
-    """Configure the synchronous HTTP client used by stage one."""
+    """Configure the synchronous HTTP client shared by category and rank requests."""
 
     concurrency: Literal[1] = 1
-    page_interval_seconds: IntervalConfig
+    # 分类树和榜单分页共用同一请求间隔。
+    request_interval_seconds: IntervalConfig
     connect_timeout_seconds: float = Field(gt=0)
     read_timeout_seconds: float = Field(gt=0)
 
@@ -97,20 +100,24 @@ class SchedulerConfig(StrictModel):
     cross_day_backfill: Literal[False] = False
 
 
-class FilterOption(StrictModel):
-    """Pair a platform ID with its human-readable name."""
+class CategoryScopeConfig(StrictModel):
+    """Discover target-level descendants below every level-one category."""
 
-    id: int = Field(gt=0)
-    name: str = Field(min_length=1)
+    # 当前任务遍历分类接口返回的全部非汇总一级分类。
+    mode: Literal["all_level1"] = "all_level1"
+    # 当前数据契约只采集三级分类。
+    target_level: Literal[3] = 3
+    # “全部”节点必须排除，避免与子分类重复。
+    exclude_all: Literal[True] = True
 
 
 class FiltersConfig(StrictModel):
     """Configure the verified product ranking filters."""
 
-    industry: FilterOption
-    category: FilterOption
-    brand_type: Literal[-1] = -1
-    price_bin: Literal["不限"] = "不限"
+    # 当前只开放真实请求验证过的不限和非知名品牌值。
+    brand_type: Literal[-1, 0] = -1
+    # 当前只开放真实请求验证过的不限和严格大于一万元价格带。
+    price_bin: Literal["不限", "10001-?"] = "不限"
     search_info: Literal[""] = ""
 
 
@@ -126,16 +133,10 @@ class RankConfig(StrictModel):
 
 
 class DateConfig(StrictModel):
-    """Restrict stage one to the verified current-day request semantics."""
+    """Restrict collection to the verified current-day request semantics."""
 
     strategy: Literal["today"] = "today"
     date_type: Literal[1] = 1
-
-
-class PaginationConfig(StrictModel):
-    """Configure a page-aligned item limit for the fixed ten-item endpoint."""
-
-    max_items: int = Field(gt=0, le=200, multiple_of=10)
 
 
 class TaskConfig(StrictModel):
@@ -146,9 +147,10 @@ class TaskConfig(StrictModel):
     display_name: str = Field(min_length=1)
     schedule: str = Field(min_length=1)
     rank: RankConfig
+    # 分类范围每次任务从平台分类树动态发现。
+    category_scope: CategoryScopeConfig
     filters: FiltersConfig
     date: DateConfig
-    pagination: PaginationConfig
 
     @field_validator("schedule")
     @classmethod

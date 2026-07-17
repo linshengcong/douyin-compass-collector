@@ -93,14 +93,14 @@ def test_first_reconcile_runs_today_once_and_advances_checkpoint(
 
     assert calls == [
         (
-            ["product_hot_sale_drinks"],
+            ["product_hot_sale_all_level3"],
             datetime(2026, 7, 16, 14, 0, tzinfo=SHANGHAI_TIMEZONE),
         )
     ]
     # 持久化检查点证明第二次调用没有依赖进程内状态。
     database = Database(config.database.path)
     try:
-        checkpoint = database.scheduler_checkpoint("product_hot_sale_drinks")
+        checkpoint = database.scheduler_checkpoint("product_hot_sale_all_level3")
     finally:
         database.close()
     assert checkpoint == datetime(2026, 7, 16, 15, 0)
@@ -119,7 +119,7 @@ def test_cross_day_occurrence_is_missed_and_never_dispatched(
     database = Database(config.database.path)
     try:
         database.set_scheduler_checkpoint(
-            "product_hot_sale_drinks",
+            "product_hot_sale_all_level3",
             datetime(2026, 7, 15, 13, 0, tzinfo=SHANGHAI_TIMEZONE),
         )
     finally:
@@ -181,7 +181,7 @@ def test_same_cron_tasks_dispatch_as_one_serial_batch(
     now = datetime(2026, 7, 16, 15, 0, tzinfo=SHANGHAI_TIMEZONE)
     reconcile_scheduler_once(config, now=now, run_callback=fake_run)
 
-    assert calls == [["product_hot_sale_drinks", "product_hot_sale_second"]]
+    assert calls == [["product_hot_sale_all_level3", "product_hot_sale_second"]]
 
 
 def test_scheduler_auth_failure_closes_browser_without_waiting(
@@ -246,8 +246,10 @@ def test_scheduler_auth_failure_closes_browser_without_waiting(
     assert lifecycle == {"closed": 1, "waited": 0}
     assert len(rows) == 2
     assert {row.task_id for row in rows} == {
-        "product_hot_sale_drinks",
+        "product_hot_sale_all_level3",
         "product_hot_sale_second",
     }
     assert {row.status for row in rows} == {"auth_required"}
     assert {row.error_category for row in rows} == {"auth_required"}
+    # 每个 TaskExecutionPlan 必须拥有独立 collection batch 主键。
+    assert len({row.batch_id for row in rows}) == 2

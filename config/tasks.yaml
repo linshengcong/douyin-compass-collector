@@ -42,9 +42,9 @@ auth:
 
 http:
   concurrency: 1
-  page_interval_seconds:
-    min: 1
-    max: 2
+  request_interval_seconds:
+    min: 0.1
+    max: 0.3
   connect_timeout_seconds: 10
   read_timeout_seconds: 30
 
@@ -59,27 +59,25 @@ retention:
   delete_exports: false
 
 tasks:
-  - id: product_hot_sale_drinks
+  - id: product_hot_sale_all_level3
     enabled: true
-    display_name: 水饮冲调商品实时总榜
+    display_name: 全行业三级分类商品实时榜
     schedule: "0 14 * * *"
     rank:
       type: product_hot_sale
       endpoint_path: /compass_api/shop/product/product_rank/market_hot_sale
       rank_data_type: 1
       activity_id: ""
+    category_scope:
+      mode: all_level1
+      target_level: 3
+      exclude_all: true
     filters:
-      industry:
-        id: 13
-        name: 食品饮料
-      category:
-        id: 1000001823
-        name: 水饮冲调
-      brand_type: -1
-      price_bin: 不限
+      # 已验证：0 表示非知名品牌 1 表示知名品牌。
+      brand_type: 0
+      # 已验证：10001-? 表示价格严格大于 10000 且无上限。
+      price_bin: "不限"
       search_info: ""
     date:
       strategy: today
       date_type: 1
-    pagination:
-      max_items: 200

@@ -1,21 +1,42 @@
-"""Pure pagination-plan tests."""
+"""Pure uncapped pagination-plan tests for one dynamic category."""
+
+import pytest
 
 from compass_collector.product_rank import calculate_pagination_plan
 
 
-def test_total_below_cap_uses_partial_final_page() -> None:
-    """Request sixteen pages when the platform total is 156."""
+@pytest.mark.parametrize(
+    ("total", "expected_page_count"),
+    [
+        (0, 1),
+        (1, 1),
+        (10, 1),
+        (11, 2),
+        (73, 8),
+        (200, 20),
+        (201, 21),
+        (500, 50),
+    ],
+)
+def test_pagination_covers_the_complete_api_total(
+    total: int,
+    expected_page_count: int,
+) -> None:
+    """Request every ten-item page without a two-hundred-item cap."""
 
-    # 总数小于任务上限时完整覆盖平台榜单。
-    plan = calculate_pagination_plan(total=156, max_items=200)
-    assert plan.target_items == 156
-    assert plan.target_pages == 16
+    # 分页计划保留接口完整 total，不再计算任何裁剪后的目标条数。
+    plan = calculate_pagination_plan(total)
+
+    assert plan.api_total == total
+    assert plan.target_page_count == expected_page_count
 
 
-def test_total_above_cap_stops_at_two_hundred_items() -> None:
-    """Request twenty pages when the platform total exceeds the cap."""
+@pytest.mark.parametrize("invalid_total", [-1, True, False, 1.5, "10", None])
+def test_pagination_rejects_negative_boolean_and_non_integer_totals(
+    invalid_total: object,
+) -> None:
+    """Keep zero valid while rejecting values that only resemble totals."""
 
-    # 总数大于任务上限时仅采集前 200 条。
-    plan = calculate_pagination_plan(total=500, max_items=200)
-    assert plan.target_items == 200
-    assert plan.target_pages == 20
+    # bool 是 int 的子类，必须由实现显式拒绝。
+    with pytest.raises(ValueError, match="non-negative integer"):
+        calculate_pagination_plan(invalid_total)  # type: ignore[arg-type]

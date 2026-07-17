@@ -2,17 +2,26 @@
 
 import csv
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 from compass_collector.errors import PublicationError
-from compass_collector.models import MetricRange, ProductRankEntry
+from compass_collector.models import CollectedCategoryRun, MetricRange
 
 
 # CSV 字段顺序是已确认的业务展示契约。
-CSV_HEADERS = ("排名", "商品", "店铺名称", "用户支付金额", "成交件数", "首次上榜")
+CSV_HEADERS = (
+    "分类",
+    "排名",
+    "商品",
+    "店铺名称",
+    "用户支付金额",
+    "成交件数",
+    "首次上榜",
+)
 # 平台 price 原值除以 100 得到元。
 PRICE_SCALE = Decimal(100)
 # 平台 number 原值除以 10 得到件数。
@@ -20,6 +29,8 @@ NUMBER_SCALE = Decimal(10)
 # 中文紧凑展示使用万和亿两个量级。
 TEN_THOUSAND = Decimal(10_000)
 HUNDRED_MILLION = Decimal(100_000_000)
+# task_id 同时作为目录名，必须保持为单个可预测的安全路径段。
+TASK_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
 
 def format_decimal(value: Decimal) -> str:
@@ -106,45 +117,73 @@ class CsvExporter:
         self,
         *,
         task_id: str,
+        display_name: str,
         planned_at: datetime,
         version: int,
-        run_id: str,
-        entries: tuple[ProductRankEntry, ...],
+        batch_id: str,
+        category_runs: tuple[CollectedCategoryRun, ...],
     ) -> StagedCsvExport:
         """Write a complete UTF-8 BOM CSV to a temporary file."""
 
-        # 业务日期目录使用计划时间所属日期。
-        export_directory = self.export_root / planned_at.date().isoformat()
+        if TASK_ID_PATTERN.fullmatch(task_id) is None:
+            raise PublicationError(
+                "invalid task_id for CSV path",
+                category="csv_path_error",
+            )
+        # 业务日期和任务目录共同隔离同名、同计划时间的不同任务。
+        export_directory = (
+            self.export_root / planned_at.date().isoformat() / task_id
+        )
         export_directory.mkdir(parents=True, exist_ok=True)
+        # 中文展示名中的路径分隔符统一替换，避免意外创建子目录。
+        safe_display_name = display_name.replace("/", "_").replace("\\", "_")
         # v1 不显式加后缀，强制重采从 v2 开始标记。
         version_suffix = "" if version == 1 else f"_v{version}"
-        # 文件名包含计划时分，与工程方案示例一致。
+        # 文件名使用中文任务名和计划时分，便于直接识别导出内容。
         final_path = export_directory / (
-            f"{task_id}_{planned_at.strftime('%H%M')}{version_suffix}.csv"
+            f"{safe_display_name}_{planned_at.strftime('%H%M')}{version_suffix}.csv"
         )
-        # 临时文件包含 run_id，避免并行调试名称冲突。
-        temporary_path = final_path.with_name(f".{final_path.name}.{run_id}.tmp")
+        # 临时文件包含 batch_id，避免并行调试名称冲突。
+        temporary_path = final_path.with_name(f".{final_path.name}.{batch_id}.tmp")
         try:
             with temporary_path.open("w", encoding="utf-8-sig", newline="") as file_handle:
                 # CSV writer 由标准库处理逗号、换行和引号转义。
                 writer = csv.writer(file_handle)
                 writer.writerow(CSV_HEADERS)
-                for entry in sorted(entries, key=lambda item: item.rank):
-                    # 店铺名称严格按接口原始顺序拼接。
-                    shop_names = " | ".join(shop.shop_name for shop in entry.shops)
-                    writer.writerow(
-                        (
-                            entry.rank,
-                            entry.product_name,
-                            shop_names,
-                            format_metric_range(entry.pay_amount),
-                            format_metric_range(entry.pay_combo_count),
-                            "true" if entry.newly_on_ranking else "false",
-                        )
+                # 分类按照接口发现顺序输出，不依赖调用方传入顺序。
+                sorted_category_runs = sorted(
+                    category_runs,
+                    key=lambda item: item.plan.category.discovery_order,
+                )
+                for category_run in sorted_category_runs:
+                    # 同一分类内按照榜单排名输出，不依赖分页拼接顺序。
+                    sorted_entries = sorted(
+                        category_run.entries,
+                        key=lambda item: item.rank,
                     )
-        except Exception as error:
+                    for entry in sorted_entries:
+                        # 店铺名称严格按接口原始顺序拼接。
+                        shop_names = " | ".join(
+                            shop.shop_name for shop in entry.shops
+                        )
+                        writer.writerow(
+                            (
+                                category_run.plan.category.display_path,
+                                entry.rank,
+                                entry.product_name,
+                                shop_names,
+                                format_metric_range(entry.pay_amount),
+                                format_metric_range(entry.pay_combo_count),
+                                "true" if entry.newly_on_ranking else "false",
+                            )
+                        )
+        except BaseException as error:
+            # batch_id 唯一临时路径属于本次导出，中止信号也必须先完成补偿。
             if temporary_path.exists():
                 temporary_path.unlink()
+            if not isinstance(error, Exception):
+                # KeyboardInterrupt/SystemExit 保留原始类型和 traceback 交给上层收口。
+                raise
             if isinstance(error, PublicationError):
                 raise
             raise PublicationError(

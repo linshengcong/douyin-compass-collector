@@ -7,7 +7,12 @@ from typing import Any
 
 from compass_collector.config import TaskConfig
 from compass_collector.errors import ResponseContractError
-from compass_collector.models import MetricRange, ProductRankEntry, ProductShop
+from compass_collector.models import (
+    DiscoveredCategory,
+    MetricRange,
+    ProductRankEntry,
+    ProductShop,
+)
 
 
 # 真实接口已验证每页固定返回最多 10 条。
@@ -16,46 +21,59 @@ PAGE_SIZE = 10
 
 @dataclass(frozen=True, slots=True)
 class PaginationPlan:
-    """Describe how many complete API pages the current task must request."""
+    """Describe the complete uncapped pagination required by one category."""
 
-    target_items: int
-    target_pages: int
+    # api_total 保留平台第一页返回的完整榜单条数。
+    api_total: int
+    # target_page_count 至少为 1，空榜单也保留一次真实首页请求。
+    target_page_count: int
 
 
 @dataclass(frozen=True, slots=True)
 class PageContract:
     """Expose the validated fields needed by the collection loop."""
 
-    total: int
+    # api_total 在同一个三级分类的全部分页中必须保持稳定。
+    api_total: int
+    # target_page_count 由完整 total 和固定 page_size=10 推导。
+    target_page_count: int
+    # item_count 是当前页已经通过条数契约的实际行数。
     item_count: int
 
 
-def calculate_pagination_plan(total: int, max_items: int) -> PaginationPlan:
-    """Calculate the capped item count and required ten-item pages."""
+def calculate_pagination_plan(total: int) -> PaginationPlan:
+    """Calculate every required ten-item page without applying an item cap."""
 
-    if total <= 0:
-        raise ValueError("total must be positive")
-    # 目标条数取平台总数和任务上限中的较小值。
-    target_items = min(total, max_items)
-    # 页数向上取整，以覆盖平台总数不是 10 的倍数的情况。
-    target_pages = ceil(target_items / PAGE_SIZE)
-    return PaginationPlan(target_items=target_items, target_pages=target_pages)
+    # bool 是 int 的子类，必须显式拒绝以免 False 被当成空榜单。
+    if type(total) is not int or total < 0:
+        raise ValueError("total must be a non-negative integer")
+    # 空榜单仍请求第一页；正数榜单按十条一页完整向上取整。
+    target_page_count = max(1, ceil(total / PAGE_SIZE))
+    return PaginationPlan(
+        api_total=total,
+        target_page_count=target_page_count,
+    )
 
 
 def build_request_params(
     task: TaskConfig,
+    category: DiscoveredCategory,
     business_date: date,
     page_no: int,
 ) -> dict[str, str | int]:
     """Build only the verified business query parameters."""
 
+    # 页码必须从 1 开始，bool 不能冒充整数页码。
+    if type(page_no) is not int or page_no < 1:
+        raise ValueError("page_no must be a positive integer")
     # 平台日期参数在任务启动时固定，全部分页共用。
     platform_date = business_date.strftime("%Y/%m/%d 00:00:00")
     return {
         "page_no": page_no,
         "page_size": PAGE_SIZE,
-        "industry_id": task.filters.industry.id,
-        "category_id": task.filters.category.id,
+        "industry_id": category.level1_category_id,
+        # 级联选择器要求二级与三级 ID 按页面请求格式共同提交。
+        "category_id": f"{category.level2_category_id},{category.category_id}",
         "brand_type": task.filters.brand_type,
         "price_bin": task.filters.price_bin,
         "search_info": task.filters.search_info,
@@ -74,6 +92,20 @@ def validate_page_payload(
 ) -> PageContract:
     """Validate the real response contract before the page is persisted."""
 
+    # 请求页码由采集循环生成，但契约函数仍拒绝 bool、0 和负数。
+    if type(requested_page) is not int or requested_page < 1:
+        raise ValueError("requested_page must be a positive integer")
+    # 后续页携带的首屏 total 也必须保持严格非负整数语义。
+    if expected_total is not None and (
+        type(expected_total) is not int or expected_total < 0
+    ):
+        raise ValueError("expected_total must be a non-negative integer")
+    # 解码后的 JSON 根必须是对象，避免非对象响应触发普通 AttributeError。
+    if not isinstance(payload, dict):
+        raise ResponseContractError(
+            "response root is not an object",
+            category="invalid_contract",
+        )
     if type(payload.get("st")) is not int or payload["st"] != 0:
         raise ResponseContractError(
             "response st is not zero",
@@ -111,11 +143,11 @@ def validate_page_payload(
             "response page_size is not ten",
             category="page_size_mismatch",
         )
-    # 平台总数必须是正整数，空榜单按异常处理。
+    # 平台总数允许为 0，但 bool、负数和其他类型都违反契约。
     total = page_result.get("total")
-    if type(total) is not int or total <= 0:
+    if type(total) is not int or total < 0:
         raise ResponseContractError(
-            "response total is not positive",
+            "response total is not a non-negative integer",
             category="invalid_total",
         )
     if expected_total is not None and total != expected_total:
@@ -123,21 +155,29 @@ def validate_page_payload(
             "response total changed during pagination",
             category="total_changed",
         )
-    # 当前页在整个平台榜单中的剩余条数用于校验末页。
-    remaining_items = total - ((requested_page - 1) * PAGE_SIZE)
-    if remaining_items <= 0:
+    # 页数计划不设置 200 条或其他上限，完全覆盖接口 total。
+    pagination_plan = calculate_pagination_plan(total)
+    if requested_page > pagination_plan.target_page_count:
         raise ResponseContractError(
             "requested page is beyond total",
             category="page_out_of_range",
         )
-    # 中间页必须满 10 条，平台末页允许不足 10 条。
-    expected_item_count = min(PAGE_SIZE, remaining_items)
+    # 空榜单首页必须为空；正数榜单中间页满 10 条，末页允许 1～10 条。
+    if total == 0:
+        expected_item_count = 0
+    else:
+        remaining_items = total - ((requested_page - 1) * PAGE_SIZE)
+        expected_item_count = min(PAGE_SIZE, remaining_items)
     if len(data_result) != expected_item_count:
         raise ResponseContractError(
             "response item count does not match pagination contract",
             category="item_count_mismatch",
         )
-    return PageContract(total=total, item_count=len(data_result))
+    return PageContract(
+        api_total=total,
+        target_page_count=pagination_plan.target_page_count,
+        item_count=len(data_result),
+    )
 
 
 def parse_metric_range(
@@ -201,6 +241,9 @@ def parse_page_entries(
 ) -> list[ProductRankEntry]:
     """Parse all product rows from one already validated page response."""
 
+    # 领域记录最终受 SQLite page_no >= 1 约束，解析入口提前保持一致。
+    if type(page_no) is not int or page_no < 1:
+        raise ValueError("page_no must be a positive integer")
     # 页级契约已确认该路径为数组。
     data_result = payload["data"]["data_result"]
     # 解析结果在全部页完成后进入整榜校验。
@@ -308,25 +351,34 @@ def parse_page_entries(
 def validate_complete_ranking(
     entries: list[ProductRankEntry],
     *,
-    target_items: int,
+    api_total: int,
 ) -> None:
     """Reject incomplete, duplicate, or discontinuous full ranking snapshots."""
 
-    if len(entries) != target_items:
+    # 完整榜单总数使用与分页计划相同的严格非负整数语义。
+    if type(api_total) is not int or api_total < 0:
+        raise ValueError("api_total must be a non-negative integer")
+    if len(entries) != api_total:
         raise ResponseContractError(
             "full ranking item count does not match target",
             category="incomplete_ranking",
         )
     # 商品 ID 集合用于拒绝分页之间的重复商品。
     product_ids = {entry.product_id for entry in entries}
-    if len(product_ids) != target_items:
+    if len(product_ids) != api_total:
         raise ResponseContractError(
             "full ranking contains duplicate products",
             category="duplicate_product",
         )
-    # 排名集合必须精确覆盖 1 到目标条数。
+    # 重复排名单独分类，便于区分重复与单纯缺失或越界。
     ranks = {entry.rank for entry in entries}
-    expected_ranks = set(range(1, target_items + 1))
+    if len(ranks) != api_total:
+        raise ResponseContractError(
+            "full ranking contains duplicate ranks",
+            category="duplicate_rank",
+        )
+    # 排名集合必须精确覆盖 1 到接口完整总数。
+    expected_ranks = set(range(1, api_total + 1))
     if ranks != expected_ranks:
         raise ResponseContractError(
             "full ranking is not continuous",

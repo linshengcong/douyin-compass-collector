@@ -107,29 +107,33 @@ def test_delivery_documents_cover_operations_and_security() -> None:
     assert "missed" in troubleshooting_guide
 
 
-def test_makefile_exposes_clear_npm_style_commands() -> None:
-    """Keep the common developer workflow available through short make targets."""
+def test_makefile_exposes_compact_parameterized_commands() -> None:
+    """Keep the common workflow short without duplicating run and service targets."""
 
     # Makefile 文本用于锁定公开命令名称和默认安全边界。
     makefile = Path("Makefile").read_text(encoding="utf-8")
-    # 常用命令应覆盖安装、采集、调度、测试和受限 launchd 检查。
+    # 常用命令覆盖安装、采集、调度、测试和参数化 LaunchAgent 管理。
     expected_targets = {
         "help",
         "install",
         "login",
         "run",
-        "dry-run",
-        "force",
+        "app",
+        "notify-test",
+        "clear-data",
         "status",
         "scheduler",
         "test",
         "check",
-        "launchd-check",
-        "launchd-install",
-        "launchd-status",
-        "launchd-uninstall",
+        "service",
     }
 
     assert all(f"{target}:" in makefile for target in expected_targets)
+    assert "dry-run:" not in makefile
+    assert "force:" not in makefile
+    assert "launchd-check:" not in makefile
+    assert "MODE ?= normal" in makefile
+    assert "GUI ?= yes" in makefile
+    assert "ACTION ?= check" in makefile
     assert "--frozen" in makefile
-    assert "TASK ?= product_hot_sale_drinks" in makefile
+    assert "TASK ?= product_hot_sale_all_level3" in makefile
