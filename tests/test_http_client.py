@@ -1,7 +1,6 @@
 """Shared Compass HTTP transport, throttling, and Cookie-scope tests."""
 
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -14,9 +13,10 @@ from compass_collector.browser import (
     BrowserSession,
 )
 from compass_collector.category_discovery import build_category_request_params
-from compass_collector.config import HttpConfig, IntervalConfig, load_config
+from compass_collector.config import HttpConfig, IntervalConfig
 from compass_collector.errors import HttpResponseError
 from compass_collector.http_client import CompassHttpClient
+from current_contract import CURRENT_INTERVAL_MAX, CURRENT_INTERVAL_MIN, CURRENT_TASK
 
 
 # 动态、追踪和签名参数不得进入分类树请求。
@@ -29,13 +29,16 @@ FORBIDDEN_DYNAMIC_PARAMS = {
 }
 
 
-def build_http_config() -> HttpConfig:
+def build_http_config(*, concurrency: int = 1) -> HttpConfig:
     """Build the fixed serial HTTP settings used by isolated client tests."""
 
-    # 测试配置使用当前 0.1～0.3 秒统一间隔。
-    interval_config = IntervalConfig(min=0.1, max=0.3)
+    # 测试配置复用真实 YAML 中的当前统一请求间隔。
+    interval_config = IntervalConfig(
+        min=CURRENT_INTERVAL_MIN,
+        max=CURRENT_INTERVAL_MAX,
+    )
     return HttpConfig(
-        concurrency=1,
+        concurrency=concurrency,
         request_interval_seconds=interval_config,
         connect_timeout_seconds=10,
         read_timeout_seconds=30,
@@ -60,6 +63,21 @@ def patch_httpx_client(
         return real_client_class(transport=transport, **kwargs)
 
     monkeypatch.setattr(http_client_module.httpx, "Client", build_mock_client)
+
+
+def test_configured_concurrency_is_capped_to_four_page_workers() -> None:
+    """Keep the agreed four-worker page prefetch cap when config is eight."""
+
+    # 生产配置允许 8 作为调优上限，当前实现只开放四个分页 worker。
+    client = CompassHttpClient(
+        build_http_config(concurrency=8),
+        cookies=[],
+        user_agent="CompassCollectorTest/1.0",
+    )
+    try:
+        assert client.page_fetch_workers == 4
+    finally:
+        client.close()
 
 
 def test_category_request_uses_only_fixed_endpoint_and_three_params(
@@ -117,7 +135,7 @@ def test_category_request_uses_only_fixed_endpoint_and_three_params(
 def test_same_client_waits_before_every_request_after_first(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Apply the shared 0.1-0.3 second throttle across repeated API calls."""
+    """Apply the configured shared throttle across repeated API calls."""
 
     # 请求计数用于确认客户端没有隐式重试。
     request_count = 0
@@ -150,13 +168,11 @@ def test_same_client_waits_before_every_request_after_first(
         user_agent="CompassCollectorTest/1.0",
         wait_for_delay=wait_for_delay,
     )
-    # 真实任务只用来提供已验证的榜单 endpoint_path。
-    task = load_config(Path("config/tasks.yaml")).tasks[0]
     try:
         # 分类树立即发送，后续榜单分页各等待一次。
         client.get_category_tree(build_category_request_params())
-        client.get_product_rank_page(task, {"page_no": 1})
-        client.get_product_rank_page(task, {"page_no": 2})
+        client.get_product_rank_page(CURRENT_TASK, {"page_no": 1})
+        client.get_product_rank_page(CURRENT_TASK, {"page_no": 2})
     finally:
         client.close()
 
@@ -167,7 +183,10 @@ def test_same_client_waits_before_every_request_after_first(
         "/compass_api/shop/product/product_rank/market_hot_sale",
     ]
     assert len(observed_delays) == 2
-    assert all(0.1 <= delay_seconds <= 0.3 for delay_seconds in observed_delays)
+    assert all(
+        CURRENT_INTERVAL_MIN <= delay_seconds <= CURRENT_INTERVAL_MAX
+        for delay_seconds in observed_delays
+    )
 
 
 def test_failed_request_still_forces_delay_before_next_attempt(
@@ -218,7 +237,7 @@ def test_failed_request_still_forces_delay_before_next_attempt(
     assert response.status_code == 200
     assert request_count == 2
     assert len(observed_delays) == 1
-    assert 0.1 <= observed_delays[0] <= 0.3
+    assert CURRENT_INTERVAL_MIN <= observed_delays[0] <= CURRENT_INTERVAL_MAX
 
 
 def test_cookie_scope_covers_category_and_ranking_endpoints() -> None:

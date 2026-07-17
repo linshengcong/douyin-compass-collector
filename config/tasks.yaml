@@ -41,10 +41,10 @@ auth:
     - csrf_session_id
 
 http:
-  concurrency: 1
+  concurrency: 8
   request_interval_seconds:
-    min: 0.1
-    max: 0.3
+    min: 0.01
+    max: 0.03
   connect_timeout_seconds: 10
   read_timeout_seconds: 30
 
@@ -75,7 +75,7 @@ tasks:
     filters:
       # 已验证：0 表示非知名品牌 1 表示知名品牌。
       brand_type: 0
-      # 已验证：10001-? 表示价格严格大于 10000 且无上限。
+      # 已验证：不限表示不限制商品价格带。
       price_bin: "不限"
       search_info: ""
     date:

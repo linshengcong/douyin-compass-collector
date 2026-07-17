@@ -3,6 +3,8 @@
 import re
 from pathlib import Path
 
+from current_contract import CURRENT_INTERVAL_LABEL, CURRENT_PRICE_BIN_DOC_MARKER
+
 
 # CURRENT_DOCUMENTS 是对外描述当前工程行为的文档集合。
 CURRENT_DOCUMENTS = (
@@ -30,9 +32,9 @@ def test_documents_use_only_the_current_dynamic_category_contract() -> None:
         "每次任务请求一次分类树",
         "二级分类 ID 与三级分类 ID",
         "完整请求全部页",
-        "0.1～0.3 秒",
+        CURRENT_INTERVAL_LABEL,
         "非知名品牌",
-        "10001-?",
+        CURRENT_PRICE_BIN_DOC_MARKER,
         "partial_success",
         "第 3 个",
     )

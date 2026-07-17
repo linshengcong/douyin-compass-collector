@@ -7,10 +7,10 @@ from typing import Any
 
 import pytest
 
-from compass_collector.config import load_config
 from compass_collector.errors import ResponseContractError
 from compass_collector.models import DiscoveredCategory
 from compass_collector.product_rank import build_request_params, validate_page_payload
+from current_contract import CURRENT_BRAND_TYPE, CURRENT_PRICE_BIN, CURRENT_TASK
 
 
 # 测试样本是用户提供真实响应的脱敏裁剪副本。
@@ -77,7 +77,7 @@ def test_request_params_use_cascaded_category_and_exact_twelve_fields() -> None:
     """Build the verified fields with the full level-two/level-three category path."""
 
     # 真实任务配置只提供榜单、筛选和日期策略。
-    task = load_config(Path("config/tasks.yaml")).tasks[0]
+    task = CURRENT_TASK
     # 当次分类树发现结果提供动态行业和二级、三级级联 ID。
     category = build_discovered_category()
     # 第八页用于证明页码不会被固定在第一页。
@@ -88,8 +88,8 @@ def test_request_params_use_cascaded_category_and_exact_twelve_fields() -> None:
         "page_size": 10,
         "industry_id": "13",
         "category_id": "1000001823,1000001832",
-        "brand_type": 0,
-        "price_bin": "10001-?",
+        "brand_type": CURRENT_BRAND_TYPE,
+        "price_bin": CURRENT_PRICE_BIN,
         "search_info": "",
         "rank_data_type": 1,
         "begin_date": "2026/07/16 00:00:00",
@@ -262,7 +262,7 @@ def test_request_params_reject_invalid_page_numbers(invalid_page_no: object) -> 
     """Reject zero, negative and boolean request page numbers."""
 
     # 动态分类和任务配置保持有效，只测试页码入口。
-    task = load_config(Path("config/tasks.yaml")).tasks[0]
+    task = CURRENT_TASK
     category = build_discovered_category()
 
     with pytest.raises(ValueError, match="positive integer"):

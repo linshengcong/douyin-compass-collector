@@ -4,6 +4,7 @@ import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 import httpx
@@ -25,6 +26,8 @@ COMPASS_API_ORIGIN = "https://compass.jinritemai.com"
 REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 # 等待函数返回 True 表示用户在间隔中请求中止。
 DelayWaiter = Callable[[float], bool]
+# 单分类分页预取只开放四个 worker，避免分类级生命周期被并发放大。
+MAX_PAGE_FETCH_WORKERS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +48,7 @@ def _sleep_without_interruption(delay_seconds: float) -> bool:
 
 
 class CompassHttpClient:
-    """Call category and ranking APIs serially with one authenticated Cookie jar."""
+    """Call Compass APIs through one authenticated Cookie jar and shared throttle."""
 
     def __init__(
         self,
@@ -93,6 +96,10 @@ class CompassHttpClient:
         self._wait_for_delay = wait_for_delay or _sleep_without_interruption
         # 第一个罗盘 API 请求立即发送，后续请求才等待。
         self._has_requested = False
+        # 请求启动锁让并发分页仍共享一个全局随机间隔。
+        self._request_start_lock = Lock()
+        # page_fetch_workers 是分类内分页预取的实际 worker 数。
+        self.page_fetch_workers = min(config.concurrency, MAX_PAGE_FETCH_WORKERS)
 
     def close(self) -> None:
         """Release connections and the in-memory Cookie jar."""
@@ -102,15 +109,21 @@ class CompassHttpClient:
     def _wait_before_request(self) -> None:
         """Apply one random delay before every request after the first attempt."""
 
-        if not self._has_requested:
-            return
-        # 间隔每次独立随机生成，不使用固定频率。
-        delay_seconds = random.uniform(self._minimum_interval, self._maximum_interval)
-        if self._wait_for_delay(delay_seconds):
-            raise CollectionInterruptedError(
-                "Collection interrupted during request interval",
-                category="interrupted",
+        # 并发分页只能并发等待响应，不能并发跳过请求启动间隔。
+        with self._request_start_lock:
+            if not self._has_requested:
+                self._has_requested = True
+                return
+            # 间隔每次独立随机生成，不使用固定频率。
+            delay_seconds = random.uniform(
+                self._minimum_interval,
+                self._maximum_interval,
             )
+            if self._wait_for_delay(delay_seconds):
+                raise CollectionInterruptedError(
+                    "Collection interrupted during request interval",
+                    category="interrupted",
+                )
 
     def _get_json(
         self,
@@ -120,8 +133,6 @@ class CompassHttpClient:
         """Request one fixed Compass endpoint without retries and parse its JSON."""
 
         self._wait_before_request()
-        # 请求尝试开始后立即记录，失败后的下一次请求仍会等待。
-        self._has_requested = True
         # 固定源与代码内部路径组成不含动态签名的接口地址。
         endpoint_url = f"{COMPASS_API_ORIGIN}{endpoint_path}"
         try:

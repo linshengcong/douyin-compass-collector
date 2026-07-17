@@ -48,9 +48,9 @@ class IntervalConfig(StrictModel):
     """Configure the randomized delay between serial Compass API requests."""
 
     # 所有罗盘 API 请求的最小随机间隔。
-    min: float = Field(ge=0.1, le=1)
+    min: float = Field(ge=0.01, le=1)
     # 所有罗盘 API 请求的最大随机间隔。
-    max: float = Field(ge=0.1, le=1)
+    max: float = Field(ge=0.01, le=1)
 
     @field_validator("max")
     @classmethod
@@ -67,7 +67,8 @@ class IntervalConfig(StrictModel):
 class HttpConfig(StrictModel):
     """Configure the synchronous HTTP client shared by category and rank requests."""
 
-    concurrency: Literal[1] = 1
+    # concurrency 控制单分类内分页预取的上限，分类本身仍保持串行。
+    concurrency: int = Field(ge=1, le=8, default=1)
     # 分类树和榜单分页共用同一请求间隔。
     request_interval_seconds: IntervalConfig
     connect_timeout_seconds: float = Field(gt=0)

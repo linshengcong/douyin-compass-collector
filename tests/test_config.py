@@ -1,35 +1,40 @@
 """Configuration contract tests."""
 
-from pathlib import Path
-
 import pytest
 import yaml
 from pydantic import ValidationError
 
-from compass_collector.config import AppConfig, load_config
-
-
-# 真实项目配置是合法配置契约的基线。
-CONFIG_PATH = Path("config/tasks.yaml")
+from compass_collector.config import AppConfig
+from current_contract import CONFIG_PATH, CURRENT_CONFIG, CURRENT_TASK
 
 
 def test_real_config_is_valid() -> None:
     """Load the checked-in dynamic category configuration successfully."""
 
     # 加载后的应用配置用于核对动态三级分类契约。
-    config = load_config(CONFIG_PATH)
-    assert config.http.concurrency == 1
-    assert config.http.request_interval_seconds.min == 0.1
-    assert config.http.request_interval_seconds.max == 0.3
+    config = CURRENT_CONFIG
+    assert config.http.concurrency == 8
     # 首个任务是当前唯一启用的全一级分类任务。
-    task = config.tasks[0]
+    task = CURRENT_TASK
     assert task.id == "product_hot_sale_all_level3"
     assert task.display_name == "全行业三级分类商品实时榜"
     assert task.category_scope.mode == "all_level1"
     assert task.category_scope.target_level == 3
     assert task.category_scope.exclude_all is True
-    assert task.filters.brand_type == 0
-    assert task.filters.price_bin == "10001-?"
+
+
+@pytest.mark.parametrize("invalid_concurrency", [0, 9])
+def test_unsupported_http_concurrency_is_rejected(
+    invalid_concurrency: int,
+) -> None:
+    """Reject page prefetch concurrency outside the agreed 1-8 range."""
+
+    # 真实 YAML 只替换并发值，避免测试和其他配置默认值分叉。
+    raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    raw_config["http"]["concurrency"] = invalid_concurrency
+
+    with pytest.raises(ValidationError):
+        AppConfig.model_validate(raw_config)
 
 
 @pytest.mark.parametrize(

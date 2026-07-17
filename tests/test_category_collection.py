@@ -1,8 +1,10 @@
 """Stage-three serial category ranking orchestration tests."""
 
 import json
+import time
 from datetime import date, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -47,7 +49,7 @@ PLANNED_AT = datetime(2026, 7, 17, 14, 0, tzinfo=SHANGHAI_TIMEZONE)
 def build_category(order: int) -> DiscoveredCategory:
     """Create one deterministic dynamic level-three category."""
 
-    # 分类 ID 随发现顺序变化，方便精确断言串行请求。
+    # 分类 ID 随发现顺序变化，方便精确断言分类顺序。
     category_id = f"category-{order}"
     return DiscoveredCategory(
         discovery_order=order,
@@ -304,6 +306,9 @@ class FakeRankingClient:
         self,
         behavior_by_category: dict[str, int | Exception],
         *,
+        page_fetch_workers: int = 1,
+        delay_by_page: dict[int, float] | None = None,
+        failure_by_page: dict[int, Exception] | None = None,
         stop_after_response_for: str | None = None,
         control: CollectionControl | None = None,
     ) -> None:
@@ -311,8 +316,20 @@ class FakeRankingClient:
 
         # behavior_by_category 使用动态 category_id 选择结果。
         self.behavior_by_category = behavior_by_category
-        # calls 保留严格的分类与页码请求顺序。
+        # page_fetch_workers 模拟真实客户端暴露给编排层的分页 worker 数。
+        self.page_fetch_workers = page_fetch_workers
+        # delay_by_page 用于制造乱序响应，验证主线程顺序持久化。
+        self.delay_by_page = dict(delay_by_page or {})
+        # failure_by_page 用于模拟单个并发分页失败。
+        self.failure_by_page = dict(failure_by_page or {})
+        # calls 保留请求启动记录，并发分页不依赖它断言落盘顺序。
         self.calls: list[tuple[str, int]] = []
+        # _lock 保护并发测试中的调用、active 和 max_active 统计。
+        self._lock = Lock()
+        # active_requests 是当前仍未返回的模拟 HTTP 请求数。
+        self.active_requests = 0
+        # max_active_requests 用于断言分页预取确实发生且未超过上限。
+        self.max_active_requests = 0
         # stop_after_response_for 模拟响应期间用户点击停止。
         self.stop_after_response_for = stop_after_response_for
         # control 与编排层共享同一个中止信号。
@@ -335,21 +352,38 @@ class FakeRankingClient:
         category_id = category_path_parts[-1]
         # page_no 的配置契约保证为整数。
         page_no = int(params["page_no"])
-        self.calls.append((category_id, page_no))
-        # 当前分类行为在测试开始前完整配置。
-        behavior = self.behavior_by_category[category_id]
-        if isinstance(behavior, Exception):
-            raise behavior
-        # total 驱动真实分页契约生成每一页条数。
-        payload = build_page_payload(
-            category_id=category_id,
-            page_no=page_no,
-            total=behavior,
-        )
-        if category_id == self.stop_after_response_for and self.control is not None:
-            self.control.request_stop()
-        # body 仅用于失败路径，本测试使用同一脱敏 JSON 占位内容。
-        return HttpJsonResponse(payload=payload, body=b"sanitized", status_code=200)
+        with self._lock:
+            self.calls.append((category_id, page_no))
+            self.active_requests += 1
+            self.max_active_requests = max(
+                self.max_active_requests,
+                self.active_requests,
+            )
+        try:
+            # delay_by_page 在请求已登记后等待，制造稳定的并发重叠。
+            delay_seconds = self.delay_by_page.get(page_no, 0)
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            # 单页失败优先于分类级行为，用于测试并发分页失败定位。
+            if page_no in self.failure_by_page:
+                raise self.failure_by_page[page_no]
+            # 当前分类行为在测试开始前完整配置。
+            behavior = self.behavior_by_category[category_id]
+            if isinstance(behavior, Exception):
+                raise behavior
+            # total 驱动真实分页契约生成每一页条数。
+            payload = build_page_payload(
+                category_id=category_id,
+                page_no=page_no,
+                total=behavior,
+            )
+            if category_id == self.stop_after_response_for and self.control is not None:
+                self.control.request_stop()
+            # body 仅用于失败路径，本测试使用同一脱敏 JSON 占位内容。
+            return HttpJsonResponse(payload=payload, body=b"sanitized", status_code=200)
+        finally:
+            with self._lock:
+                self.active_requests -= 1
 
 
 def build_prepared_batch(
@@ -431,6 +465,100 @@ def test_collects_more_than_two_hundred_items_in_strict_page_order() -> None:
         ("sqlite_page", "run-1", 1),
         ("manifest", "page", "run-1", 1),
     ]
+
+
+def test_prefetched_pages_persist_in_page_order_after_out_of_order_responses() -> None:
+    """Fetch later pages concurrently while committing raw and SQLite in order."""
+
+    # 延迟让第 5 页先于第 2 页返回，验证主线程按页码缓冲落盘。
+    events: list[tuple[Any, ...]] = []
+    storage = FakeBatchStorage(events)
+    database = FakeDatabase(events)
+    client = FakeRankingClient(
+        {"category-1": 51},
+        page_fetch_workers=4,
+        delay_by_page={2: 0.08, 3: 0.06, 4: 0.04, 5: 0.02, 6: 0.01},
+    )
+    prepared_batch = build_prepared_batch(category_count=1, storage=storage)
+
+    result = collect_category_batch(
+        prepared_batch=prepared_batch,
+        task=load_task(),
+        client=client,  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        runtime_logger=FakeRuntimeLogger(),  # type: ignore[arg-type]
+    )
+
+    page_events = [
+        event
+        for event in events
+        if event[0] in {"raw", "sqlite_page"}
+        or (event[0] == "manifest" and event[1] == "page")
+    ]
+    assert result.category_runs[0].target_page_count == 6
+    assert client.max_active_requests > 1
+    assert client.max_active_requests <= 4
+    assert page_events == [
+        ("raw", "run-1", 1),
+        ("sqlite_page", "run-1", 1),
+        ("manifest", "page", "run-1", 1),
+        ("raw", "run-1", 2),
+        ("sqlite_page", "run-1", 2),
+        ("manifest", "page", "run-1", 2),
+        ("raw", "run-1", 3),
+        ("sqlite_page", "run-1", 3),
+        ("manifest", "page", "run-1", 3),
+        ("raw", "run-1", 4),
+        ("sqlite_page", "run-1", 4),
+        ("manifest", "page", "run-1", 4),
+        ("raw", "run-1", 5),
+        ("sqlite_page", "run-1", 5),
+        ("manifest", "page", "run-1", 5),
+        ("raw", "run-1", 6),
+        ("sqlite_page", "run-1", 6),
+        ("manifest", "page", "run-1", 6),
+    ]
+
+
+def test_concurrent_page_failure_records_the_failed_page() -> None:
+    """Report the failing concurrent page without publishing later buffered pages."""
+
+    # 第 3 页在并发预取中失败，分类按普通失败收口并继续批次语义。
+    events: list[tuple[Any, ...]] = []
+    storage = FakeBatchStorage(events)
+    database = FakeDatabase(events)
+    client = FakeRankingClient(
+        {"category-1": 41},
+        page_fetch_workers=4,
+        delay_by_page={2: 0.05, 3: 0.01, 4: 0.05, 5: 0.05},
+        failure_by_page={
+            3: HttpRequestError(
+                "HTTP request timed out",
+                category="timeout",
+            )
+        },
+    )
+    prepared_batch = build_prepared_batch(category_count=1, storage=storage)
+
+    result = collect_category_batch(
+        prepared_batch=prepared_batch,
+        task=load_task(),
+        client=client,  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        runtime_logger=FakeRuntimeLogger(),  # type: ignore[arg-type]
+    )
+
+    persisted_pages = [event[2] for event in events if event[0] == "sqlite_page"]
+    assert result.category_runs == ()
+    assert result.failed_category_count == 1
+    assert database.failure_calls == [
+        {
+            "category_run_id": "run-1",
+            "failed_page": 3,
+            "error_category": "timeout",
+        }
+    ]
+    assert persisted_pages == [1]
 
 
 def test_total_zero_still_saves_one_empty_page() -> None:

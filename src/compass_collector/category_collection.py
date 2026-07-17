@@ -1,5 +1,6 @@
 """Collect every discovered level-three ranking without publishing a batch."""
 
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -15,7 +16,7 @@ from compass_collector.errors import (
     HttpResponseError,
     ResponseContractError,
 )
-from compass_collector.http_client import CompassHttpClient
+from compass_collector.http_client import CompassHttpClient, HttpJsonResponse
 from compass_collector.models import (
     CategoryRunPlan,
     CollectedCategoryBatch,
@@ -45,6 +46,8 @@ ORDINARY_CATEGORY_ERRORS = (
     HttpResponseError,
     ResponseContractError,
 )
+# 分页预取从第二页开始，第一页必须先串行建立 total 和目标页数。
+FIRST_PREFETCH_PAGE_NO = 2
 
 
 class _CategoryAttemptFailed(Exception):
@@ -72,6 +75,19 @@ class _CategoryAttemptFailed(Exception):
         self.exception_type = exception_type
         # category_started 决定批次终止事务是否需要收口当前 running 分类。
         self.category_started = category_started
+
+
+class _FetchedPageFailed(Exception):
+    """Attach the page number to one failed concurrent page request."""
+
+    def __init__(self, page_no: int, cause: BaseException) -> None:
+        """Keep the original failure while exposing its requested page."""
+
+        super().__init__(str(cause))
+        # page_no 用于上层记录失败页，避免并发完成顺序影响诊断。
+        self.page_no = page_no
+        # cause 交给主线程按既有 CollectorError 规则处理。
+        self.cause = cause
 
 
 def _safe_emit(runtime_logger: RuntimeLogger, **event_fields: Any) -> None:
@@ -105,6 +121,13 @@ def _raise_if_stopped(control: CollectionControl | None) -> None:
             "Collection interrupted by user request",
             category="interrupted",
         )
+
+
+def _page_fetch_workers(client: CompassHttpClient) -> int:
+    """Return the page prefetch worker count exposed by the HTTP client."""
+
+    # 测试替身可能只实现 get_product_rank_page，默认回退到串行语义。
+    return max(1, int(getattr(client, "page_fetch_workers", 1)))
 
 
 def _failure_response_body(
@@ -168,28 +191,33 @@ def _collect_category_run(
         entries: list[ProductRankEntry] = []
         # raw_pages 与 SQLite raw_responses 保持相同顺序。
         raw_pages: list[RawPageRecord] = []
-        # 第一页是所有分类都必须请求的入口，包括 total=0。
-        page_no = 1
         # api_total 只从第一页建立，后续页面必须保持一致。
         api_total: int | None = None
         # target_page_count 由真实 total 动态计算，不设置 200 条上限。
         target_page_count: int | None = None
 
-        while True:
-            # 新页开始后失败材料应只关联本页响应。
-            latest_response_body = None
-            # 即将在请求或等待的页码作为安全失败定位。
-            failed_page = page_no
-            _raise_if_stopped(control)
-            # 请求参数仅注入当前动态三级分类和固定业务日期。
+        def fetch_page(page_no: int) -> HttpJsonResponse:
+            """Fetch one ranking page without mutating local collection state."""
+
+            # worker 线程只构造请求并等待 HTTP 响应，不写 SQLite 或 raw。
             request_params = build_request_params(
                 task=task,
                 category=plan.category,
                 business_date=prepared_batch.business_date,
                 page_no=page_no,
             )
-            # 同一个 CompassHttpClient 保证分类之间也严格串行并共享间隔。
-            response = client.get_product_rank_page(task, request_params)
+            return client.get_product_rank_page(task, request_params)
+
+        def persist_page(
+            *,
+            page_no: int,
+            response: HttpJsonResponse,
+        ) -> None:
+            """Validate and persist one already fetched page in page-number order."""
+
+            nonlocal api_total, target_page_count, latest_response_body
+
+            # 当前响应正文仅在本页契约失败时进入失败材料。
             latest_response_body = response.body
             # 捕获时间在完整响应收到后计算，并贯穿 raw 索引和商品条目。
             captured_at = datetime.now(SHANGHAI_TIMEZONE)
@@ -267,11 +295,75 @@ def _collect_category_run(
             )
             # 已保存的正常响应不复制到人工中止失败材料。
             latest_response_body = None
-            _raise_if_stopped(control)
-            if page_no >= target_page_count:
-                break
-            # 下一页严格在当前页三层持久化后才允许发起。
-            page_no += 1
+
+        # 第一页是所有分类都必须请求的入口，包括 total=0。
+        page_no = 1
+        latest_response_body = None
+        failed_page = page_no
+        _raise_if_stopped(control)
+        persist_page(page_no=page_no, response=fetch_page(page_no))
+        _raise_if_stopped(control)
+        # 第一页成功后 target_page_count 必然已经由响应契约建立。
+        assert target_page_count is not None
+
+        if target_page_count >= FIRST_PREFETCH_PAGE_NO:
+            # page_fetch_workers 是本分类后续分页预取的实际并发度。
+            page_fetch_workers = _page_fetch_workers(client)
+            # next_page_to_submit 是尚未进入线程池的下一页。
+            next_page_to_submit = FIRST_PREFETCH_PAGE_NO
+            # next_page_to_persist 是主线程下一次允许落盘的页。
+            next_page_to_persist = FIRST_PREFETCH_PAGE_NO
+            # fetched_pages 暂存乱序完成的响应，直到轮到对应页持久化。
+            fetched_pages: dict[int, HttpJsonResponse] = {}
+            # futures 持有页码映射，避免线程完成顺序影响失败定位。
+            futures: dict[Future[HttpJsonResponse], int] = {}
+
+            with ThreadPoolExecutor(max_workers=page_fetch_workers) as executor:
+                while (
+                    next_page_to_submit <= target_page_count
+                    and len(futures) < page_fetch_workers
+                ):
+                    _raise_if_stopped(control)
+                    futures[executor.submit(fetch_page, next_page_to_submit)] = (
+                        next_page_to_submit
+                    )
+                    next_page_to_submit += 1
+
+                while next_page_to_persist <= target_page_count:
+                    _raise_if_stopped(control)
+                    if next_page_to_persist not in fetched_pages:
+                        done, _pending = wait(
+                            futures.keys(),
+                            return_when=FIRST_COMPLETED,
+                        )
+                        for future in done:
+                            completed_page_no = futures.pop(future)
+                            try:
+                                fetched_pages[completed_page_no] = future.result()
+                            except BaseException as error:
+                                # 失败页按请求页码记录，不受并发完成顺序影响。
+                                raise _FetchedPageFailed(
+                                    completed_page_no,
+                                    error,
+                                ) from error
+                            while (
+                                next_page_to_submit <= target_page_count
+                                and len(futures) < page_fetch_workers
+                            ):
+                                _raise_if_stopped(control)
+                                future = executor.submit(fetch_page, next_page_to_submit)
+                                futures[future] = next_page_to_submit
+                                next_page_to_submit += 1
+                        continue
+
+                    # 只有主线程按页码顺序持久化，数据库连续页约束保持不变。
+                    failed_page = next_page_to_persist
+                    persist_page(
+                        page_no=next_page_to_persist,
+                        response=fetched_pages.pop(next_page_to_persist),
+                    )
+                    _raise_if_stopped(control)
+                    next_page_to_persist += 1
 
         # 完整分类必须覆盖 1..api_total 且无重复商品或排名。
         validate_complete_ranking(entries, api_total=api_total)
@@ -327,6 +419,29 @@ def _collect_category_run(
             failed_page=failed_page,
             response_body=None,
             exception_type=type(error).__name__,
+            category_started=category_started,
+        ) from error
+    except _FetchedPageFailed as error:
+        if isinstance(error.cause, CollectorError):
+            # HTTP 或协作式中断失败沿用原有错误分类。
+            response_body = _failure_response_body(error.cause, latest_response_body)
+            raise _CategoryAttemptFailed(
+                cause=error.cause,
+                failed_page=error.page_no,
+                response_body=response_body,
+                exception_type=type(error.cause).__name__,
+                category_started=category_started,
+            ) from error
+        # 线程池中的非业务异常统一转换为安全内部错误。
+        safe_error = CollectorError(
+            "Unexpected category page fetch failure",
+            category="internal_error",
+        )
+        raise _CategoryAttemptFailed(
+            cause=safe_error,
+            failed_page=error.page_no,
+            response_body=latest_response_body,
+            exception_type=type(error.cause).__name__,
             category_started=category_started,
         ) from error
     except CollectorError as error:

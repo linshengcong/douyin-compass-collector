@@ -649,7 +649,7 @@ class CollectorWindow(QMainWindow):
         self.host_label = QLabel("compass.jinritemai.com")
         self.interval_label = QLabel(
             f"{self.config.http.request_interval_seconds.min:g}–"
-            f"{self.config.http.request_interval_seconds.max:g} 秒 / 串行"
+            f"{self.config.http.request_interval_seconds.max:g} 秒 / 分页四线程"
         )
         self.schedule_label = QLabel(selected_task.schedule)
         self.run_status_label = QLabel("空闲")
