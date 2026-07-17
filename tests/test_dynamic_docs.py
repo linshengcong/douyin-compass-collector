@@ -23,7 +23,7 @@ def test_documents_use_only_the_current_dynamic_category_contract() -> None:
         document_path.read_text(encoding="utf-8")
         for document_path in CURRENT_DOCUMENTS
     )
-    # required_markers 锁定动态分类、完整分页和失败阈值核心语义。
+    # required_markers 锁定动态分类、完整分页和失败处理核心语义。
     required_markers = (
         "所有一级分类",
         "all_level1",
@@ -36,7 +36,7 @@ def test_documents_use_only_the_current_dynamic_category_contract() -> None:
         "非知名品牌",
         CURRENT_PRICE_BIN_DOC_MARKER,
         "partial_success",
-        "第 3 个",
+        "全部分类都失败",
     )
     # obsolete_markers 只用于拒绝旧配置和旧数据模型叙述。
     obsolete_markers = (
@@ -89,8 +89,8 @@ def test_failure_docs_use_batch_and_category_identifiers() -> None:
     assert "<batch_id>" in troubleshooting
     assert "<category_run_id>" in troubleshooting
     assert "category-tree.json.gz" in troubleshooting
-    assert "第 1～2 个" in troubleshooting
-    assert "第 3 个" in troubleshooting
+    assert "普通分类失败会记录失败材料并继续" in troubleshooting
+    assert "全部分类都失败" in troubleshooting
     assert "published_at IS NOT NULL" in troubleshooting
 
 

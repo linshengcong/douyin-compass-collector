@@ -67,8 +67,12 @@ class IntervalConfig(StrictModel):
 class HttpConfig(StrictModel):
     """Configure the synchronous HTTP client shared by category and rank requests."""
 
-    # concurrency 控制单分类内分页预取的上限，分类本身仍保持串行。
-    concurrency: int = Field(ge=1, le=8, default=1)
+    # level1_concurrency 限制同时采集的一级分类组数量。
+    level1_concurrency: int = Field(ge=1, le=2, default=1)
+    # page_concurrency 限制单个三级分类后续分页的预取 worker 数量。
+    page_concurrency: int = Field(ge=1, le=4, default=1)
+    # max_in_flight_requests 限制所有分类共享的未完成 HTTP 请求数量。
+    max_in_flight_requests: int = Field(ge=1, le=8, default=1)
     # 分类树和榜单分页共用同一请求间隔。
     request_interval_seconds: IntervalConfig
     connect_timeout_seconds: float = Field(gt=0)

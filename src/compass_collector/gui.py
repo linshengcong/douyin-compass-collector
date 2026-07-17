@@ -198,7 +198,7 @@ def reduce_gui_progress(
             page_no=0,
             target_pages=0,
             category_path=None,
-            result_text="分类发现完成，准备串行采集",
+            result_text="分类发现完成，准备并发采集",
             indeterminate=False,
         )
     if event_name == "category_collection_started":
@@ -649,7 +649,10 @@ class CollectorWindow(QMainWindow):
         self.host_label = QLabel("compass.jinritemai.com")
         self.interval_label = QLabel(
             f"{self.config.http.request_interval_seconds.min:g}–"
-            f"{self.config.http.request_interval_seconds.max:g} 秒 / 分页四线程"
+            f"{self.config.http.request_interval_seconds.max:g} 秒 / "
+            f"一级分类 {self.config.http.level1_concurrency} 线程、"
+            f"分页 {self.config.http.page_concurrency} 线程、"
+            f"全局 {self.config.http.max_in_flight_requests} 请求"
         )
         self.schedule_label = QLabel(selected_task.schedule)
         self.run_status_label = QLabel("空闲")

@@ -262,7 +262,7 @@ def test_summary_reports_published_partial_success_without_calling_it_failure() 
 def test_dry_run_partial_success_uses_its_own_summary_state() -> None:
     """Label an accepted dry-run partial result without implying publication."""
 
-    # dry-run 同样允许一至两个普通分类失败，但不会产生 CSV。
+    # dry-run 同样允许普通分类失败，但不会产生 CSV。
     summary = _summary(
         TaskNotificationResult(
             task_id="dry-partial-task",

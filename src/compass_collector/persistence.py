@@ -115,7 +115,7 @@ class CollectionBatch(Base):
             "AND failed_category_count = 0 AND not_started_category_count = 0) OR "
             "(status = 'partial_success' AND discovered_category_count > 0 "
             "AND successful_category_count > 0 "
-            "AND failed_category_count BETWEEN 1 AND 2 "
+            "AND failed_category_count >= 1 "
             "AND not_started_category_count = 0 "
             "AND successful_category_count + failed_category_count = "
             "discovered_category_count) OR "
@@ -787,7 +787,7 @@ class Database:
                 .order_by(CategoryRun.discovery_order)
             ).all()
         )
-        # 正常完成的阶段三批次只能包含 success 与最多两个 failed。
+        # 正常完成的阶段三批次只能包含 success 与允许发布的分类级 failed。
         if any(
             category_run.status not in {"success", "failed"}
             for category_run in category_runs
@@ -810,11 +810,6 @@ class Database:
         if not successful_category_runs:
             raise PublicationError(
                 "collection batch has no successful category",
-                category="publication_contract_error",
-            )
-        if len(failed_category_runs) > 2:
-            raise PublicationError(
-                "collection batch exceeds the publishable failure limit",
                 category="publication_contract_error",
             )
         if len(category_runs) != batch.discovered_category_count:
@@ -911,7 +906,7 @@ class Database:
                     "collected raw pages do not match SQLite progress",
                     category="publication_contract_error",
                 )
-        # 零失败为 success，一至两个失败且至少一成功为 partial_success。
+        # 零失败为 success；至少一个成功与任意数量分类失败为 partial_success。
         final_status = "success" if not failed_category_runs else "partial_success"
         return batch, category_runs, final_status
 
@@ -1190,7 +1185,7 @@ class Database:
         category_run_id: str,
         started_at: datetime,
     ) -> BatchCollectionSnapshot:
-        """Start the next pending category while enforcing strict serial order."""
+        """Start one pending category while the batch remains in collection state."""
 
         # SQLite 保存无时区的北京时间墙上时间。
         stored_started_at = normalize_datetime(started_at)
@@ -1207,29 +1202,7 @@ class Database:
                 raise RuntimeError("collection batch is not running")
             if category_run.status != "pending":
                 raise RuntimeError("category run is not pending")
-            # 严格串行要求同一批次任何时刻最多一个 running 分类。
-            running_category_run_id = session.scalar(
-                select(CategoryRun.id)
-                .where(
-                    CategoryRun.batch_id == batch.id,
-                    CategoryRun.status == "running",
-                )
-                .limit(1)
-            )
-            if running_category_run_id is not None:
-                raise RuntimeError("another category run is already running")
-            # 只能启动 discovery_order 最小的 pending 分类，不能跳序。
-            next_pending_category_run_id = session.scalar(
-                select(CategoryRun.id)
-                .where(
-                    CategoryRun.batch_id == batch.id,
-                    CategoryRun.status == "pending",
-                )
-                .order_by(CategoryRun.discovery_order)
-                .limit(1)
-            )
-            if next_pending_category_run_id != category_run_id:
-                raise RuntimeError("category runs must start in discovery order")
+            # 一级分类并发时允许多个 running 分类；调度层保证每个一级组内顺序。
             # 状态与开始时间在同一事务中生效。
             category_run.status = "running"
             category_run.started_at = stored_started_at
@@ -1358,7 +1331,7 @@ class Database:
         error_category: str,
         finished_at: datetime,
     ) -> BatchCollectionSnapshot:
-        """Finish the first or second ordinary category failure and keep collecting."""
+        """Finish one ordinary category failure and keep collecting other categories."""
 
         if failed_page < 1:
             raise ValueError("failed page must be positive")
@@ -1379,20 +1352,7 @@ class Database:
             }
             if failed_page not in allowed_failed_pages:
                 raise RuntimeError("failed page is inconsistent with saved progress")
-            # 第三个普通失败必须走批次级原子收口，禁止留下中间状态。
-            existing_failed_category_count = session.scalar(
-                select(func.count())
-                .select_from(CategoryRun)
-                .where(
-                    CategoryRun.batch_id == batch.id,
-                    CategoryRun.status == "failed",
-                )
-            )
-            if (existing_failed_category_count or 0) >= 2:
-                raise RuntimeError(
-                    "third category failure must terminate the collection batch"
-                )
-            # 普通失败只结束当前分类，批次继续保持 running。
+            # 普通失败只结束当前分类，批次继续保持 running 以完成其余分类。
             category_run.status = "failed"
             category_run.failed_page = failed_page
             category_run.error_category = error_category
@@ -1429,29 +1389,31 @@ class Database:
                 raise RuntimeError("collection batch does not exist")
             if batch.status != "running":
                 raise RuntimeError("collection batch is not running")
-            # 查询全部 running 分类以验证严格串行不变量。
+            # 一级分类并发允许批次同时存在多个运行中分类。
             running_category_runs = session.scalars(
                 select(CategoryRun).where(
                     CategoryRun.batch_id == batch_id,
                     CategoryRun.status == "running",
                 )
             ).all()
-            if len(running_category_runs) > 1:
-                raise RuntimeError("collection batch has multiple running categories")
             if current_category_run_id is None:
                 if running_category_runs:
                     raise RuntimeError("running category id is required for termination")
                 if failed_page is not None:
                     raise ValueError("failed page requires a current category run")
             else:
-                # 当前分类必须就是该批次唯一的 running 分类。
-                if (
-                    len(running_category_runs) != 1
-                    or running_category_runs[0].id != current_category_run_id
-                ):
+                # 当前分类必须是本批次的一个 running 分类。
+                current_category_run = next(
+                    (
+                        category_run
+                        for category_run in running_category_runs
+                        if category_run.id == current_category_run_id
+                    ),
+                    None,
+                )
+                if current_category_run is None:
                     raise RuntimeError("current category run is not the running category")
                 # 当前分类可能没有成功页，也可能在后续页终止。
-                current_category_run = running_category_runs[0]
                 # 最后一页完整性校验失败和下一页请求失败都属于合法失败位置。
                 allowed_failed_pages = {
                     max(1, current_category_run.saved_page_count),
@@ -1473,6 +1435,13 @@ class Database:
                 current_category_run.failed_page = failed_page
                 current_category_run.error_category = error_category
                 current_category_run.finished_at = stored_finished_at
+                # 其他并行中的分类没有独立失败原因，按批次终态一起安全收口。
+                for running_category_run in running_category_runs:
+                    if running_category_run.id == current_category_run_id:
+                        continue
+                    running_category_run.status = current_category_status
+                    running_category_run.error_category = error_category
+                    running_category_run.finished_at = stored_finished_at
             # 所有尚未启动分类与当前分类、批次在同一事务内收口。
             pending_category_runs = session.scalars(
                 select(CategoryRun).where(

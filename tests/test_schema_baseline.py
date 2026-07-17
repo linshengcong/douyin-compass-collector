@@ -323,7 +323,6 @@ def test_published_at_is_the_only_official_publication_boundary(tmp_path: Path) 
     [
         ("success", 0, 0, 0, 0),
         ("success", 2, 1, 1, 0),
-        ("partial_success", 4, 1, 3, 0),
         ("partial_success", 2, 0, 2, 0),
         ("partial_success", 3, 1, 1, 1),
     ],
@@ -343,7 +342,7 @@ def test_publication_status_enforces_the_category_failure_threshold(
     try:
         with pytest.raises(IntegrityError):
             with database.session_factory.begin() as session:
-                # 这些组合分别覆盖空分类、错标 success 和超过两个失败。
+                # 这些组合分别覆盖空分类、错标 success 和没有成功分类的部分结果。
                 session.add(
                     CollectionBatch(
                         id="invalid-category-counts",

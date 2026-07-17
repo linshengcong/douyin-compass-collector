@@ -145,7 +145,7 @@ def test_category_failure_preserves_current_category_progress() -> None:
 def test_terminal_category_failure_overrides_the_continue_message() -> None:
     """Stop claiming the loop continues after the third ordinary failure."""
 
-    # continued_state 模拟第三个失败事件刚刚显示的临时继续文案。
+    # continued_state 模拟普通分类失败后继续执行的临时文案。
     continued_state = GuiProgressState(
         category_index=30,
         category_total=73,

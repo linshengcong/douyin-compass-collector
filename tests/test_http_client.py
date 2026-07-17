@@ -1,6 +1,9 @@
 """Shared Compass HTTP transport, throttling, and Cookie-scope tests."""
 
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+import time
 from typing import Any
 
 import httpx
@@ -29,7 +32,12 @@ FORBIDDEN_DYNAMIC_PARAMS = {
 }
 
 
-def build_http_config(*, concurrency: int = 1) -> HttpConfig:
+def build_http_config(
+    *,
+    level1_concurrency: int = 1,
+    page_concurrency: int = 1,
+    max_in_flight_requests: int = 1,
+) -> HttpConfig:
     """Build the fixed serial HTTP settings used by isolated client tests."""
 
     # 测试配置复用真实 YAML 中的当前统一请求间隔。
@@ -38,7 +46,9 @@ def build_http_config(*, concurrency: int = 1) -> HttpConfig:
         max=CURRENT_INTERVAL_MAX,
     )
     return HttpConfig(
-        concurrency=concurrency,
+        level1_concurrency=level1_concurrency,
+        page_concurrency=page_concurrency,
+        max_in_flight_requests=max_in_flight_requests,
         request_interval_seconds=interval_config,
         connect_timeout_seconds=10,
         read_timeout_seconds=30,
@@ -65,19 +75,73 @@ def patch_httpx_client(
     monkeypatch.setattr(http_client_module.httpx, "Client", build_mock_client)
 
 
-def test_configured_concurrency_is_capped_to_four_page_workers() -> None:
-    """Keep the agreed four-worker page prefetch cap when config is eight."""
+def test_configured_concurrency_exposes_the_agreed_worker_limits() -> None:
+    """Expose two level-one workers, four page workers, and an eight-request cap."""
 
-    # 生产配置允许 8 作为调优上限，当前实现只开放四个分页 worker。
+    # 生产配置将三个并发边界拆开，避免一个数同时承担多个含义。
     client = CompassHttpClient(
-        build_http_config(concurrency=8),
+        build_http_config(
+            level1_concurrency=2,
+            page_concurrency=4,
+            max_in_flight_requests=8,
+        ),
         cookies=[],
         user_agent="CompassCollectorTest/1.0",
     )
     try:
         assert client.page_fetch_workers == 4
+        assert client.level1_fetch_workers == 2
     finally:
         client.close()
+
+
+def test_global_in_flight_cap_applies_across_parallel_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep concurrent HTTP work below the configured global request ceiling."""
+
+    # active 统计只在 MockTransport 内完成，不会访问真实网络。
+    active_requests = 0
+    max_active_requests = 0
+    active_lock = Lock()
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        """Hold each synthetic response briefly so concurrent requests overlap."""
+
+        nonlocal active_requests, max_active_requests
+        with active_lock:
+            active_requests += 1
+            max_active_requests = max(max_active_requests, active_requests)
+        try:
+            time.sleep(0.03)
+            return httpx.Response(200, json={"st": 0, "data": {}})
+        finally:
+            with active_lock:
+                active_requests -= 1
+
+    patch_httpx_client(monkeypatch, handle_request)
+    client = CompassHttpClient(
+        build_http_config(max_in_flight_requests=2),
+        cookies=[],
+        user_agent="CompassCollectorTest/1.0",
+        wait_for_delay=lambda _delay_seconds: False,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [
+                executor.submit(
+                    client.get_product_rank_page,
+                    CURRENT_TASK,
+                    {"page_no": page_no},
+                )
+                for page_no in range(1, 5)
+            ]
+            for future in futures:
+                future.result()
+    finally:
+        client.close()
+
+    assert max_active_requests == 2
 
 
 def test_category_request_uses_only_fixed_endpoint_and_three_params(

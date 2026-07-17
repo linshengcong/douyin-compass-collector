@@ -13,7 +13,9 @@ def test_real_config_is_valid() -> None:
 
     # 加载后的应用配置用于核对动态三级分类契约。
     config = CURRENT_CONFIG
-    assert config.http.concurrency == 8
+    assert config.http.level1_concurrency == 2
+    assert config.http.page_concurrency == 4
+    assert config.http.max_in_flight_requests == 8
     # 首个任务是当前唯一启用的全一级分类任务。
     task = CURRENT_TASK
     assert task.id == "product_hot_sale_all_level3"
@@ -23,15 +25,26 @@ def test_real_config_is_valid() -> None:
     assert task.category_scope.exclude_all is True
 
 
-@pytest.mark.parametrize("invalid_concurrency", [0, 9])
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("level1_concurrency", 0),
+        ("level1_concurrency", 3),
+        ("page_concurrency", 0),
+        ("page_concurrency", 5),
+        ("max_in_flight_requests", 0),
+        ("max_in_flight_requests", 9),
+    ],
+)
 def test_unsupported_http_concurrency_is_rejected(
-    invalid_concurrency: int,
+    field_name: str,
+    invalid_value: int,
 ) -> None:
-    """Reject page prefetch concurrency outside the agreed 1-8 range."""
+    """Reject each HTTP concurrency boundary outside its agreed range."""
 
     # 真实 YAML 只替换并发值，避免测试和其他配置默认值分叉。
     raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw_config["http"]["concurrency"] = invalid_concurrency
+    raw_config["http"][field_name] = invalid_value
 
     with pytest.raises(ValidationError):
         AppConfig.model_validate(raw_config)
