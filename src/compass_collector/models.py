@@ -130,5 +130,5 @@ class CollectedCategoryBatch:
     storage: BatchStorage
     # category_runs 只保留完整成功分类，失败分类不会返回 entries。
     category_runs: tuple[CollectedCategoryRun, ...]
-    # failed_category_count 正常返回时只能是零、一或二。
+    # failed_category_count 统计全部跳过的分类，用于部分成功发布汇总。
     failed_category_count: int

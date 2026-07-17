@@ -62,7 +62,7 @@ def prepare_database(
         batch_id="batch-stage-three",
         category_tree_raw_path=category_tree_path,
     )
-    # 动态分类数量用于覆盖顺序、失败阈值和剩余分类收口。
+    # 动态分类数量用于覆盖顺序、多个失败分类和剩余分类收口。
     categories = tuple(
         DiscoveredCategory(
             discovery_order=category_index,
@@ -120,36 +120,29 @@ def create_raw_page(
     )
 
 
-def test_category_runs_start_strictly_serial_and_in_discovery_order(
+def test_category_runs_can_start_concurrently_after_discovery(
     tmp_path: Path,
 ) -> None:
-    """Reject a skipped category and a second concurrent running category."""
+    """Allow parallel category lifecycles after the full discovery plan is registered."""
 
-    # 四个 pending 分类用于验证第一项是唯一合法入口。
+    # 四个 pending 分类用于验证一级分类并发下可独立进入 running。
     database, category_run_plans = prepare_database(tmp_path)
     try:
-        with pytest.raises(RuntimeError, match="discovery order"):
-            database.start_category_run(
-                category_run_plans[1].category_run_id,
-                STARTED_AT,
-            )
-        # 第一分类成功进入 running 并返回完整批次快照。
-        snapshot = database.start_category_run(
+        database.start_category_run(
             category_run_plans[0].category_run_id,
             STARTED_AT,
         )
-        with pytest.raises(RuntimeError, match="already running"):
-            database.start_category_run(
-                category_run_plans[1].category_run_id,
-                STARTED_AT,
-            )
+        snapshot = database.start_category_run(
+            category_run_plans[1].category_run_id,
+            STARTED_AT,
+        )
     finally:
         database.close()
 
     assert snapshot.status == "running"
     assert [category.status for category in snapshot.categories] == [
         "running",
-        "pending",
+        "running",
         "pending",
         "pending",
     ]
@@ -330,16 +323,16 @@ def test_complete_ranking_failure_can_reference_the_last_saved_page(
     assert snapshot.categories[0].error_category == error_category
 
 
-def test_third_failure_atomically_stops_current_and_remaining_categories(
+def test_multiple_ordinary_failures_remain_publishable_category_outcomes(
     tmp_path: Path,
 ) -> None:
-    """Keep two ordinary failures running, then terminate on the third failure."""
+    """Allow three category failures without forcing an early batch termination."""
 
-    # 四分类分别表示两个容错失败、第三失败和一个未开始分类。
+    # 四分类中的前三个失败均可独立收口，最后一个仍保留 pending。
     database, category_run_plans = prepare_database(tmp_path)
     try:
-        for category_run_plan in category_run_plans[:2]:
-            # 第一、第二个失败只结束当前分类并允许继续。
+        for category_run_plan in category_run_plans[:3]:
+            # 任意数量普通失败都只结束当前分类并允许继续。
             database.start_category_run(
                 category_run_plan.category_run_id,
                 STARTED_AT,
@@ -351,47 +344,27 @@ def test_third_failure_atomically_stops_current_and_remaining_categories(
                 FINISHED_AT,
             )
             assert snapshot.status == "running"
-        # 第三分类先进入 running，但普通失败接口必须拒绝非原子收口。
-        third_category_run_id = category_run_plans[2].category_run_id
-        database.start_category_run(third_category_run_id, STARTED_AT)
-        with pytest.raises(RuntimeError, match="third category failure"):
-            database.finish_category_failure(
-                third_category_run_id,
-                1,
-                "request_failed",
-                FINISHED_AT,
-            )
-        # 批次级接口在一个事务内处理第三失败和所有 pending 分类。
-        snapshot = database.terminate_collection_batch(
-            "batch-stage-three",
-            "failed",
-            "too_many_category_failures",
-            FINISHED_AT,
-            current_category_run_id=third_category_run_id,
-            failed_page=1,
-        )
         with database.session_factory() as session:
-            # SQLite 读取证明没有遗留 running 或 pending 行。
-            unfinished_category_count = session.scalar(
+            # SQLite 读取证明三个失败不会影响尚未开始的第四个分类。
+            pending_category_count = session.scalar(
                 select(func.count())
                 .select_from(CategoryRun)
-                .where(CategoryRun.status.in_(("running", "pending")))
+                .where(CategoryRun.status == "pending")
             )
-            # 批次终态与快照必须一致。
             batch = session.get(CollectionBatch, "batch-stage-three")
     finally:
         database.close()
 
     assert batch is not None
-    assert batch.status == "failed"
-    assert unfinished_category_count == 0
+    assert batch.status == "running"
+    assert pending_category_count == 1
     assert snapshot.failed_category_count == 3
-    assert snapshot.not_started_category_count == 1
+    assert snapshot.not_started_category_count == 0
     assert [category.status for category in snapshot.categories] == [
         "failed",
         "failed",
         "failed",
-        "not_started",
+        "pending",
     ]
 
 

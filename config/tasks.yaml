@@ -41,7 +41,10 @@ auth:
     - csrf_session_id
 
 http:
-  concurrency: 8
+  # 两个一级分类并行；每个三级分类最多四页预取；全局请求不超过八个。
+  level1_concurrency: 2
+  page_concurrency: 4
+  max_in_flight_requests: 8
   request_interval_seconds:
     min: 0.01
     max: 0.03

@@ -391,6 +391,37 @@ def test_partial_success_publishes_only_successful_categories(tmp_path: Path) ->
     assert product_count == 1
 
 
+def test_partial_success_allows_multiple_failed_categories(tmp_path: Path) -> None:
+    """Publish successful data when several independent categories are skipped."""
+
+    # 三个失败分类不应阻止唯一成功分类发布，失败原因仍保留在分类运行记录中。
+    database, collected_batch = prepare_collected_batch(
+        tmp_path,
+        mode="normal",
+        category_statuses=("success", "failed", "failed", "failed"),
+    )
+    staged_csv = prepare_staged_csv(tmp_path, name="multiple-failures.csv")
+    try:
+        result = database.publish_collected_batch(
+            collected_batch,
+            1,
+            staged_csv,
+            PUBLISHED_AT,
+        )
+        with database.session_factory() as session:
+            # 失败分类没有商品条目，正式表只保留完整成功分类的数据。
+            product_count = session.scalar(
+                select(func.count()).select_from(ProductRankEntryModel)
+            )
+    finally:
+        database.close()
+
+    assert result.snapshot.status == "partial_success"
+    assert result.snapshot.successful_category_count == 1
+    assert result.snapshot.failed_category_count == 3
+    assert product_count == 1
+
+
 class PublishThenFailCsv:
     """Publish the final file and then raise to exercise filesystem compensation."""
 

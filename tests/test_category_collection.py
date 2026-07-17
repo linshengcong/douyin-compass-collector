@@ -4,7 +4,7 @@ import json
 import time
 from datetime import date, datetime
 from pathlib import Path
-from threading import Lock
+from threading import Lock, get_ident
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -46,15 +46,19 @@ BUSINESS_DATE = date(2026, 7, 17)
 PLANNED_AT = datetime(2026, 7, 17, 14, 0, tzinfo=SHANGHAI_TIMEZONE)
 
 
-def build_category(order: int) -> DiscoveredCategory:
+def build_category(order: int, *, level1_category_id: str = "13") -> DiscoveredCategory:
     """Create one deterministic dynamic level-three category."""
 
     # 分类 ID 随发现顺序变化，方便精确断言分类顺序。
     category_id = f"category-{order}"
+    # 默认一级名称维持真实 fixture 的食品饮料，其他 ID 仅用于并发分组测试。
+    level1_category_name = (
+        "食品饮料" if level1_category_id == "13" else f"一级分类{level1_category_id}"
+    )
     return DiscoveredCategory(
         discovery_order=order,
-        level1_category_id="13",
-        level1_category_name="食品饮料",
+        level1_category_id=level1_category_id,
+        level1_category_name=level1_category_name,
         level2_category_id=f"level2-{order}",
         level2_category_name=f"二级分类{order}",
         category_id=category_id,
@@ -135,6 +139,8 @@ class FakeBatchStorage:
         self.events = events
         # failure_calls 用于确认每个失败分类只留档一次。
         self.failure_calls: list[dict[str, Any]] = []
+        # write_thread_ids 验证所有 raw 与 Manifest 写入仍由采集 owner 执行。
+        self.write_thread_ids: list[int] = []
         # fail_once_operations 模拟一次瞬时 Manifest 原子替换失败。
         self.fail_once_operations = set(fail_once_operations or ())
 
@@ -146,6 +152,7 @@ class FakeBatchStorage:
     ) -> Path:
         """Return a safe synthetic path after recording the raw boundary."""
 
+        self.write_thread_ids.append(get_ident())
         self.events.append(("raw", category_run_id, page_no))
         return Path(f"/runtime/{category_run_id}/page-{page_no:03d}.json.gz")
 
@@ -153,6 +160,7 @@ class FakeBatchStorage:
         """Record the Manifest synchronization after each SQLite snapshot."""
 
         # 指定操作第一次失败后移除标记，使同快照重试可以成功。
+        self.write_thread_ids.append(get_ident())
         if snapshot["operation"] in self.fail_once_operations:
             self.fail_once_operations.remove(snapshot["operation"])
             raise OSError("simulated transient manifest failure")
@@ -185,8 +193,10 @@ class FakeDatabase:
         self.success_calls: list[str] = []
         # failure_calls 只包含第一个和第二个普通失败。
         self.failure_calls: list[dict[str, Any]] = []
-        # terminate_calls 用于核对 auth/interrupted/第三失败原子收口。
+        # terminate_calls 用于核对 auth/interrupted/内部错误的原子收口。
         self.terminate_calls: list[dict[str, Any]] = []
+        # write_thread_ids 验证 SQLite 生命周期没有落到网络 worker。
+        self.write_thread_ids: list[int] = []
 
     @staticmethod
     def _snapshot(
@@ -211,6 +221,7 @@ class FakeDatabase:
     ) -> dict[str, Any]:
         """Record one pending-to-running transition."""
 
+        self.write_thread_ids.append(get_ident())
         self.start_calls.append(category_run_id)
         self.events.append(("sqlite_start", category_run_id))
         return self._snapshot("start", category_run_id=category_run_id)
@@ -225,6 +236,7 @@ class FakeDatabase:
     ) -> dict[str, Any]:
         """Record one raw page index after its synthetic file path exists."""
 
+        self.write_thread_ids.append(get_ident())
         self.events.append(("sqlite_page", category_run_id, raw_page.page_no))
         return self._snapshot(
             "page",
@@ -242,6 +254,7 @@ class FakeDatabase:
     ) -> dict[str, Any]:
         """Record one fully validated category success."""
 
+        self.write_thread_ids.append(get_ident())
         self.success_calls.append(category_run_id)
         self.events.append(("sqlite_success", category_run_id))
         return self._snapshot("success", category_run_id=category_run_id)
@@ -262,6 +275,7 @@ class FakeDatabase:
             "failed_page": failed_page,
             "error_category": error_category,
         }
+        self.write_thread_ids.append(get_ident())
         self.failure_calls.append(failure_call)
         self.events.append(("sqlite_failure", category_run_id, failed_page))
         return self._snapshot("failure", category_run_id=category_run_id)
@@ -269,6 +283,7 @@ class FakeDatabase:
     def terminate_collection_batch(self, **terminal_fields: Any) -> dict[str, Any]:
         """Record one atomic terminal transaction and return its snapshot."""
 
+        self.write_thread_ids.append(get_ident())
         self.terminate_calls.append(dict(terminal_fields))
         self.events.append(
             (
@@ -307,6 +322,7 @@ class FakeRankingClient:
         behavior_by_category: dict[str, int | Exception],
         *,
         page_fetch_workers: int = 1,
+        level1_fetch_workers: int = 1,
         delay_by_page: dict[int, float] | None = None,
         failure_by_page: dict[int, Exception] | None = None,
         stop_after_response_for: str | None = None,
@@ -318,6 +334,8 @@ class FakeRankingClient:
         self.behavior_by_category = behavior_by_category
         # page_fetch_workers 模拟真实客户端暴露给编排层的分页 worker 数。
         self.page_fetch_workers = page_fetch_workers
+        # level1_fetch_workers 模拟一级分类组的最大并发调度数。
+        self.level1_fetch_workers = level1_fetch_workers
         # delay_by_page 用于制造乱序响应，验证主线程顺序持久化。
         self.delay_by_page = dict(delay_by_page or {})
         # failure_by_page 用于模拟单个并发分页失败。
@@ -390,11 +408,17 @@ def build_prepared_batch(
     *,
     category_count: int,
     storage: FakeBatchStorage,
+    level1_category_ids: tuple[str, ...] | None = None,
 ) -> PreparedCategoryBatch:
     """Create one stage-two result without invoking category discovery."""
 
     # 分类按接口发现顺序构造。
-    categories = tuple(build_category(order) for order in range(1, category_count + 1))
+    # 未指定时沿用单一级分类 fixture，指定时用于构造跨一级分类调度场景。
+    category_level1_ids = level1_category_ids or ("13",) * category_count
+    categories = tuple(
+        build_category(order, level1_category_id=category_level1_ids[order - 1])
+        for order in range(1, category_count + 1)
+    )
     # 每个分类运行 ID 在批次准备阶段已经固定。
     plans = tuple(
         CategoryRunPlan(category_run_id=f"run-{category.discovery_order}", category=category)
@@ -520,25 +544,24 @@ def test_prefetched_pages_persist_in_page_order_after_out_of_order_responses() -
     ]
 
 
-def test_concurrent_page_failure_records_the_failed_page() -> None:
-    """Report the failing concurrent page without publishing later buffered pages."""
+def test_level_one_groups_fetch_concurrently_but_persist_on_owner_thread() -> None:
+    """Run two top-level groups together without moving storage or SQLite writes off-thread."""
 
-    # 第 3 页在并发预取中失败，分类按普通失败收口并继续批次语义。
+    # 两个一级分类各含一个空榜单，第一页延迟确保网络请求产生稳定重叠。
     events: list[tuple[Any, ...]] = []
     storage = FakeBatchStorage(events)
     database = FakeDatabase(events)
     client = FakeRankingClient(
-        {"category-1": 41},
-        page_fetch_workers=4,
-        delay_by_page={2: 0.05, 3: 0.01, 4: 0.05, 5: 0.05},
-        failure_by_page={
-            3: HttpRequestError(
-                "HTTP request timed out",
-                category="timeout",
-            )
-        },
+        {"category-1": 0, "category-2": 0},
+        level1_fetch_workers=2,
+        delay_by_page={1: 0.05},
     )
-    prepared_batch = build_prepared_batch(category_count=1, storage=storage)
+    prepared_batch = build_prepared_batch(
+        category_count=2,
+        storage=storage,
+        level1_category_ids=("13", "25"),
+    )
+    owner_thread_id = get_ident()
 
     result = collect_category_batch(
         prepared_batch=prepared_batch,
@@ -548,8 +571,88 @@ def test_concurrent_page_failure_records_the_failed_page() -> None:
         runtime_logger=FakeRuntimeLogger(),  # type: ignore[arg-type]
     )
 
-    persisted_pages = [event[2] for event in events if event[0] == "sqlite_page"]
-    assert result.category_runs == ()
+    assert client.max_active_requests == 2
+    assert [run.plan.category_run_id for run in result.category_runs] == [
+        "run-1",
+        "run-2",
+    ]
+    assert set(database.write_thread_ids) == {owner_thread_id}
+    assert set(storage.write_thread_ids) == {owner_thread_id}
+
+
+def test_parallel_group_auth_failure_does_not_start_a_waiting_third_group() -> None:
+    """Stop group scheduling after auth failure while preserving its terminal reason."""
+
+    # 两个槽位先启动前两个一级分类；第三组必须等待可用槽位而不能抢跑。
+    events: list[tuple[Any, ...]] = []
+    storage = FakeBatchStorage(events)
+    database = FakeDatabase(events)
+    client = FakeRankingClient(
+        {
+            "category-1": AuthRequiredError(
+                "Compass authentication is required",
+                category="auth_required",
+                status_code=401,
+                response_body=b"sanitized-auth-response",
+            ),
+            "category-2": 0,
+            "category-3": 0,
+        },
+        level1_fetch_workers=2,
+        delay_by_page={1: 0.03},
+    )
+    prepared_batch = build_prepared_batch(
+        category_count=3,
+        storage=storage,
+        level1_category_ids=("13", "25", "37"),
+    )
+
+    with pytest.raises(CategoryBatchCollectionError) as error_info:
+        collect_category_batch(
+            prepared_batch=prepared_batch,
+            task=load_task(),
+            client=client,  # type: ignore[arg-type]
+            database=database,  # type: ignore[arg-type]
+            runtime_logger=FakeRuntimeLogger(),  # type: ignore[arg-type]
+        )
+
+    assert error_info.value.cause.category == "auth_required"
+    assert all(category_id != "category-3" for category_id, _page_no in client.calls)
+    assert database.terminate_calls[0]["status"] == "auth_required"
+
+
+def test_concurrent_page_failure_records_the_failed_page() -> None:
+    """Report the failing concurrent page without publishing later buffered pages."""
+
+    # 第 3 页在并发预取中失败，分类按普通失败收口并继续批次语义。
+    events: list[tuple[Any, ...]] = []
+    storage = FakeBatchStorage(events)
+    database = FakeDatabase(events)
+    client = FakeRankingClient(
+        {"category-1": 41, "category-2": 0},
+        page_fetch_workers=4,
+        delay_by_page={2: 0.05, 3: 0.01, 4: 0.05, 5: 0.05},
+        failure_by_page={
+            3: HttpRequestError(
+                "HTTP request timed out",
+                category="timeout",
+            )
+        },
+    )
+    prepared_batch = build_prepared_batch(category_count=2, storage=storage)
+
+    result = collect_category_batch(
+        prepared_batch=prepared_batch,
+        task=load_task(),
+        client=client,  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        runtime_logger=FakeRuntimeLogger(),  # type: ignore[arg-type]
+    )
+
+    persisted_pages = [
+        (event[1], event[2]) for event in events if event[0] == "sqlite_page"
+    ]
+    assert [run.plan.category_run_id for run in result.category_runs] == ["run-2"]
     assert result.failed_category_count == 1
     assert database.failure_calls == [
         {
@@ -558,7 +661,7 @@ def test_concurrent_page_failure_records_the_failed_page() -> None:
             "error_category": "timeout",
         }
     ]
-    assert persisted_pages == [1]
+    assert persisted_pages == [("run-1", 1), ("run-2", 1)]
 
 
 def test_total_zero_still_saves_one_empty_page() -> None:
@@ -657,10 +760,10 @@ def test_one_ordinary_failure_continues_without_retry() -> None:
     assert database.terminate_calls == []
 
 
-def test_third_ordinary_failure_atomically_terminates_remaining_categories() -> None:
-    """Stop on the third failed category without separately finalizing it."""
+def test_all_ordinary_failures_terminate_only_after_every_category_is_attempted() -> None:
+    """Keep skipping ordinary failures, then fail the batch only when none succeeded."""
 
-    # 四个分类都配置失败，但第四个不应发起请求。
+    # 四个分类都配置失败；每个分类都应保留失败材料后才收口空结果批次。
     events: list[tuple[Any, ...]] = []
     storage = FakeBatchStorage(events)
     database = FakeDatabase(events)
@@ -694,10 +797,13 @@ def test_third_ordinary_failure_atomically_terminates_remaining_categories() -> 
         ("category-1", 1),
         ("category-2", 1),
         ("category-3", 1),
+        ("category-4", 1),
     ]
     assert [call["category_run_id"] for call in database.failure_calls] == [
         "run-1",
         "run-2",
+        "run-3",
+        "run-4",
     ]
     assert database.terminate_calls == [
         {
@@ -705,11 +811,11 @@ def test_third_ordinary_failure_atomically_terminates_remaining_categories() -> 
             "status": "failed",
             "error_category": "network_error",
             "finished_at": database.terminate_calls[0]["finished_at"],
-            "current_category_run_id": "run-3",
-            "failed_page": 1,
+            "current_category_run_id": None,
+            "failed_page": None,
         }
     ]
-    assert len(storage.failure_calls) == 3
+    assert len(storage.failure_calls) == 4
 
 
 def test_auth_failure_stops_before_the_next_category() -> None:

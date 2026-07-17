@@ -273,7 +273,7 @@ def collect_task(
         runtime_logger=runtime_logger,
         control=control,
     )
-    # 同一个 HTTP 客户端继续串行采集全部动态三级分类分页。
+    # 同一个 HTTP 客户端继续按共享全局节流采集全部动态三级分类分页。
     return collect_category_batch(
         prepared_batch=prepared_batch,
         task=plan.task,

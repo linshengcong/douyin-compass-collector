@@ -4,7 +4,7 @@ import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from threading import Lock
+from threading import BoundedSemaphore, Lock
 from typing import Any
 
 import httpx
@@ -99,7 +99,11 @@ class CompassHttpClient:
         # 请求启动锁让并发分页仍共享一个全局随机间隔。
         self._request_start_lock = Lock()
         # page_fetch_workers 是分类内分页预取的实际 worker 数。
-        self.page_fetch_workers = min(config.concurrency, MAX_PAGE_FETCH_WORKERS)
+        self.page_fetch_workers = min(config.page_concurrency, MAX_PAGE_FETCH_WORKERS)
+        # level1_fetch_workers 是一级分类组调度的实际 worker 数。
+        self.level1_fetch_workers = config.level1_concurrency
+        # 请求信号量跨一级分类和分页线程共享，限制真实在途 HTTP 请求数。
+        self._in_flight_requests = BoundedSemaphore(config.max_in_flight_requests)
 
     def close(self) -> None:
         """Release connections and the in-memory Cookie jar."""
@@ -132,22 +136,28 @@ class CompassHttpClient:
     ) -> HttpJsonResponse:
         """Request one fixed Compass endpoint without retries and parse its JSON."""
 
-        self._wait_before_request()
-        # 固定源与代码内部路径组成不含动态签名的接口地址。
-        endpoint_url = f"{COMPASS_API_ORIGIN}{endpoint_path}"
+        # 取得名额后才进入统一启动间隔，等待响应期间持续占用名额。
+        self._in_flight_requests.acquire()
         try:
-            # 业务参数由 httpx 编码，请求 URL 不写入日志。
-            response = self._client.get(endpoint_url, params=params)
-        except httpx.TimeoutException as exc:
-            raise HttpRequestError(
-                "HTTP request timed out",
-                category="timeout",
-            ) from exc
-        except httpx.RequestError as exc:
-            raise HttpRequestError(
-                "HTTP request failed before receiving a response",
-                category="network_error",
-            ) from exc
+            self._wait_before_request()
+            # 固定源与代码内部路径组成不含动态签名的接口地址。
+            endpoint_url = f"{COMPASS_API_ORIGIN}{endpoint_path}"
+            try:
+                # 业务参数由 httpx 编码，请求 URL 不写入日志。
+                response = self._client.get(endpoint_url, params=params)
+            except httpx.TimeoutException as exc:
+                raise HttpRequestError(
+                    "HTTP request timed out",
+                    category="timeout",
+                ) from exc
+            except httpx.RequestError as exc:
+                raise HttpRequestError(
+                    "HTTP request failed before receiving a response",
+                    category="network_error",
+                ) from exc
+        finally:
+            # 包括启动间隔中止和网络异常在内的所有路径都必须归还名额。
+            self._in_flight_requests.release()
         # 响应 body 仅用于 JSON 解析或本地受限失败留档。
         response_body = response.content
         if response.status_code in {401, 403} | REDIRECT_STATUS_CODES:
