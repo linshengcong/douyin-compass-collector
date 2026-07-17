@@ -81,9 +81,10 @@ def load_vercel_settings() -> VercelSettings:
     team_id = os.environ.get("VERCEL_TEAM_ID", "").strip() or None
     if (
         not _is_valid_https_url(deploy_hook_url)
-        or not api_token
-        or not project_id
+        or not _is_valid_api_token(api_token)
+        or not _is_valid_identifier(project_id)
         or not _is_valid_https_url(site_url)
+        or (team_id is not None and not _is_valid_identifier(team_id))
     ):
         return VercelSettings(enabled=True, error_category="vercel_config_invalid")
     return VercelSettings(
@@ -112,6 +113,20 @@ def _is_valid_https_url(value: str) -> bool:
         and port is None
         and not parsed.fragment
     )
+
+
+def _is_valid_api_token(value: str) -> bool:
+    """Reject placeholder or non-ASCII token text before constructing an HTTP header."""
+
+    # HTTP Authorization 头只接受可安全编码的可见 ASCII 字符，避免配置错误中断采集任务。
+    return bool(value) and value.isascii() and not any(character.isspace() for character in value)
+
+
+def _is_valid_identifier(value: str) -> bool:
+    """Accept Vercel project or team identifiers without treating placeholder text as valid."""
+
+    # Vercel 标识符在 URL 查询参数中使用，因此限制为无空白的 ASCII 文本。
+    return bool(value) and value.isascii() and not any(character.isspace() for character in value)
 
 
 class VercelDeployer:
