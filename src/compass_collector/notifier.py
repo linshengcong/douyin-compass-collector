@@ -592,6 +592,69 @@ def deliver_batch_notification(
     return result
 
 
+def deliver_website_notification(
+    *,
+    execution_batch_id: str,
+    runtime_logger: RuntimeLogger,
+    site_url: str | None,
+    error_category: str | None = None,
+) -> NotificationDeliveryResult:
+    """Send the second DingTalk message for website deployment success or failure."""
+
+    # 第二条消息使用执行批次关联，但不伪装成 SQLite 业务批次。
+    log_context = LogContext(execution_batch_id=execution_batch_id)
+    succeeded = site_url is not None and error_category is None
+    title = "✅ 罗盘网页部署成功" if succeeded else "⚠️ 罗盘网页未更新"
+    lines = [f"### {title}", "", f"- 执行批次：`{execution_batch_id}`"]
+    if succeeded:
+        # site_url 来自受控环境配置，作为公开入口允许进入钉钉正文。
+        lines.append(f"- 网站：[打开最新榜单]({site_url})")
+    else:
+        # 只发送稳定错误分类，不能暴露 OSS、Vercel 或网络响应正文。
+        lines.append(f"- 原因：`{error_category or 'website_notification_error'}`")
+    markdown = "\n".join(lines)
+    try:
+        settings = load_dingtalk_settings()
+    except Exception:
+        settings = DingTalkSettings(
+            enabled=True,
+            webhook_url=None,
+            secret=None,
+            error_category="notification_config_invalid",
+        )
+    if not settings.enabled and settings.error_category is None:
+        return NotificationDeliveryResult(status=NotificationDeliveryStatus.DISABLED)
+    try:
+        result = DingTalkNotifier(settings).send_markdown(title, markdown)
+    except Exception:
+        result = NotificationDeliveryResult(
+            status=NotificationDeliveryStatus.FAILED,
+            error_category="notification_internal_error",
+        )
+    _safe_emit(
+        runtime_logger,
+        level="INFO" if result.status is NotificationDeliveryStatus.SUCCEEDED else "ERROR",
+        event=(
+            "website_notification_succeeded"
+            if result.status is NotificationDeliveryStatus.SUCCEEDED
+            else "website_notification_failed"
+        ),
+        message=(
+            "网页部署钉钉通知发送成功"
+            if result.status is NotificationDeliveryStatus.SUCCEEDED
+            else "网页部署钉钉通知发送失败"
+        ),
+        stage="website_notification",
+        context=log_context,
+        details={
+            "website_status": "ready" if succeeded else "failed",
+            "error_category": error_category,
+            "notification_error_category": result.error_category,
+        },
+    )
+    return result
+
+
 def run_notification_test(
     runtime_logger: RuntimeLogger,
     *,

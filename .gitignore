@@ -4,3 +4,5 @@ __pycache__/
 *.py[cod]
 runtime/
 .env
+web/node_modules/
+web/dist/

@@ -148,6 +148,33 @@ OSS_DOWNLOAD_URL_EXPIRES_SECONDS=604800
 
 RAM 用户至少需要该 Bucket 的 `oss:PutObject` 和 `oss:GetObject`。对象保持私有；签名链接本身是短期 bearer 凭证，只在本次进程中进入钉钉正文，不写入 JSONL、SQLite、Manifest 或日志。OSS 上传失败不会回滚正式 CSV 或改变采集结果，钉钉结果列会标记 `OSS 上传失败`；第一版不自动重试。
 
+### 公开榜单网站与 Vercel
+
+网站源码位于 `web/`，使用 React + Vite 读取 OSS 上的最新公开榜单。每次正式发布后，程序先发送采集完成钉钉汇总，再生成只含 CSV 七列的 gzip JSON，上传到 `WEB_PUBLIC_PREFIX`（默认 `compass/web/`）：版本化 `batches/<batch_id>.json.gz`、同批次公开 CSV，以及不缓存的 `latest.json` 索引。网页始终先读取索引，因此刷新即可看到新批次，无需把数据提交 Git。
+
+网页对象前缀需要在 OSS 控制台单独配置为公开读，并允许 Vercel 网站域名对该前缀发起 `GET` 跨域请求；不要公开 `runtime/`、原始响应或私有 CSV 前缀。Vercel 项目连接当前 GitHub 仓库后，将 Root Directory 设置为 `web`，并设置构建环境变量：
+
+```text
+VITE_DATA_INDEX_URL=https://<bucket>.oss-<region>.aliyuncs.com/compass/web/latest.json
+```
+
+本机 `.env` 需要额外配置：
+
+```text
+WEB_ENABLED=true
+WEB_PUBLIC_PREFIX=compass/web
+VERCEL_ENABLED=true
+VERCEL_DEPLOY_HOOK_URL=<Vercel Deploy Hook>
+VERCEL_API_TOKEN=<只读部署查询 Token>
+VERCEL_PROJECT_ID=<Vercel Project ID>
+VERCEL_TEAM_ID=<可选，团队项目才填写>
+VERCEL_SITE_URL=https://<project>.vercel.app
+```
+
+网页数据上传失败不会回滚 CSV 或采集结果：首条钉钉仍说明采集完成，第二条说明网页未更新。上传成功后会触发 Vercel Deploy Hook，并最多轮询五分钟；部署 `READY` 才发送第二条网站链接通知，失败或超时会发送安全错误分类。部署 Hook、API Token 和钉钉密钥都只能保存在 `.env`。
+
+本地前端开发使用 `make web-dev`，静态构建使用 `make web-build`。当前界面按桌面优先设计，移动端自动改为商品卡片；支持三级类目、商品/店铺关键词、支付金额/成交件数下限、首次上榜、排序、分页和 CSV 下载。
+
 ## 4. 首次登录
 
 ```bash

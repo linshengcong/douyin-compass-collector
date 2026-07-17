@@ -33,6 +33,7 @@ from compass_collector.notifier import (
     TaskNotificationResult,
     TaskNotificationStatus,
     deliver_batch_notification,
+    deliver_website_notification,
 )
 from compass_collector.oss_uploader import OssUploadError, OssUploader
 from compass_collector.persistence import (
@@ -45,6 +46,8 @@ from compass_collector.retention import cleanup_runtime
 from compass_collector.run_control import CollectionControl
 from compass_collector.runtime_locks import ProcessLock, RuntimeLockBusy
 from compass_collector.runtime_logging import LogContext, RuntimeLogger
+from compass_collector.vercel_deployer import VercelDeployer, VercelDeploymentError
+from compass_collector.web_publisher import WebPublicationError, WebPublisher
 
 
 # 所有业务日期和计划时间按北京时区固定。
@@ -73,6 +76,22 @@ class TaskExecutionPlan:
     business_date: date
     planned_at: datetime
     version: int
+
+
+@dataclass(frozen=True, slots=True)
+class WebsitePublicationCandidate:
+    """Retain only published-task metadata needed after the first notification."""
+
+    # task preserves the public task identity in website snapshot metadata.
+    task: TaskConfig
+    # collected_batch supplies successful and failed category counters.
+    collected_batch: CollectedCategoryBatch
+    # csv_path is already atomically published before any website upload begins.
+    csv_path: Path
+    # batch_id isolates immutable website object keys.
+    batch_id: str
+    # published_at allows the website to display the authoritative publication time.
+    published_at: datetime
 
 
 def build_task_notification_result(
@@ -546,6 +565,120 @@ def _finish_unpublished_batch(
     _sync_collection_snapshot(collected_batch.storage, terminal_snapshot)
 
 
+def _publish_website_after_collection(
+    *,
+    candidates: list[WebsitePublicationCandidate],
+    oss_uploader: OssUploader,
+    execution_batch_id: str,
+    runtime_logger: RuntimeLogger,
+) -> None:
+    """Publish the latest public website snapshot after the CSV summary is delivered."""
+
+    # 没有正式 CSV 的 dry-run、失败或幂等跳过批次不更新公开网站。
+    if not candidates:
+        return
+    publisher = WebPublisher.from_environment(oss_uploader, runtime_root=RUNTIME_ROOT)
+    if not publisher.settings.enabled:
+        return
+    for candidate in candidates:
+        try:
+            publication = publisher.publish(
+                csv_path=candidate.csv_path,
+                task_id=candidate.task.id,
+                batch_id=candidate.batch_id,
+                business_date=candidate.collected_batch.business_date,
+                published_at=candidate.published_at,
+                successful_category_count=len(candidate.collected_batch.category_runs),
+                failed_category_count=candidate.collected_batch.failed_category_count,
+                item_count=sum(
+                    len(category_run.entries)
+                    for category_run in candidate.collected_batch.category_runs
+                ),
+            )
+        except WebPublicationError as error:
+            _safe_emit(
+                runtime_logger,
+                level="ERROR",
+                event="website_data_upload_failed",
+                message=f"[{candidate.task.id}] 网页数据上传失败，category={error.category}",
+                stage="website_publication",
+                context=LogContext(
+                    batch_id=candidate.batch_id,
+                    task_id=candidate.task.id,
+                ),
+                details={"error_category": error.category},
+            )
+            deliver_website_notification(
+                execution_batch_id=execution_batch_id,
+                runtime_logger=runtime_logger,
+                site_url=None,
+                error_category=error.category,
+            )
+            return
+        if publication is not None:
+            _safe_emit(
+                runtime_logger,
+                level="INFO",
+                event="website_data_upload_succeeded",
+                message=f"[{candidate.task.id}] 网页最新数据已上传",
+                stage="website_publication",
+                context=LogContext(
+                    batch_id=candidate.batch_id,
+                    task_id=candidate.task.id,
+                ),
+                details={"uploaded": True},
+            )
+    deployer = VercelDeployer.from_environment()
+    try:
+        deployment = deployer.deploy_and_wait()
+    except VercelDeploymentError as error:
+        _safe_emit(
+            runtime_logger,
+            level="ERROR",
+            event="vercel_deployment_failed",
+            message=f"网页部署未确认，category={error.category}",
+            stage="vercel_deployment",
+            details={"error_category": error.category},
+        )
+        deliver_website_notification(
+            execution_batch_id=execution_batch_id,
+            runtime_logger=runtime_logger,
+            site_url=None,
+            error_category=error.category,
+        )
+        return
+    if deployment is None:
+        # WEB_ENABLED 已开启但 Vercel 未启用时，显式给出第二条可操作通知。
+        _safe_emit(
+            runtime_logger,
+            level="ERROR",
+            event="vercel_deployment_failed",
+            message="网页数据已上传，但 Vercel 部署未配置",
+            stage="vercel_deployment",
+            details={"error_category": "vercel_config_disabled"},
+        )
+        deliver_website_notification(
+            execution_batch_id=execution_batch_id,
+            runtime_logger=runtime_logger,
+            site_url=None,
+            error_category="vercel_config_disabled",
+        )
+        return
+    _safe_emit(
+        runtime_logger,
+        level="INFO",
+        event="vercel_deployment_succeeded",
+        message="网页部署成功",
+        stage="vercel_deployment",
+        details={"site_ready": True},
+    )
+    deliver_website_notification(
+        execution_batch_id=execution_batch_id,
+        runtime_logger=runtime_logger,
+        site_url=deployment.site_url,
+    )
+
+
 def _run_collection_unlocked(
     config: AppConfig,
     selected_task_id: str | None,
@@ -600,6 +733,8 @@ def _run_collection_unlocked(
     notification_sent = False
     # 上传器只在 OSS_ENABLED=true 时做网络调用；未配置时完全不影响采集主链路。
     oss_uploader = OssUploader.from_environment()
+    # 网站候选仅在 CSV 已正式发布后积累，第一条钉钉通知保持采集完成语义。
+    website_publication_candidates: list[WebsitePublicationCandidate] = []
 
     def send_batch_notification_once() -> None:
         """Deliver one ordered batch summary without changing collection state."""
@@ -1152,8 +1287,26 @@ def _run_collection_unlocked(
                                 ),
                                 details={"uploaded": True},
                             )
+                    # 无论私有 CSV 上传是否成功，正式 CSV 都可独立作为公开网站快照来源。
+                    website_publication_candidates.append(
+                        WebsitePublicationCandidate(
+                            task=plan.task,
+                            collected_batch=collected_batch,
+                            csv_path=published_batch.csv_path,
+                            batch_id=published_batch.batch_id,
+                            published_at=publication_result.snapshot.published_at
+                            or datetime.now(SHANGHAI_TIMEZONE),
+                        )
+                    )
             # 通知在任务终态形成后立即发送，不等待人工关闭 Chrome。
             send_batch_notification_once()
+            # 第二条通知仅在首条采集汇总完成后，反映网页数据和 Vercel 的独立结果。
+            _publish_website_after_collection(
+                candidates=website_publication_candidates,
+                oss_uploader=oss_uploader,
+                execution_batch_id=execution_batch_id,
+                runtime_logger=runtime_logger,
+            )
             if (
                 manual
                 and config.browser.keep_open_after_manual_run

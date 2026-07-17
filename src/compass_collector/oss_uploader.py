@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 
 # OSS V4 签名下载链接的官方最长有效期为七天。
@@ -209,6 +209,60 @@ class OssUploader:
             raise
         except Exception:
             # SDK 的响应正文、请求 ID 与连接信息均不对外传播。
+            raise OssUploadError("oss_upload_failed") from None
+
+    def public_object_url(self, object_key: str) -> str:
+        """Build one public object URL without embedding any credential or signature."""
+
+        if not self.settings.valid or not _is_valid_prefix(object_key):
+            raise OssUploadError("oss_upload_input_invalid")
+        assert self.settings.endpoint is not None
+        assert self.settings.bucket is not None
+        endpoint = urlparse(self.settings.endpoint)
+        if endpoint.hostname is None:
+            raise OssUploadError("oss_upload_input_invalid")
+        # OSS virtual-host URL keeps public website objects independent from signed CSV URLs.
+        return f"https://{self.settings.bucket}.{endpoint.hostname}/{quote(object_key)}"
+
+    def upload_public_file(
+        self,
+        *,
+        file_path: Path,
+        object_key: str,
+        content_type: str,
+        cache_control: str,
+        content_encoding: str | None = None,
+    ) -> None:
+        """Upload one public website object while keeping ACL policy outside the code."""
+
+        if not self.settings.valid:
+            raise OssUploadError(self.settings.error_category or "oss_config_invalid")
+        if (
+            not file_path.is_file()
+            or not _is_valid_prefix(object_key)
+            or not content_type
+            or not cache_control
+        ):
+            raise OssUploadError("oss_upload_input_invalid")
+        request_fields: dict[str, Any] = {
+            "bucket": self.settings.bucket,
+            "key": object_key,
+            "content_type": content_type,
+            "cache_control": cache_control,
+        }
+        if content_encoding is not None:
+            request_fields["content_encoding"] = content_encoding
+        try:
+            client, oss = self._client_factory(self.settings)
+            upload_result = client.put_object_from_file(
+                oss.PutObjectRequest(**request_fields),
+                str(file_path),
+            )
+            if not 200 <= int(upload_result.status_code) < 300:
+                raise OssUploadError("oss_upload_failed")
+        except OssUploadError:
+            raise
+        except Exception:
             raise OssUploadError("oss_upload_failed") from None
 
 

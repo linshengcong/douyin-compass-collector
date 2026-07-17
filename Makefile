@@ -33,7 +33,7 @@ endif
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install login app run notify-test clear-data status scheduler test check service
+.PHONY: help install login app run notify-test clear-data status scheduler web-dev web-build test check service
 
 help: ## 显示所有快捷命令
 	@awk 'BEGIN {FS = ":.*## "; printf "用法：make <command> [TASK=task_id]\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -61,6 +61,12 @@ status: ## 查看最近运行状态
 
 scheduler: ## 前台启动 Scheduler，按 Ctrl-C 停止
 	$(PYTHON) -m compass_collector scheduler
+
+web-dev: ## 启动网站本地开发服务
+	npm --prefix web run dev
+
+web-build: ## 构建网站静态文件
+	npm --prefix web run build
 
 test: ## 执行全部自动化测试
 	$(PYTHON) -m pytest
