@@ -8,6 +8,8 @@ MODE ?= normal
 GUI ?= yes
 # LaunchAgent 操作统一通过 ACTION 选择：check、install、status 或 uninstall。
 ACTION ?= check
+# 本地前端默认读取当前公开榜单索引；更换环境时可通过命令行覆盖。
+WEB_DATA_INDEX_URL ?= https://e-commerce-data.oss-cn-shanghai.aliyuncs.com/compass/web/latest.json
 # 所有运行命令使用锁定依赖，避免后台或调试时隐式更新环境。
 PYTHON := $(UV) run --frozen python
 
@@ -63,7 +65,7 @@ scheduler: ## 前台启动 Scheduler，按 Ctrl-C 停止
 	$(PYTHON) -m compass_collector scheduler
 
 web-dev: ## 启动网站本地开发服务
-	npm --prefix web run dev
+	VITE_DATA_INDEX_URL="$(WEB_DATA_INDEX_URL)" npm --prefix web run dev -- --host 127.0.0.1 --port 5175
 
 web-build: ## 构建网站静态文件
 	npm --prefix web run build

@@ -173,7 +173,7 @@ VERCEL_SITE_URL=https://<project>.vercel.app
 
 网页数据上传失败不会回滚 CSV 或采集结果：首条钉钉仍说明采集完成，第二条说明网页未更新。上传成功后会触发 Vercel Deploy Hook，并最多轮询五分钟；部署 `READY` 才发送第二条网站链接通知，失败或超时会发送安全错误分类。部署 Hook、API Token 和钉钉密钥都只能保存在 `.env`。
 
-本地前端开发使用 `make web-dev`，静态构建使用 `make web-build`。当前界面按桌面优先设计，移动端自动改为商品卡片；支持三级类目、商品/店铺关键词、支付金额/成交件数下限、首次上榜、排序、分页和 CSV 下载。
+本地前端开发使用 `make web-dev`，打开 `http://127.0.0.1:5175/`；保存前端文件后由 Vite 自动热更新。静态构建使用 `make web-build`。如需替换公开数据源，可用 `make web-dev WEB_DATA_INDEX_URL=https://.../latest.json` 覆盖默认值。当前界面按桌面优先设计，移动端自动改为商品卡片；支持三级类目、商品/店铺关键词、支付金额/成交件数下限、首次上榜、排序、分页和 CSV 下载。
 
 ## 4. 首次登录
 
