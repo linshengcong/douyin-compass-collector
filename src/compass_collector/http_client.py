@@ -100,6 +100,15 @@ class CompassHttpClient:
         self._request_start_lock = Lock()
         # page_fetch_workers 是分类内分页预取的实际 worker 数。
         self.page_fetch_workers = min(config.page_concurrency, MAX_PAGE_FETCH_WORKERS)
+        # 分页绝对进度上限覆盖连接、读取和同分类请求启动间隔，防止底层连接永久悬挂。
+        self.page_fetch_wait_timeout_seconds = (
+            config.connect_timeout_seconds
+            + config.read_timeout_seconds
+            + (self.page_fetch_workers * config.request_interval_seconds.max)
+            + 5
+        )
+        # 全局请求名额与分页看门狗共用截止时间，避免失联请求耗尽名额后永久阻塞。
+        self.request_slot_wait_timeout_seconds = self.page_fetch_wait_timeout_seconds
         # level1_fetch_workers 是一级分类组调度的实际 worker 数。
         self.level1_fetch_workers = config.level1_concurrency
         # 请求信号量跨一级分类和分页线程共享，限制真实在途 HTTP 请求数。
@@ -137,7 +146,15 @@ class CompassHttpClient:
         """Request one fixed Compass endpoint without retries and parse its JSON."""
 
         # 取得名额后才进入统一启动间隔，等待响应期间持续占用名额。
-        self._in_flight_requests.acquire()
+        # 等待名额也必须有上限，后台失联请求不能让后续分类永久卡住。
+        acquired_request_slot = self._in_flight_requests.acquire(
+            timeout=self.request_slot_wait_timeout_seconds
+        )
+        if not acquired_request_slot:
+            raise HttpRequestError(
+                "Timed out waiting for an available Compass request slot",
+                category="timeout",
+            )
         try:
             self._wait_before_request()
             # 固定源与代码内部路径组成不含动态签名的接口地址。

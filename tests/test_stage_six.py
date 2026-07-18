@@ -239,6 +239,35 @@ def test_event_stream_outputs_only_prefixed_safe_json(
     assert output_line.count("Scheduler 已启动") == 1
 
 
+def test_logger_keeps_persisted_event_when_console_pipe_is_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treat a non-blocking console backpressure as display-only failure."""
+
+    # GUI 或终端输出管道背压不得使已写入 JSONL 的采集流程失败。
+    def raise_blocking_output(*args: object, **kwargs: object) -> None:
+        raise BlockingIOError("simulated stdout backpressure")
+
+    monkeypatch.setattr("builtins.print", raise_blocking_output)
+    logger = RuntimeLogger(tmp_path / "logs")
+
+    logger.emit(
+        level="INFO",
+        event="category_discovered",
+        message="分类发现完成",
+        stage="category_discovery",
+    )
+
+    events = [
+        json.loads(line)
+        for line in next((tmp_path / "logs").glob("*.jsonl"))
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [event["event"] for event in events] == ["category_discovered"]
+
+
 def test_pre_requested_stop_creates_interrupted_manifest_without_http(
     tmp_path: Path,
     monkeypatch,

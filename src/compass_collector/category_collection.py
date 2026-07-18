@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from queue import Empty, Queue
 from threading import Event, get_ident
+from time import monotonic
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -226,6 +227,40 @@ def _page_fetch_workers(client: CompassHttpClient) -> int:
 
     # 测试替身可能只实现 get_product_rank_page，默认回退到串行语义。
     return max(1, int(getattr(client, "page_fetch_workers", 1)))
+
+
+def _page_fetch_wait_timeout_seconds(client: CompassHttpClient) -> float:
+    """Return the absolute no-progress timeout for concurrent page futures."""
+
+    # 测试替身未暴露该值时使用保守默认值，真实客户端由 HTTP 配置推导。
+    return max(0.01, float(getattr(client, "page_fetch_wait_timeout_seconds", 45.0)))
+
+
+def _wait_for_completed_page_futures(
+    *,
+    futures: dict[Future[HttpJsonResponse], int],
+    timeout_seconds: float,
+    check_stopped: Callable[[], None],
+) -> set[Future[HttpJsonResponse]]:
+    """Wait for one page future while enforcing an absolute no-progress deadline."""
+
+    # 单次短等待允许 GUI 停止请求及时打断，不必等待完整网络截止时间。
+    deadline = monotonic() + timeout_seconds
+    while True:
+        check_stopped()
+        remaining_seconds = deadline - monotonic()
+        if remaining_seconds <= 0:
+            raise HttpRequestError(
+                "Concurrent page fetch made no progress before its deadline",
+                category="timeout",
+            )
+        done, _pending = wait(
+            futures.keys(),
+            timeout=min(0.5, remaining_seconds),
+            return_when=FIRST_COMPLETED,
+        )
+        if done:
+            return done
 
 
 def _level1_fetch_workers(client: CompassHttpClient) -> int:
@@ -456,7 +491,9 @@ def _collect_category_run(
             # futures 持有页码映射，避免线程完成顺序影响失败定位。
             futures: dict[Future[HttpJsonResponse], int] = {}
 
-            with ThreadPoolExecutor(max_workers=page_fetch_workers) as executor:
+            # 不使用 context manager：超时路径不能因等待失联 worker 而再次卡住。
+            executor = ThreadPoolExecutor(max_workers=page_fetch_workers)
+            try:
                 while (
                     next_page_to_submit <= target_page_count
                     and len(futures) < page_fetch_workers
@@ -470,15 +507,26 @@ def _collect_category_run(
                 while next_page_to_persist <= target_page_count:
                     raise_if_collection_stopped()
                     if next_page_to_persist not in fetched_pages:
-                        done, _pending = wait(
-                            futures.keys(),
-                            return_when=FIRST_COMPLETED,
-                        )
+                        try:
+                            done = _wait_for_completed_page_futures(
+                                futures=futures,
+                                timeout_seconds=_page_fetch_wait_timeout_seconds(client),
+                                check_stopped=raise_if_collection_stopped,
+                            )
+                        except HttpRequestError as error:
+                            # 取消尚未启动的页；已在运行的请求不阻塞当前分类的失败收口。
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            raise _FetchedPageFailed(
+                                next_page_to_persist,
+                                error,
+                            ) from error
                         for future in done:
                             completed_page_no = futures.pop(future)
                             try:
                                 fetched_pages[completed_page_no] = future.result()
                             except BaseException as error:
+                                # 任一页已失败时，不等待其他可能失联的预取请求。
+                                executor.shutdown(wait=False, cancel_futures=True)
                                 # 失败页按请求页码记录，不受并发完成顺序影响。
                                 raise _FetchedPageFailed(
                                     completed_page_no,
@@ -502,6 +550,13 @@ def _collect_category_run(
                     )
                     raise_if_collection_stopped()
                     next_page_to_persist += 1
+            except BaseException:
+                # 异常路径取消未开始的请求，不因 executor 默认等待行为卡住整个批次。
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                # 所有页已完成时正常回收 worker，避免后台线程跨分类残留。
+                executor.shutdown(wait=True)
 
         # 完整分类必须覆盖 1..api_total 且无重复商品或排名。
         validate_complete_ranking(entries, api_total=api_total)

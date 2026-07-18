@@ -27,6 +27,7 @@ SAFE_DETAIL_FIELDS = {
     "discovery_order",
     "dry_run",
     "error_category",
+    "exception_type",
     "level1_category_count",
     "page_no",
     "planned_at",
@@ -150,17 +151,24 @@ class RuntimeLogger:
             file_handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
             file_handle.write("\n")
         if self.event_sink is not None:
-            # 回调收到副本，避免订阅者意外修改后续控制台输出。
-            self.event_sink(dict(payload))
-        if os.environ.get(EVENT_STREAM_ENV) == "1":
-            # GUI 子进程只输出带前缀的安全 JSON，避免消息重复展示。
-            print(
-                EVENT_STREAM_PREFIX
-                + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                flush=True,
-            )
-        else:
-            print(message)
+            # GUI 回调仅用于实时展示，失效时不能改变已成功落盘的采集语义。
+            try:
+                self.event_sink(dict(payload))
+            except Exception:
+                pass
+        try:
+            if os.environ.get(EVENT_STREAM_ENV) == "1":
+                # GUI 子进程只输出带前缀的安全 JSON，避免消息重复展示。
+                print(
+                    EVENT_STREAM_PREFIX
+                    + json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    flush=True,
+                )
+            else:
+                print(message)
+        except (BlockingIOError, BrokenPipeError, OSError):
+            # 终端或 GUI 输出管道背压时，JSONL 已写入，不能反向中断采集。
+            pass
 
 
 def read_latest_batch_events(log_directory: Path, limit: int = 500) -> list[dict[str, Any]]:

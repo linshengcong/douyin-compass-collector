@@ -142,6 +142,8 @@ def _finish_failed_batch(
             details={
                 "batch_status": status,
                 "error_category": error.category,
+                # 仅保留异常类型，便于定位且不暴露底层异常正文。
+                "exception_type": exception_type,
                 "status_code": error.status_code,
             },
         )

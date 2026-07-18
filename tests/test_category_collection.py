@@ -323,6 +323,7 @@ class FakeRankingClient:
         *,
         page_fetch_workers: int = 1,
         level1_fetch_workers: int = 1,
+        page_fetch_wait_timeout_seconds: float = 45,
         delay_by_page: dict[int, float] | None = None,
         failure_by_page: dict[int, Exception] | None = None,
         stop_after_response_for: str | None = None,
@@ -336,6 +337,8 @@ class FakeRankingClient:
         self.page_fetch_workers = page_fetch_workers
         # level1_fetch_workers 模拟一级分类组的最大并发调度数。
         self.level1_fetch_workers = level1_fetch_workers
+        # 分页绝对等待上限用于模拟底层 HTTP 无进度的看门狗边界。
+        self.page_fetch_wait_timeout_seconds = page_fetch_wait_timeout_seconds
         # delay_by_page 用于制造乱序响应，验证主线程顺序持久化。
         self.delay_by_page = dict(delay_by_page or {})
         # failure_by_page 用于模拟单个并发分页失败。
@@ -662,6 +665,40 @@ def test_concurrent_page_failure_records_the_failed_page() -> None:
         }
     ]
     assert persisted_pages == [("run-1", 1), ("run-2", 1)]
+
+
+def test_stalled_prefetch_times_out_and_allows_later_category_to_continue() -> None:
+    """Fail one no-progress prefetch without blocking later category collection."""
+
+    # 第一个分类的预取页故意慢于绝对上限；第二个分类仍必须被完整采集。
+    events: list[tuple[Any, ...]] = []
+    storage = FakeBatchStorage(events)
+    database = FakeDatabase(events)
+    client = FakeRankingClient(
+        {"category-1": 21, "category-2": 0},
+        page_fetch_workers=2,
+        page_fetch_wait_timeout_seconds=0.01,
+        delay_by_page={2: 0.08, 3: 0.08},
+    )
+    prepared_batch = build_prepared_batch(category_count=2, storage=storage)
+
+    result = collect_category_batch(
+        prepared_batch=prepared_batch,
+        task=load_task(),
+        client=client,  # type: ignore[arg-type]
+        database=database,  # type: ignore[arg-type]
+        runtime_logger=FakeRuntimeLogger(),  # type: ignore[arg-type]
+    )
+
+    assert [run.plan.category_run_id for run in result.category_runs] == ["run-2"]
+    assert result.failed_category_count == 1
+    assert database.failure_calls == [
+        {
+            "category_run_id": "run-1",
+            "failed_page": 2,
+            "error_category": "timeout",
+        }
+    ]
 
 
 def test_total_zero_still_saves_one_empty_page() -> None:

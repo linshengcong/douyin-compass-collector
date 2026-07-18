@@ -17,7 +17,7 @@ from compass_collector.browser import (
 )
 from compass_collector.category_discovery import build_category_request_params
 from compass_collector.config import HttpConfig, IntervalConfig
-from compass_collector.errors import HttpResponseError
+from compass_collector.errors import HttpRequestError, HttpResponseError
 from compass_collector.http_client import CompassHttpClient
 from current_contract import CURRENT_INTERVAL_MAX, CURRENT_INTERVAL_MIN, CURRENT_TASK
 
@@ -142,6 +142,35 @@ def test_global_in_flight_cap_applies_across_parallel_requests(
         client.close()
 
     assert max_active_requests == 2
+
+
+def test_request_slot_wait_has_an_absolute_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not let exhausted in-flight capacity block a later category forever."""
+
+    # 名额耗尽时不应实际请求网络，测试 handler 若被调用会立即暴露回归。
+    patch_httpx_client(
+        monkeypatch,
+        lambda _request: pytest.fail("request must not start without a free slot"),
+    )
+    client = CompassHttpClient(
+        build_http_config(max_in_flight_requests=1),
+        cookies=[],
+        user_agent="CompassCollectorTest/1.0",
+        wait_for_delay=lambda _delay_seconds: False,
+    )
+    # 缩短测试看门狗，不改变生产配置推导的截止时间。
+    client.request_slot_wait_timeout_seconds = 0.01
+    client._in_flight_requests.acquire()
+    try:
+        with pytest.raises(HttpRequestError) as error_info:
+            client.get_product_rank_page(CURRENT_TASK, {"page_no": 1})
+    finally:
+        client._in_flight_requests.release()
+        client.close()
+
+    assert error_info.value.category == "timeout"
 
 
 def test_category_request_uses_only_fixed_endpoint_and_three_params(
