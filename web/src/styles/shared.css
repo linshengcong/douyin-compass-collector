@@ -1,0 +1,5 @@
+:root { font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif; color: #172847; background: #f5f8fe; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { min-width: 320px; margin: 0; background: linear-gradient(145deg, #f9fbff 0%, #f5f8ff 52%, #eef4ff 100%); }
+button, input, select { font: inherit; } button { cursor: pointer; } button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid rgb(44 111 240 / 25%); outline-offset: 2px; }
+.page-shell { min-height: 100vh; }.mobile-view { display: none; }.state-card { max-width: 480px; margin: 18vh auto; border: 1px solid #eaf0fb; border-radius: 20px; background: #fff; box-shadow: 0 18px 45px rgb(31 58 110 / 8%); padding: 56px 24px; color: #687998; text-align: center; }.error-state { color: #dc5e69; }.empty-state { padding: 54px 20px; color: #77859d; text-align: center; }
