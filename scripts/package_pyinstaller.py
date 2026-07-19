@@ -122,8 +122,10 @@ def main() -> None:
     assert_host_matches_target(target)
     project_root = Path(__file__).resolve().parents[1]
     application_path = build_application(project_root, target)
-    archive_path = assemble_archive(project_root, application_path, target)
-    print(f"已创建：{archive_path}")
+    assemble_archive(project_root, application_path, target)
+    # Windows GitHub Runner 的默认控制台编码可能不支持中文文件名。
+    # 这里保持 ASCII 日志，避免 ZIP 已生成却因最后一条提示输出失败。
+    print("Desktop archive created successfully.")
 
 
 if __name__ == "__main__":
