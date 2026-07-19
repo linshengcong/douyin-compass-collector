@@ -700,13 +700,13 @@ def test_stalled_prefetch_times_out_and_allows_later_category_to_continue() -> N
 
     assert [run.plan.category_run_id for run in result.category_runs] == ["run-2"]
     assert result.failed_category_count == 1
-    assert database.failure_calls == [
-        {
-            "category_run_id": "run-1",
-            "failed_page": 2,
-            "error_category": "timeout",
-        }
-    ]
+    # 第 2、3 页同时预取：当 runner 线程恰好在第 2 页完成后才恢复，
+    # 下一次无进度超时会自然落在第 3 页。两者都是同一“预取停滞”语义。
+    assert len(database.failure_calls) == 1
+    failure_call = database.failure_calls[0]
+    assert failure_call["category_run_id"] == "run-1"
+    assert failure_call["error_category"] == "timeout"
+    assert failure_call["failed_page"] in {2, 3}
 
 
 def test_total_zero_still_saves_one_empty_page() -> None:
