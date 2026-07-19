@@ -12,20 +12,18 @@ permissions:
 jobs:
   test:
     name: Test before packaging
-    runs-on: ubuntu-latest
+    # LaunchAgent dry-run relies on macOS-native PlistBuddy and plutil.
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install Qt runtime libraries
-        run: sudo apt-get update && sudo apt-get install --yes libegl1 libgl1
       - name: Install locked dependencies
         run: uv sync --frozen --group dev
       - name: Run tests
-        # GUI module tests only need Qt imports; offscreen avoids requesting a display server.
-        run: QT_QPA_PLATFORM=offscreen uv run pytest
+        run: uv run pytest
 
   package:
     name: Package ${{ matrix.target }}
