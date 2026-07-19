@@ -916,10 +916,16 @@ def _collect_category_batch_by_level1(
         return True
 
     with ThreadPoolExecutor(max_workers=max_group_workers) as executor:
-        while len(active_futures) < max_group_workers and submit_next_group(executor):
-            pass
+        # 一级分类组按并发批次推进：当前批次所有组正常退出后，才允许启动下一批。
+        # 这样任一并行组稍后报告认证失效时，不会让已释放的槽位抢先启动等待组。
+        while active_futures or (
+            terminal_failure is None and next_group_index < len(level1_groups)
+        ):
+            if not active_futures:
+                while len(active_futures) < max_group_workers and submit_next_group(executor):
+                    pass
+                continue
 
-        while active_futures:
             # 优先执行已经排队的持久化操作，避免 worker 因等待主线程而饥饿。
             if persistence.process_one(timeout_seconds=0.01):
                 continue
@@ -952,12 +958,6 @@ def _collect_category_batch_by_level1(
                                 "abandoned",
                             )
                             batch_stop_event.set()
-                while (
-                    terminal_failure is None
-                    and len(active_futures) < max_group_workers
-                    and submit_next_group(executor)
-                ):
-                    pass
                 continue
 
             # 首个终态原因是批次审计依据；后续并行组只释放并退出，不能覆盖它。

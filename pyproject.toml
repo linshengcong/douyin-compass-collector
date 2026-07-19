@@ -10,17 +10,23 @@ dependencies = [
   "httpx>=0.28,<0.29",
   "playwright>=1.53,<2",
   "pydantic>=2.11,<3",
-  "pyside6>=6.8,<7",
+  # 桌面界面只使用 QtCore、QtGui、QtWidgets；避免下载未使用的 Addons 组件。
+  "pyside6-essentials>=6.8,<7",
   "python-dotenv>=1.1,<2",
   "pyyaml>=6.0,<7",
   "sqlalchemy>=2.0,<3",
 ]
 
 [dependency-groups]
-dev = [
-  "pillow>=11.0,<12",
-  "pyinstaller>=6.16,<7",
+# 测试、打包和图标生成分别按需安装，避免打包工作流下载无关依赖。
+test = [
   "pytest>=8.4,<9",
+]
+package = [
+  "pyinstaller>=6.16,<7",
+]
+tools = [
+  "pillow>=11.0,<12",
 ]
 
 [build-system]

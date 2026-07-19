@@ -325,6 +325,7 @@ class FakeRankingClient:
         level1_fetch_workers: int = 1,
         page_fetch_wait_timeout_seconds: float = 45,
         delay_by_page: dict[int, float] | None = None,
+        delay_by_category_page: dict[tuple[str, int], float] | None = None,
         failure_by_page: dict[int, Exception] | None = None,
         stop_after_response_for: str | None = None,
         control: CollectionControl | None = None,
@@ -341,6 +342,8 @@ class FakeRankingClient:
         self.page_fetch_wait_timeout_seconds = page_fetch_wait_timeout_seconds
         # delay_by_page 用于制造乱序响应，验证主线程顺序持久化。
         self.delay_by_page = dict(delay_by_page or {})
+        # delay_by_category_page 覆盖通用页延迟，用于稳定构造一级分类调度竞态。
+        self.delay_by_category_page = dict(delay_by_category_page or {})
         # failure_by_page 用于模拟单个并发分页失败。
         self.failure_by_page = dict(failure_by_page or {})
         # calls 保留请求启动记录，并发分页不依赖它断言落盘顺序。
@@ -382,7 +385,10 @@ class FakeRankingClient:
             )
         try:
             # delay_by_page 在请求已登记后等待，制造稳定的并发重叠。
-            delay_seconds = self.delay_by_page.get(page_no, 0)
+            delay_seconds = self.delay_by_category_page.get(
+                (category_id, page_no),
+                self.delay_by_page.get(page_no, 0),
+            )
             if delay_seconds > 0:
                 time.sleep(delay_seconds)
             # 单页失败优先于分类级行为，用于测试并发分页失败定位。
@@ -602,7 +608,9 @@ def test_parallel_group_auth_failure_does_not_start_a_waiting_third_group() -> N
             "category-3": 0,
         },
         level1_fetch_workers=2,
-        delay_by_page={1: 0.03},
+        # category-2 先完成并释放一个 worker 槽位；category-1 随后才报告认证失效。
+        # 旧的“空槽立即补组”调度会因此错误启动 category-3。
+        delay_by_category_page={("category-1", 1): 0.03},
     )
     prepared_batch = build_prepared_batch(
         category_count=3,
