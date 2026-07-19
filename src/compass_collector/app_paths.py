@@ -1,11 +1,12 @@
 """Resolve development and portable desktop paths from one trusted place."""
 
+import os
 import sys
 from pathlib import Path
 
 
-# 便携版目录和配置文件均使用可见中文名，方便通过 Finder 和 Explorer 操作。
-PORTABLE_DATA_DIRECTORY_NAME = "采集器数据"
+# 桌面版数据置于系统的应用数据目录，不能写入已签名的 .app / _internal 资源。
+PORTABLE_DATA_DIRECTORY_NAME = "抖音罗盘采集器"
 PORTABLE_ENVIRONMENT_FILENAME = "配置.env"
 
 
@@ -47,10 +48,24 @@ def resource_root() -> Path:
 
 
 def portable_data_root() -> Path:
-    """Return the self-contained writable data directory inside the application."""
+    """Return the per-user writable directory for a packaged desktop application."""
 
-    # 资源根目录位于 macOS .app/Contents/Resources 或 Windows one-folder payload。
-    return resource_root() / PORTABLE_DATA_DIRECTORY_NAME
+    # macOS 对 .app 的签名覆盖 Contents；写入 Resources 会使首次启动后签名失效。
+    if sys.platform == "darwin":
+        return (
+            Path.home()
+            / "Library"
+            / "Application Support"
+            / PORTABLE_DATA_DIRECTORY_NAME
+        )
+    # Windows 的 LocalAppData 同样避免污染 one-folder 安装包并支持无管理员运行。
+    if sys.platform == "win32":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / PORTABLE_DATA_DIRECTORY_NAME
+        return Path.home() / "AppData" / "Local" / PORTABLE_DATA_DIRECTORY_NAME
+    # 其他平台保留 XDG 风格的安全默认目录，方便开发诊断。
+    return Path.home() / ".local" / "share" / PORTABLE_DATA_DIRECTORY_NAME
 
 
 def runtime_root() -> Path:

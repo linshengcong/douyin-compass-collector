@@ -53,7 +53,7 @@ from compass_collector.runtime_logging import (
 from compass_collector.app_paths import runtime_root, scheduler_process_command
 
 
-# GUI、Scheduler 与采集锁在便携版均位于可见的采集器数据/runtime，永不进入安装包。
+# GUI、Scheduler 与采集锁在桌面版均位于用户应用数据目录，永不进入安装包。
 RUNTIME_ROOT = runtime_root()
 # GUI 日志表限制内存事件数，持久记录仍以 JSONL 为准。
 MAX_VISIBLE_EVENTS = 2000

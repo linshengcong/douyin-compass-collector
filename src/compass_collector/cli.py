@@ -202,9 +202,9 @@ def _validate_portable_environment() -> None:
     message_box = QMessageBox()
     message_box.setIcon(QMessageBox.Warning)
     message_box.setWindowTitle("缺少配置文件")
-    message_box.setText("未找到 采集器数据/配置.env，暂时无法启动采集器。")
+    message_box.setText("未找到应用数据目录中的配置.env，暂时无法启动采集器。")
     message_box.setInformativeText(
-        "请将可信来源提供的 .env 重命名为“配置.env”，放入已打开的“采集器数据”文件夹后，再重新启动应用。"
+        "请将可信来源提供的 .env 重命名为“配置.env”，放入已打开的应用数据文件夹后，再重新启动应用。"
     )
     open_button = message_box.addButton("打开配置目录", QMessageBox.AcceptRole)
     message_box.addButton("退出", QMessageBox.RejectRole)

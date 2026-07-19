@@ -53,7 +53,7 @@ from compass_collector.app_paths import runtime_root
 
 # 所有业务日期和计划时间按北京时区固定。
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
-# 运行时文件在开发时位于仓库 runtime，便携版位于应用包内采集器数据/runtime。
+# 运行时文件在开发时位于仓库 runtime，桌面版位于用户应用数据目录。
 RUNTIME_ROOT = runtime_root()
 # Chrome Profile、登录态读取和采集共用同一执行锁。
 COLLECTION_LOCK_NAME = "collection.lock"

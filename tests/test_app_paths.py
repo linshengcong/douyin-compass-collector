@@ -18,26 +18,32 @@ def test_development_paths_keep_existing_relative_runtime_layout(
     assert app_paths.dotenv_path() == Path(".env")
 
 
-def test_windows_bundle_keeps_config_and_data_inside_one_folder_payload(
+def test_windows_bundle_keeps_config_in_bundle_and_data_in_local_app_data(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    """Keep config and writable data in the packaged Windows application payload."""
+    """Keep immutable config in the bundle and writable data outside it on Windows."""
 
     executable_path = tmp_path / "抖音罗盘采集器.exe"
     resource_path = tmp_path / "_internal"
     monkeypatch.setattr(app_paths.sys, "frozen", True, raising=False)
     monkeypatch.setattr(app_paths.sys, "executable", str(executable_path))
     monkeypatch.setattr(app_paths.sys, "_MEIPASS", str(resource_path), raising=False)
+    monkeypatch.setattr(app_paths.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData" / "Local"))
 
     assert app_paths.application_root() == tmp_path
     assert app_paths.default_config_path() == resource_path / "config" / "tasks.yaml"
-    assert app_paths.dotenv_path() == resource_path / "采集器数据" / "配置.env"
-    assert app_paths.runtime_root() == resource_path / "采集器数据" / "runtime"
+    data_path = tmp_path / "AppData" / "Local" / "抖音罗盘采集器"
+    assert app_paths.dotenv_path() == data_path / "配置.env"
+    assert app_paths.runtime_root() == data_path / "runtime"
 
 
-def test_macos_bundle_keeps_data_inside_app_resources(monkeypatch, tmp_path: Path) -> None:
-    """Keep visible data inside the macOS app bundle for self-contained sharing."""
+def test_macos_bundle_keeps_data_outside_signed_app_resources(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Keep writable data outside the signed macOS application bundle."""
 
     executable_path = (
         tmp_path
@@ -50,9 +56,13 @@ def test_macos_bundle_keeps_data_inside_app_resources(monkeypatch, tmp_path: Pat
     monkeypatch.setattr(app_paths.sys, "frozen", True, raising=False)
     monkeypatch.setattr(app_paths.sys, "executable", str(executable_path))
     monkeypatch.setattr(app_paths.sys, "_MEIPASS", str(resource_path), raising=False)
+    monkeypatch.setattr(app_paths.sys, "platform", "darwin")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
 
     assert app_paths.application_root() == tmp_path
-    assert app_paths.portable_data_root() == resource_path / "采集器数据"
+    assert app_paths.portable_data_root() == (
+        tmp_path / "home" / "Library" / "Application Support" / "抖音罗盘采集器"
+    )
 
 
 def test_packaged_scheduler_reinvokes_same_executable(monkeypatch, tmp_path: Path) -> None:
