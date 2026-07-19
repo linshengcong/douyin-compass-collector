@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 import httpx
 from dotenv import load_dotenv
 
+from compass_collector.app_paths import dotenv_path as default_dotenv_path
 from compass_collector.runtime_logging import LogContext, RuntimeLogger
 
 
@@ -212,11 +213,13 @@ class NotificationDeliveryResult:
     status_code: int | None = None
 
 
-def load_project_environment(dotenv_path: Path = Path(".env")) -> None:
+def load_project_environment(dotenv_path: Path | None = None) -> None:
     """Load project dotenv values without overriding existing process variables."""
 
+    # 默认路径按开发或便携版环境自动切换，外部传参仍便于隔离测试。
+    resolved_dotenv_path = dotenv_path or default_dotenv_path()
     # python-dotenv 处理引号、空白和转义，override=False 保留外部注入优先级。
-    load_dotenv(dotenv_path=dotenv_path, override=False)
+    load_dotenv(dotenv_path=resolved_dotenv_path, override=False)
 
 
 def load_dingtalk_settings() -> DingTalkSettings:

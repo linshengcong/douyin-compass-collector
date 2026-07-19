@@ -29,12 +29,13 @@ from compass_collector.runner import planned_at_for_task, run_scheduled_collecti
 from compass_collector.run_control import CollectionControl
 from compass_collector.runtime_locks import ProcessLock
 from compass_collector.runtime_logging import LogContext, RuntimeLogger
+from compass_collector.app_paths import runtime_root
 
 
 # Scheduler 与采集业务日期统一使用北京时间。
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
-# 调度日志复用阶段三按日 JSONL 目录。
-RUNTIME_ROOT = Path("runtime")
+# 调度日志在开发时沿用 runtime，便携版使用应用包内持久目录。
+RUNTIME_ROOT = runtime_root()
 # Scheduler 实例锁与实际采集执行锁相互独立。
 SCHEDULER_LOCK_NAME = "scheduler.lock"
 # 运行回调签名允许测试替换真实浏览器采集。

@@ -585,8 +585,10 @@ def upgrade_database(database_path: Path) -> None:
     """Upgrade the configured SQLite database to the latest Alembic revision."""
 
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    # 项目根目录从当前包文件稳定推导。
-    project_root = Path(__file__).resolve().parents[2]
+    # 迁移资源在开发时来自仓库，PyInstaller 中来自打包的数据目录。
+    from compass_collector.app_paths import resource_root
+
+    project_root = resource_root()
     # Alembic 配置在运行时覆盖为当前数据库绝对 URL。
     alembic_config = AlembicConfig(str(project_root / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(project_root / "migrations"))

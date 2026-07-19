@@ -6,6 +6,8 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from compass_collector.app_paths import is_packaged_application, runtime_root
+
 
 class StrictModel(BaseModel):
     """Reject unknown configuration fields instead of silently ignoring typos."""
@@ -207,4 +209,27 @@ def load_config(config_path: Path) -> AppConfig:
     raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(raw_config, dict):
         raise ValueError("configuration root must be a mapping")
-    return AppConfig.model_validate(raw_config)
+    config = AppConfig.model_validate(raw_config)
+    if not is_packaged_application():
+        return config
+    # 打包版仍沿用受版本控制的 runtime/... 配置写法，但实际数据存放在应用包内。
+    configured_runtime_root = Path("runtime")
+    active_runtime_root = runtime_root()
+
+    def resolve_runtime_value(value: Path) -> Path:
+        """Map only relative runtime paths into the portable persistent directory."""
+
+        if value.is_absolute() or value.parts[:1] != configured_runtime_root.parts:
+            return value
+        return active_runtime_root.joinpath(*value.parts[1:])
+
+    return config.model_copy(
+        update={
+            "browser": config.browser.model_copy(
+                update={"profile_dir": resolve_runtime_value(config.browser.profile_dir)}
+            ),
+            "database": config.database.model_copy(
+                update={"path": resolve_runtime_value(config.database.path)}
+            ),
+        }
+    )

@@ -13,12 +13,19 @@ from compass_collector.runner import run_collection, run_login, run_status
 from compass_collector.runtime_locks import RuntimeLockBusy
 from compass_collector.runtime_logging import RuntimeLogger
 from compass_collector.scheduler import run_scheduler
+from compass_collector.app_paths import (
+    default_config_path,
+    dotenv_path,
+    ensure_portable_data_root,
+    is_packaged_application,
+    runtime_root,
+)
 
 
 # 默认配置路径与工程方案保持一致。
-DEFAULT_CONFIG_PATH = Path("config/tasks.yaml")
+DEFAULT_CONFIG_PATH = default_config_path()
 # CLI 级通知测试复用现有安全日志目录。
-RUNTIME_LOG_DIRECTORY = Path("runtime/logs")
+RUNTIME_LOG_DIRECTORY = runtime_root() / "logs"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -78,8 +85,14 @@ def main() -> None:
     """Validate configuration and dispatch one authorized command."""
 
     # CLI 参数在任何配置或浏览器操作前解析。
-    arguments = build_parser().parse_args()
+    cli_arguments = sys.argv[1:]
+    # 双击打包后的桌面应用时默认进入空闲 GUI，而开发 CLI 保持显式命令。
+    if is_packaged_application() and not cli_arguments:
+        cli_arguments = ["app"]
+    arguments = build_parser().parse_args(cli_arguments)
     try:
+        if is_packaged_application():
+            _validate_portable_environment()
         # .env 只补充当前进程缺失值，系统环境变量保持最高优先级。
         load_project_environment()
         if arguments.command == "notify-test":
@@ -94,6 +107,11 @@ def main() -> None:
     except (OSError, ValueError, ValidationError) as error:
         print(f"启动失败：{error}", file=sys.stderr)
         exit_code = 2
+    except ModuleNotFoundError as error:
+        # 模块名不包含账号或请求数据，可用于定位打包漏收集的依赖。
+        missing_module = error.name or "unknown"
+        print(f"运行失败：缺少打包组件 {missing_module}", file=sys.stderr)
+        exit_code = 1
     except Exception as error:
         # 未预期浏览器错误只输出类型，避免底层异常夹带 URL 或请求上下文。
         print(f"运行失败：{type(error).__name__}", file=sys.stderr)
@@ -149,7 +167,7 @@ def _dispatch_configured_command(
             raise ValueError("clear-data requires --yes")
         # 只在同时获得 Scheduler 和采集锁后执行白名单删除。
         cleanup_summary = clear_local_data_with_locks(
-            Path("runtime"),
+            runtime_root(),
             config.database.path,
         )
         print(
@@ -166,3 +184,32 @@ def _dispatch_configured_command(
     else:
         exit_code = run_scheduler(config)
     return exit_code
+
+
+def _validate_portable_environment() -> None:
+    """Guide desktop users to the external dotenv folder before a real run starts."""
+
+    # 先创建目录，用户无需在 Finder 或 Explorer 中手动显示隐藏文件。
+    data_root = ensure_portable_data_root()
+    if dotenv_path().is_file():
+        return
+    # PySide6 只在打包 GUI 缺配置时导入，终端开发命令不受影响。
+    from PySide6.QtCore import QUrl
+    from PySide6.QtGui import QDesktopServices
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    application = QApplication.instance() or QApplication(sys.argv)
+    message_box = QMessageBox()
+    message_box.setIcon(QMessageBox.Warning)
+    message_box.setWindowTitle("缺少配置文件")
+    message_box.setText("未找到 采集器数据/配置.env，暂时无法启动采集器。")
+    message_box.setInformativeText(
+        "请将可信来源提供的 .env 重命名为“配置.env”，放入已打开的“采集器数据”文件夹后，再重新启动应用。"
+    )
+    open_button = message_box.addButton("打开配置目录", QMessageBox.AcceptRole)
+    message_box.addButton("退出", QMessageBox.RejectRole)
+    message_box.exec()
+    if message_box.clickedButton() is open_button:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(data_root)))
+    # 没有 .env 时不能误以为账号与通知配置已经生效。
+    raise ValueError("portable_env_missing")

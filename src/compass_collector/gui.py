@@ -50,10 +50,11 @@ from compass_collector.runtime_logging import (
     EVENT_STREAM_PREFIX,
     read_latest_batch_events,
 )
+from compass_collector.app_paths import runtime_root, scheduler_process_command
 
 
-# GUI、Scheduler 与采集锁均位于本机 runtime，永不进入仓库。
-RUNTIME_ROOT = Path("runtime")
+# GUI、Scheduler 与采集锁在便携版均位于可见的采集器数据/runtime，永不进入安装包。
+RUNTIME_ROOT = runtime_root()
 # GUI 日志表限制内存事件数，持久记录仍以 JSONL 为准。
 MAX_VISIBLE_EVENTS = 2000
 
@@ -1047,21 +1048,16 @@ class CollectorWindow(QMainWindow):
         if lock_is_held(scheduler_lock_path, "scheduler"):
             self._refresh_scheduler_status()
             return
-        # GUI 子进程使用当前虚拟环境 Python 和相同工程目录。
+        # GUI 子进程使用开发 Python 或已打包应用，并继承同一便携目录。
         process_environment = QProcessEnvironment.systemEnvironment()
         process_environment.insert(EVENT_STREAM_ENV, "1")
         self.scheduler_process.setProcessEnvironment(process_environment)
-        self.scheduler_process.setWorkingDirectory(str(Path.cwd()))
-        self.scheduler_process.setProgram(sys.executable)
-        self.scheduler_process.setArguments(
-            [
-                "-m",
-                "compass_collector",
-                "scheduler",
-                "--config",
-                str(self.request.config_path),
-            ]
+        scheduler_program, scheduler_arguments = scheduler_process_command(
+            self.request.config_path
         )
+        self.scheduler_process.setWorkingDirectory(str(Path.cwd()))
+        self.scheduler_process.setProgram(scheduler_program)
+        self.scheduler_process.setArguments(scheduler_arguments)
         self.scheduler_buffer = ""
         self.owned_scheduler = True
         self.scheduler_status_label.setText("正在启动")
