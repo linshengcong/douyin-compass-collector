@@ -70,6 +70,9 @@ def build_application(project_root: Path, target: str) -> Path:
         # GUI 和迁移链路含有延迟导入，显式收集避免桌面版运行时缺少模块。
         "--collect-submodules",
         "compass_collector",
+        # tzdata supplies IANA zones for Windows where ZoneInfo has no system database.
+        "--collect-data",
+        "tzdata",
         # Alembic loads this standard-library submodule from migration resources at runtime.
         "--hidden-import",
         "logging.config",
@@ -83,7 +86,17 @@ def build_application(project_root: Path, target: str) -> Path:
         str(project_root / "src" / "compass_collector" / "__main__.py"),
     ]
     if target == "macos-arm64":
-        command.extend(["--target-architecture", "arm64", "--osx-bundle-identifier", "com.zhuanz1.douyin-compass-collector"])
+        command.extend(
+            [
+                "--target-architecture",
+                "arm64",
+                "--osx-bundle-identifier",
+                "com.zhuanz1.douyin-compass-collector",
+            ]
+        )
+    else:
+        # Windows 锁实现延迟导入 msvcrt；显式收集保证冻结后仍可启动。
+        command.extend(["--hidden-import", "msvcrt"])
     # subprocess 继承 CI 输出，构建失败时可以直接定位缺失的系统依赖。
     subprocess.run(command, check=True, cwd=project_root)
     return project_root / "dist" / (

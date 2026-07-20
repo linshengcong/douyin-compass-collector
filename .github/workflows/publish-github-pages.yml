@@ -1,0 +1,67 @@
+name: Publish public ranking site
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "web/**"
+      - ".github/workflows/publish-github-pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build public static site
+        env:
+          # 此地址会编译进浏览器代码，必须是可公开访问的 OSS latest.json 地址。
+          VITE_DATA_INDEX_URL: ${{ vars.VITE_DATA_INDEX_URL }}
+        run: |
+          if [ -z "$VITE_DATA_INDEX_URL" ]; then
+            echo "Repository variable VITE_DATA_INDEX_URL is required."
+            exit 1
+          fi
+          npm ci --prefix web
+          npm run build --prefix web
+      - name: Check cross-repository publishing token
+        env:
+          # 当前仓库的 GITHUB_TOKEN 无法向用户主页仓库写入，需要单独的细粒度 Token。
+          PAGES_DEPLOY_TOKEN: ${{ secrets.PAGES_DEPLOY_TOKEN }}
+        run: |
+          if [ -z "$PAGES_DEPLOY_TOKEN" ]; then
+            echo "Repository secret PAGES_DEPLOY_TOKEN is required."
+            exit 1
+          fi
+      - name: Check out GitHub Pages repository
+        uses: actions/checkout@v4
+        with:
+          repository: linshengcong/linshengcong.github.io
+          ref: master
+          token: ${{ secrets.PAGES_DEPLOY_TOKEN }}
+          path: github-pages-site
+      - name: Replace published static files
+        run: |
+          find github-pages-site -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -R web/dist/. github-pages-site/
+          touch github-pages-site/.nojekyll
+      - name: Commit and push GitHub Pages site
+        working-directory: github-pages-site
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add --all
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "Deploy public ranking site"
+          git push origin HEAD:master

@@ -1,13 +1,12 @@
 """PySide6 desktop control console for manual runs and an owned Scheduler."""
 
 import json
-import os
-import signal
 import sys
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from PySide6.QtCore import (
     QObject,
@@ -46,17 +45,51 @@ from compass_collector.run_control import CollectionControl
 from compass_collector.runner import run_collection
 from compass_collector.runtime_locks import ProcessLock, RuntimeLockBusy, lock_is_held
 from compass_collector.runtime_logging import (
-    EVENT_STREAM_ENV,
     EVENT_STREAM_PREFIX,
+    EVENT_STREAM_PATH_ENV,
     read_latest_batch_events,
 )
 from compass_collector.app_paths import runtime_root, scheduler_process_command
+from compass_collector.scheduler_control import (
+    SCHEDULER_CONTROL_ID_ENV,
+    SchedulerControlFiles,
+)
 
 
 # GUI、Scheduler 与采集锁在桌面版均位于用户应用数据目录，永不进入安装包。
 RUNTIME_ROOT = runtime_root()
 # GUI 日志表限制内存事件数，持久记录仍以 JSONL 为准。
 MAX_VISIBLE_EVENTS = 2000
+
+
+def read_scheduler_event_file(
+    event_path: Path,
+    offset: int,
+    buffered_text: str,
+) -> tuple[list[dict[str, Any]], int, str]:
+    """Read complete safe Scheduler event lines appended since one file offset."""
+
+    try:
+        with event_path.open("r", encoding="utf-8") as event_file:
+            event_file.seek(offset)
+            # appended_text 只包含本次定时轮询新增的字节。
+            appended_text = event_file.read()
+            next_offset = event_file.tell()
+    except FileNotFoundError:
+        return [], offset, buffered_text
+    # 跨写入边界的半行留到下一个轮询，避免 JSON 解析误报。
+    complete_lines = (buffered_text + appended_text).split("\n")
+    next_buffer = complete_lines.pop()
+    # 安全事件已由 Scheduler RuntimeLogger 审核，此处仅校验 JSON 结构。
+    events: list[dict[str, Any]] = []
+    for line in complete_lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events, next_offset, next_buffer
 
 
 class RunMode(str, Enum):
@@ -590,8 +623,14 @@ class CollectorWindow(QMainWindow):
         self.owned_scheduler = False
         # scheduler_job_active 用于区分停止调度与中止当前定时采集。
         self.scheduler_job_active = False
+        # scheduler_control 只寻址本窗口本次启动的 Scheduler 子进程。
+        self.scheduler_control: SchedulerControlFiles | None = None
         # Scheduler 标准输出可能跨 readyRead 信号分段。
         self.scheduler_buffer = ""
+        # Scheduler 事件文件读取到的位置只属于当前受控子进程。
+        self.scheduler_event_offset = 0
+        # 事件文件最后的半行留给下一次轮询补全。
+        self.scheduler_event_buffer = ""
         # 当前或最近已发布 CSV 是打开按钮的唯一目标。
         self.current_csv_path = latest_published_csv(config)
         # progress_state 让事件处理逻辑可以脱离真实 Qt 窗口单独验证。
@@ -607,11 +646,16 @@ class CollectorWindow(QMainWindow):
         self.scheduler_timer = QTimer(self)
         self.scheduler_timer.setInterval(2000)
         self.scheduler_timer.timeout.connect(self._refresh_scheduler_status)
+        # windowed Scheduler 无 stdout，短周期读取其独立安全事件文件。
+        self.scheduler_event_timer = QTimer(self)
+        self.scheduler_event_timer.setInterval(200)
+        self.scheduler_event_timer.timeout.connect(self._read_scheduler_event_file)
         self._build_ui()
         self._load_persisted_events()
         self._refresh_csv_controls()
         self._refresh_scheduler_status()
         self.scheduler_timer.start()
+        self.scheduler_event_timer.start()
         if request.auto_start:
             # 零延迟让窗口先完成展示，再进入可能弹确认框的启动流程。
             QTimer.singleShot(0, self.start_collection)
@@ -1018,10 +1062,9 @@ class CollectorWindow(QMainWindow):
             self.collection_control.request_stop()
             self.run_status_label.setText("正在中止")
         elif self.scheduler_job_active and self.owned_scheduler:
-            # SIGUSR1 只转发给 Scheduler 当前批次，不停止未来调度。
-            scheduler_pid = int(self.scheduler_process.processId())
-            if scheduler_pid > 0:
-                os.kill(scheduler_pid, signal.SIGUSR1)
+            # 一次性控制文件只中止 Scheduler 当前批次，不停止未来调度。
+            if self.scheduler_control is not None:
+                self.scheduler_control.request_interruption()
 
     @Slot()
     def close_retained_chrome(self) -> None:
@@ -1041,7 +1084,9 @@ class CollectorWindow(QMainWindow):
         if self.owned_scheduler:
             self.scheduler_status_label.setText("停止中，等待当前批次完成")
             self.scheduler_button.setEnabled(False)
-            self.scheduler_process.terminate()
+            # Scheduler 自行停止未来调度并等待当前批次安全收口。
+            if self.scheduler_control is not None:
+                self.scheduler_control.request_shutdown()
             return
         # 外部 Scheduler 只读展示，永远不从 GUI 终止。
         scheduler_lock_path = RUNTIME_ROOT / "locks" / "scheduler.lock"
@@ -1050,7 +1095,18 @@ class CollectorWindow(QMainWindow):
             return
         # GUI 子进程使用开发 Python 或已打包应用，并继承同一便携目录。
         process_environment = QProcessEnvironment.systemEnvironment()
-        process_environment.insert(EVENT_STREAM_ENV, "1")
+        # 每次启动使用全新实例 ID，旧控制文件不能误伤新进程。
+        scheduler_control_id = uuid4().hex
+        # GUI 和子进程通过相同运行目录解析本次控制文件。
+        self.scheduler_control = SchedulerControlFiles(
+            RUNTIME_ROOT / "controls",
+            scheduler_control_id,
+        )
+        process_environment.insert(SCHEDULER_CONTROL_ID_ENV, scheduler_control_id)
+        process_environment.insert(
+            EVENT_STREAM_PATH_ENV,
+            str(self.scheduler_control.event_path),
+        )
         self.scheduler_process.setProcessEnvironment(process_environment)
         scheduler_program, scheduler_arguments = scheduler_process_command(
             self.request.config_path
@@ -1059,6 +1115,8 @@ class CollectorWindow(QMainWindow):
         self.scheduler_process.setProgram(scheduler_program)
         self.scheduler_process.setArguments(scheduler_arguments)
         self.scheduler_buffer = ""
+        self.scheduler_event_offset = 0
+        self.scheduler_event_buffer = ""
         self.owned_scheduler = True
         self.scheduler_status_label.setText("正在启动")
         self.scheduler_process.start()
@@ -1083,9 +1141,7 @@ class CollectorWindow(QMainWindow):
                 except json.JSONDecodeError:
                     continue
                 if isinstance(event, dict):
-                    self.handle_event(event)
-                    if event.get("event") == "scheduler_started":
-                        self.scheduler_status_label.setText("GUI Scheduler 运行中")
+                    self._handle_scheduler_process_event(event)
             elif line.strip():
                 # 子进程非事件输出可能含配置字段，只展示固定安全摘要。
                 self._append_event(
@@ -1097,10 +1153,43 @@ class CollectorWindow(QMainWindow):
                     )
                 )
 
+    @Slot()
+    def _read_scheduler_event_file(self) -> None:
+        """Poll the owned windowed Scheduler's instance-scoped event file."""
+
+        scheduler_control = self.scheduler_control
+        if scheduler_control is None:
+            return
+        events, next_offset, next_buffer = read_scheduler_event_file(
+            scheduler_control.event_path,
+            self.scheduler_event_offset,
+            self.scheduler_event_buffer,
+        )
+        self.scheduler_event_offset = next_offset
+        self.scheduler_event_buffer = next_buffer
+        for event in events:
+            self._handle_scheduler_process_event(event)
+
+    def _handle_scheduler_process_event(self, event: dict[str, Any]) -> None:
+        """Apply one Scheduler child event received from a pipe or event file."""
+
+        # 两种传输方式都复用同一 GUI 状态归约，避免平台分叉。
+        self.handle_event(event)
+        if event.get("event") == "scheduler_started":
+            self.scheduler_status_label.setText("GUI Scheduler 运行中")
+
     @Slot(int, QProcess.ExitStatus)
     def _scheduler_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
         """Clear owned Scheduler state after graceful or abnormal process exit."""
 
+        # 进程退出后再读一次，避免漏掉缓冲区中的最后一条完成事件。
+        self._read_scheduler_event_file()
+        # GUI 负责清理子进程未消费的本实例请求文件。
+        finished_control = self.scheduler_control
+        if finished_control is not None:
+            finished_control.cleanup()
+            finished_control.clear_event_log()
+        self.scheduler_control = None
         self.owned_scheduler = False
         self.scheduler_job_active = False
         self.scheduler_status_label.setText(
@@ -1305,7 +1394,9 @@ class CollectorWindow(QMainWindow):
                 return
             self.pending_close = True
             self.scheduler_status_label.setText("停止中，等待当前批次完成")
-            self.scheduler_process.terminate()
+            # 退出窗口与按钮停止使用相同的等待式跨平台协议。
+            if self.scheduler_control is not None:
+                self.scheduler_control.request_shutdown()
             event.ignore()
             return
         event.accept()

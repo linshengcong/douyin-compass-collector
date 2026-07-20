@@ -15,6 +15,8 @@ dependencies = [
   "python-dotenv>=1.1,<2",
   "pyyaml>=6.0,<7",
   "sqlalchemy>=2.0,<3",
+  # Windows does not provide the IANA zoneinfo database required by Asia/Shanghai.
+  "tzdata>=2025.2,<2027",
 ]
 
 [dependency-groups]

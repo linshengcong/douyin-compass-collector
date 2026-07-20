@@ -1,8 +1,10 @@
 """Stage-six GUI routing, safe events, cancellation, and lock tests."""
 
 import json
+import sys
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -18,6 +20,7 @@ from compass_collector.runner import (
     collect_task,
     run_scheduled_collection,
 )
+from compass_collector import runtime_locks
 from compass_collector.runtime_locks import ProcessLock, RuntimeLockBusy, lock_is_held
 from compass_collector.runtime_logging import (
     EVENT_STREAM_ENV,
@@ -84,6 +87,28 @@ def test_process_locks_detect_live_owner_and_release_automatically(tmp_path: Pat
     # 文件仍存在不代表锁仍被占用，判断只依赖操作系统锁。
     assert lock_path.exists()
     assert lock_is_held(lock_path, "gui") is False
+
+
+def test_windows_process_lock_uses_msvcrt_without_importing_fcntl(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Use Windows byte-range locking so packaged startup has no fcntl dependency."""
+
+    # 伪造 Windows 标准库接口，确保跨平台分支不依赖当前 macOS 运行环境。
+    calls: list[tuple[int, int]] = []
+    fake_msvcrt = SimpleNamespace(
+        LK_NBLCK=1,
+        LK_UNLCK=2,
+        locking=lambda _fd, mode, length: calls.append((mode, length)),
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(runtime_locks, "_is_windows", lambda: True)
+
+    with ProcessLock(tmp_path / "windows.lock", "gui"):
+        pass
+
+    assert calls == [(fake_msvcrt.LK_NBLCK, 1), (fake_msvcrt.LK_UNLCK, 1)]
 
 
 def test_collection_control_separates_stop_and_browser_close() -> None:

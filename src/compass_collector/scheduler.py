@@ -3,6 +3,7 @@
 from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime, timedelta
+import os
 from pathlib import Path
 import signal
 import time
@@ -30,6 +31,10 @@ from compass_collector.run_control import CollectionControl
 from compass_collector.runtime_locks import ProcessLock
 from compass_collector.runtime_logging import LogContext, RuntimeLogger
 from compass_collector.app_paths import runtime_root
+from compass_collector.scheduler_control import (
+    SCHEDULER_CONTROL_ID_ENV,
+    SchedulerControlFiles,
+)
 
 
 # Scheduler 与采集业务日期统一使用北京时间。
@@ -40,6 +45,22 @@ RUNTIME_ROOT = runtime_root()
 SCHEDULER_LOCK_NAME = "scheduler.lock"
 # 运行回调签名允许测试替换真实浏览器采集。
 ScheduledRunCallback = Callable[[AppConfig, list[TaskConfig], datetime], int]
+
+
+def apply_scheduler_control_requests(
+    scheduler_control: SchedulerControlFiles,
+    shutdown_requested: Event,
+    active_control: CollectionControl | None,
+) -> None:
+    """Consume GUI requests and update the Scheduler's local cooperative controls."""
+
+    # 空闲时仍消费中止请求，避免它误伤下一次计划批次。
+    interruption_requested = scheduler_control.consume_interruption()
+    if interruption_requested and active_control is not None:
+        active_control.request_stop()
+    # 优雅停止只关闭未来调度，不能隐式中止当前采集。
+    if scheduler_control.consume_shutdown():
+        shutdown_requested.set()
 
 
 def aware_checkpoint(value: datetime) -> datetime:
@@ -267,6 +288,15 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
     shutdown_requested = Event()
     # 当前批次控制器用于 GUI 显式“中止当前采集”。
     active_control: list[CollectionControl | None] = [None]
+    # GUI 提供实例 ID；终端启动则生成不可被旧请求命中的独立 ID。
+    scheduler_control_id = os.environ.get(SCHEDULER_CONTROL_ID_ENV) or uuid4().hex
+    # 控制文件位于与进程锁相同的持久运行根目录。
+    scheduler_control = SchedulerControlFiles(
+        RUNTIME_ROOT / "controls",
+        scheduler_control_id,
+    )
+    # 独立停止标记只负责结束控制轮询线程。
+    control_polling_stopped = Event()
 
     def run_group_with_control(
         callback_config: AppConfig,
@@ -305,17 +335,28 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
 
         shutdown_requested.set()
 
-    def request_active_interruption(signum, frame) -> None:
-        """Forward SIGUSR1 only to the currently running scheduled collection."""
+    def poll_control_requests() -> None:
+        """Translate cross-platform GUI request files into local thread events."""
 
-        # Scheduler 空闲时不保留中止信号，避免误伤下一次计划。
-        current_control = active_control[0]
-        if current_control is not None:
-            current_control.request_stop()
+        while not control_polling_stopped.is_set():
+            # 当前控制器只在真实定时批次生命周期内存在。
+            current_control = active_control[0]
+            apply_scheduler_control_requests(
+                scheduler_control,
+                shutdown_requested,
+                current_control,
+            )
+            control_polling_stopped.wait(0.1)
 
-    # GUI QProcess terminate 使用 SIGTERM，立即中止使用显式 SIGUSR1。
+    # SIGTERM 继续服务终端和系统进程管理；GUI 不再依赖平台信号。
     previous_term_handler = signal.signal(signal.SIGTERM, request_graceful_shutdown)
-    previous_interrupt_handler = signal.signal(signal.SIGUSR1, request_active_interruption)
+    # 控制轮询在启动补偿前运行，因此 GUI 可以安全停止启动中的批次。
+    control_thread = Thread(
+        target=poll_control_requests,
+        name="scheduler-control-poll",
+        daemon=True,
+    )
+    control_thread.start()
     # 启动时先补齐进程停止期间的到期或 missed 状态。
     reconcile_scheduler_once(
         config,
@@ -329,8 +370,10 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
             message="Scheduler 已停止",
             stage="scheduling",
         )
+        control_polling_stopped.set()
+        control_thread.join(timeout=1.0)
+        scheduler_control.cleanup()
         signal.signal(signal.SIGTERM, previous_term_handler)
-        signal.signal(signal.SIGUSR1, previous_interrupt_handler)
         return 0
     # 单工作线程保证不同 cron 组也不会并发操作同一 Chrome Profile。
     executors = {"default": ThreadPoolExecutor(max_workers=1)}
@@ -448,8 +491,10 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
             scheduler.shutdown(wait=True)
     finally:
         # 测试或嵌入调用结束后恢复进程原有信号处理器。
+        control_polling_stopped.set()
+        control_thread.join(timeout=1.0)
+        scheduler_control.cleanup()
         signal.signal(signal.SIGTERM, previous_term_handler)
-        signal.signal(signal.SIGUSR1, previous_interrupt_handler)
     runtime_logger.emit(
         level="INFO",
         event="scheduler_stopped",

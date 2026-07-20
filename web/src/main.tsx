@@ -33,7 +33,7 @@ function RankingApp() {
   const setFilters = (updater: (current: RankingFilters) => RankingFilters) => ranking.setFilters(updater);
 
   return <main className="page-shell">
-    <DesktopRankingView records={ranking.filteredRecords} filters={ranking.filters} options={options} page={page} pageSize={pageSize} totalPages={totalPages} onSetFilters={setFilters} onSelectLevel1={ranking.selectLevel1} onSelectLevel2={ranking.selectLevel2} onSelectLevel3={ranking.selectLevel3} onPageChange={setPage} onPageSizeChange={setPageSize} onReset={ranking.resetFilters} />
+    <DesktopRankingView records={ranking.filteredRecords} publishedAt={index?.published_at} filters={ranking.filters} options={options} page={page} pageSize={pageSize} totalPages={totalPages} onSetFilters={setFilters} onSelectLevel1={ranking.selectLevel1} onSelectLevel2={ranking.selectLevel2} onSelectLevel3={ranking.selectLevel3} onPageChange={setPage} onPageSizeChange={setPageSize} onReset={ranking.resetFilters} />
     <MobileRankingView snapshotRecords={records} records={ranking.filteredRecords} index={index} filters={ranking.filters} onSetFilters={setFilters} />
   </main>;
 }

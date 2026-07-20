@@ -78,6 +78,8 @@ def build_parser() -> argparse.ArgumentParser:
         "scheduler", help="run the foreground APScheduler"
     )
     scheduler_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    # _smoke 只供打包 CI 验证冻结资源，不作为用户可用命令展示。
+    subparsers.add_parser("_smoke", help=argparse.SUPPRESS)
     return parser
 
 
@@ -91,16 +93,27 @@ def main() -> None:
         cli_arguments = ["app"]
     arguments = build_parser().parse_args(cli_arguments)
     try:
-        if is_packaged_application():
+        if arguments.command == "_smoke":
+            exit_code = run_packaged_smoke_test()
+        elif is_packaged_application():
             _validate_portable_environment()
-        # .env 只补充当前进程缺失值，系统环境变量保持最高优先级。
-        load_project_environment()
-        if arguments.command == "notify-test":
-            exit_code = run_notification_test(RuntimeLogger(RUNTIME_LOG_DIRECTORY))
+            # .env 只补充当前进程缺失值，系统环境变量保持最高优先级。
+            load_project_environment()
+            if arguments.command == "notify-test":
+                exit_code = run_notification_test(RuntimeLogger(RUNTIME_LOG_DIRECTORY))
+            else:
+                # 严格业务配置在启动 Chrome 前完成全量校验。
+                config = load_config(arguments.config)
+                exit_code = _dispatch_configured_command(arguments, config)
         else:
-            # 严格业务配置在启动 Chrome 前完成全量校验。
-            config = load_config(arguments.config)
-            exit_code = _dispatch_configured_command(arguments, config)
+            # .env 只补充当前进程缺失值，系统环境变量保持最高优先级。
+            load_project_environment()
+            if arguments.command == "notify-test":
+                exit_code = run_notification_test(RuntimeLogger(RUNTIME_LOG_DIRECTORY))
+            else:
+                # 严格业务配置在启动 Chrome 前完成全量校验。
+                config = load_config(arguments.config)
+                exit_code = _dispatch_configured_command(arguments, config)
     except RuntimeLockBusy as error:
         print(f"启动失败：{error.role} 已被其他进程占用", file=sys.stderr)
         exit_code = 2
@@ -125,6 +138,12 @@ def _dispatch_configured_command(
 ) -> int:
     """Dispatch one command that already has a validated business config."""
 
+    # windowed 桌面包没有 stdin，不能进入依赖 Enter 的终端工作流。
+    if is_packaged_application() and (
+        arguments.command == "login"
+        or (arguments.command == "run" and arguments.no_gui)
+    ):
+        return _show_packaged_console_command_notice()
     if arguments.command == "login":
         exit_code = run_login(config)
     elif arguments.command == "app":
@@ -184,6 +203,45 @@ def _dispatch_configured_command(
     else:
         exit_code = run_scheduler(config)
     return exit_code
+
+
+def run_packaged_smoke_test() -> int:
+    """Start frozen Playwright resources and emit one event for packaging CI."""
+
+    # RuntimeLogger 同时验证 Windows tzdata 和 windowed 事件文件传输。
+    runtime_logger = RuntimeLogger(RUNTIME_LOG_DIRECTORY)
+    # Playwright driver 在启动时验证 PyInstaller 已收集 Node 与 driver 资源。
+    from playwright.sync_api import sync_playwright
+
+    playwright = sync_playwright().start()
+    try:
+        runtime_logger.emit(
+            level="INFO",
+            event="packaged_smoke_succeeded",
+            message="打包运行时资源验证完成",
+            stage="packaging",
+        )
+    finally:
+        playwright.stop()
+    return 0
+
+
+def _show_packaged_console_command_notice() -> int:
+    """Explain that the windowed desktop package cannot run stdin workflows."""
+
+    # 延迟导入避免开发期非 GUI CLI 命令初始化 Qt。
+    from PySide6.QtWidgets import QApplication, QMessageBox
+
+    application = QApplication.instance() or QApplication(sys.argv)
+    QMessageBox.information(
+        None,
+        "请使用图形界面",
+        "桌面版不支持需要终端输入的 login 或 --no-gui 命令。\n"
+        "请直接启动采集器，在窗口中完成登录和采集。",
+    )
+    # application 保持局部强引用直到模态提示框关闭。
+    del application
+    return 2
 
 
 def _validate_portable_environment() -> None:

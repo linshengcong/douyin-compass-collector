@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from compass_collector.oss_uploader import OssUploadError, OssUploader
 
@@ -38,6 +39,8 @@ class WebPublicationSettings:
     enabled: bool
     # public_prefix 是 OSS 内唯一允许公开读取的网站对象前缀。
     public_prefix: str = "compass/web"
+    # site_url 是静态托管完成后可在通知中公开展示的网站入口。
+    site_url: str | None = None
     # error_category 用于把错误配置与上传失败稳定地区分开。
     error_category: str | None = None
 
@@ -72,7 +75,34 @@ def load_web_publication_settings() -> WebPublicationSettings:
     public_prefix = os.environ.get("WEB_PUBLIC_PREFIX", "compass/web").strip().strip("/")
     if not public_prefix or WEB_PREFIX_PATTERN.fullmatch(public_prefix) is None:
         return WebPublicationSettings(enabled=True, error_category="web_config_invalid")
-    return WebPublicationSettings(enabled=True, public_prefix=public_prefix)
+    # 空值保留 Vercel 旧链路；非空静态网站地址必须是无凭据 HTTPS URL。
+    site_url = os.environ.get("WEB_SITE_URL", "").strip().rstrip("/") or None
+    if site_url is not None and not _is_valid_public_site_url(site_url):
+        return WebPublicationSettings(enabled=True, error_category="web_config_invalid")
+    return WebPublicationSettings(
+        enabled=True,
+        public_prefix=public_prefix,
+        site_url=site_url,
+    )
+
+
+def _is_valid_public_site_url(value: str) -> bool:
+    """Accept one safe HTTPS origin for a public static website notification."""
+
+    try:
+        parsed = urlparse(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 class WebPublisher:

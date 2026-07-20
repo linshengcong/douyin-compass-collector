@@ -1,6 +1,7 @@
 name: Package desktop applications
 
 on:
+  pull_request:
   push:
     tags:
       - "v*"
@@ -29,11 +30,30 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # 只安装运行与 PyInstaller 所需依赖；完整测试保留给本地开发或独立检查。
+      # 安装打包依赖和跨平台启动回归测试所需的 pytest。
       - name: Install packaging dependencies
-        run: uv sync --frozen --group package
+        run: uv sync --frozen --group package --group test
+      - name: Verify cross-platform Scheduler controls
+        run: uv run pytest tests/test_scheduler_control.py tests/test_windows_packaging.py
       - name: Build portable desktop archive
         run: uv run python scripts/package_pyinstaller.py --target ${{ matrix.target }}
+      - name: Smoke-test Windows executable startup
+        if: matrix.target == 'windows-x64'
+        shell: pwsh
+        run: |
+          # 独立临时目录避免 CI 冒烟污染发布目录或用户数据模拟目录。
+          $executable = Join-Path $PWD "dist\抖音罗盘采集器\抖音罗盘采集器.exe"
+          $eventPath = Join-Path $env:RUNNER_TEMP "compass-packaged-smoke.jsonl"
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP "compass-localappdata"
+          $env:COMPASS_EVENT_STREAM_PATH = $eventPath
+          & $executable _smoke
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged executable smoke test failed with exit code $LASTEXITCODE."
+          }
+          $event = Get-Content -Raw $eventPath | ConvertFrom-Json
+          if ($event.event -ne "packaged_smoke_succeeded") {
+            throw "Packaged executable did not emit its expected smoke event."
+          }
       - name: Upload private build artifact
         uses: actions/upload-artifact@v4
         with:

@@ -630,6 +630,21 @@ def _publish_website_after_collection(
                 details={"uploaded": True},
             )
     deployer = VercelDeployer.from_environment()
+    # 静态托管无需在每批数据上传后重新构建；直接通知固定公开入口。
+    if not deployer.settings.enabled and publisher.settings.site_url is not None:
+        _safe_emit(
+            runtime_logger,
+            level="INFO",
+            event="static_website_ready",
+            message="静态网站已可读取最新公开数据",
+            stage="website_publication",
+        )
+        deliver_website_notification(
+            execution_batch_id=execution_batch_id,
+            runtime_logger=runtime_logger,
+            site_url=publisher.settings.site_url,
+        )
+        return
     try:
         deployment = deployer.deploy_and_wait()
     except VercelDeploymentError as error:

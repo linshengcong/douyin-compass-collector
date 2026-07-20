@@ -51,6 +51,8 @@ FORBIDDEN_TEXT_MARKERS = (
 EVENT_STREAM_PREFIX = "@@COMPASS_EVENT@@"
 # 环境变量只切换控制台编码方式，不改变持久化 JSONL。
 EVENT_STREAM_ENV = "COMPASS_EVENT_STREAM"
+# windowed 子进程通过实例专属 JSONL 向 GUI 发送安全事件。
+EVENT_STREAM_PATH_ENV = "COMPASS_EVENT_STREAM_PATH"
 # 安全事件订阅者只能收到完成字段审查后的 payload 副本。
 EventSink = Callable[[dict[str, Any]], None]
 
@@ -157,7 +159,19 @@ class RuntimeLogger:
             except Exception:
                 pass
         try:
-            if os.environ.get(EVENT_STREAM_ENV) == "1":
+            # 打包后的 windowed 子进程没有 stdout，优先写 GUI 提供的事件文件。
+            event_stream_path = os.environ.get(EVENT_STREAM_PATH_ENV)
+            if event_stream_path:
+                # 单独打开并追加完整 JSONL，避免与正式日志文件共享生命周期。
+                event_path = Path(event_stream_path)
+                event_path.parent.mkdir(parents=True, exist_ok=True)
+                with event_path.open("a", encoding="utf-8") as event_file:
+                    # 单次写入完整行，减少 Scheduler 工作线程并发追加时的交错窗口。
+                    event_file.write(
+                        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                        + "\n"
+                    )
+            elif os.environ.get(EVENT_STREAM_ENV) == "1":
                 # GUI 子进程只输出带前缀的安全 JSON，避免消息重复展示。
                 print(
                     EVENT_STREAM_PREFIX

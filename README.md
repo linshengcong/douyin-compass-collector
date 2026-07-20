@@ -1,6 +1,6 @@
 # 抖音电商罗盘榜单采集器
 
-这是一个本地 Mac 工程：使用独立 Chrome Profile 保存人工登录态，Playwright 读取白名单内认证状态，`httpx` 请求抖音电商罗盘商品榜单。所有模式都会保留 SQLite、Manifest 和 gzip 原始响应审计；正式模式额外发布商品数据与 CSV。
+这是一个本地 macOS/Windows 工程：使用独立 Chrome Profile 保存人工登录态，Playwright 读取白名单内认证状态，`httpx` 请求抖音电商罗盘商品榜单。所有模式都会保留 SQLite、Manifest 和 gzip 原始响应审计；正式模式额外发布商品数据与 CSV。
 
 当前业务范围为分类接口动态返回的所有一级分类及其全部三级分类：排除“全部”，忽略四级及更深节点。最多两个一级分类并行，单个三级分类的分页最多四线程预取；全局最多八个在途 HTTP 请求，所有请求启动共用随机 0.01～0.03 秒间隔，不实现任何自动重试。
 
@@ -54,8 +54,8 @@ make run TASK=another_task_id
 
 ## 2. 环境要求
 
-- macOS；
-- Google Chrome 正式版；
+- macOS 或 Windows 10/11；
+- 安装在系统标准位置的 Google Chrome 正式版（应用不内置 Chrome，不能用 Edge 或 Chromium 代替）；
 - Python 3.12；
 - [uv](https://docs.astral.sh/uv/)；
 - 可访问抖音电商罗盘的账号。
@@ -163,6 +163,7 @@ VITE_DATA_INDEX_URL=https://<bucket>.oss-<region>.aliyuncs.com/compass/web/lates
 ```text
 WEB_ENABLED=true
 WEB_PUBLIC_PREFIX=compass/web
+WEB_SITE_URL=
 VERCEL_ENABLED=true
 VERCEL_DEPLOY_HOOK_URL=<Vercel Deploy Hook>
 VERCEL_API_TOKEN=<只读部署查询 Token>
@@ -172,6 +173,18 @@ VERCEL_SITE_URL=https://<project>.vercel.app
 ```
 
 网页数据上传失败不会回滚 CSV 或采集结果：首条钉钉仍说明采集完成，第二条说明网页未更新。上传成功后会触发 Vercel Deploy Hook，并最多轮询五分钟；部署 `READY` 才发送第二条网站链接通知，失败或超时会发送安全错误分类。部署 Hook、API Token 和钉钉密钥都只能保存在 `.env`。
+
+### GitHub Pages 根域名发布
+
+仓库内的 `.github/workflows/publish-github-pages.yml` 会构建 `web/` 并发布到 `linshengcong/linshengcong.github.io` 的 `master` 分支，因此网页地址为 `https://linshengcong.github.io/`。首次启用前需要：
+
+1. 在当前仓库 Settings → Secrets and variables → Actions → Variables 新建 `VITE_DATA_INDEX_URL`，值为公开 OSS 的 `latest.json` 地址；该值会进入浏览器代码，不要填私有地址或密钥。
+2. 新建 `PAGES_DEPLOY_TOKEN` Secret：使用一个仅授予 `linshengcong/linshengcong.github.io` 内容读写权限的 fine-grained personal access token。
+3. 在 `linshengcong/linshengcong.github.io` 仓库 Settings → Pages 中选择从 `master` 分支的根目录发布。
+
+工作流会覆盖用户主页仓库中除 `.git` 外的发布文件；该仓库应只存放此公开网站的构建产物。
+
+本机采集器的 `.env` 同时设置 `WEB_ENABLED=true`、`WEB_SITE_URL=https://linshengcong.github.io` 与 `VERCEL_ENABLED=false`。这样每次新数据上传 OSS 后，钉钉会直接发送 GitHub Pages 链接，不再触发或等待 Vercel。
 
 本地前端开发使用 `make web-dev`，打开 `http://127.0.0.1:5175/`；保存前端文件后由 Vite 自动热更新。静态构建使用 `make web-build`。如需替换公开数据源，可用 `make web-dev WEB_DATA_INDEX_URL=https://.../latest.json` 覆盖默认值。当前界面按桌面优先设计，移动端自动改为商品卡片；支持三级类目、商品/店铺关键词、支付金额/成交件数下限、首次上榜、排序、分页和 CSV 下载。
 

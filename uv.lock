@@ -143,6 +143,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "pyyaml" },
     { name = "sqlalchemy" },
+    { name = "tzdata" },
 ]
 
 [package.dev-dependencies]
@@ -168,6 +169,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.1,<2" },
     { name = "pyyaml", specifier = ">=6.0,<7" },
     { name = "sqlalchemy", specifier = ">=2.0,<3" },
+    { name = "tzdata", specifier = ">=2025.2,<2027" },
 ]
 
 [package.metadata.requires-dev]
