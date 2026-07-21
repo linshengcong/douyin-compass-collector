@@ -5,6 +5,8 @@ export interface RankingRecord {
   level2: string;
   level3: string;
   rank: number;
+  /** 商品接口提供的公开缩略图地址；历史快照可能为空。 */
+  thumbnail_url: string;
   product_name: string;
   shop_name: string;
   pay_amount: string;

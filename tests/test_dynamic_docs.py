@@ -74,7 +74,7 @@ def test_documents_define_dry_run_publication_and_csv_boundaries() -> None:
     assert "raw_responses" in readme
     assert "published_at" in readme
     assert "runtime/exports/<YYYY-MM-DD>/<task_id>/" in readme
-    assert "分类、排名、商品、店铺名称、用户支付金额、成交件数、首次上榜" in readme
+    assert "分类、排名、商品缩略图、商品、店铺名称、用户支付金额、成交件数、首次上榜" in readme
     assert "published_at IS NOT NULL" in design
     assert "dry-run 不写正式商品和店铺记录" in design
     assert "只包含成功完成的三级分类" in readme

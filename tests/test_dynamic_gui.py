@@ -86,6 +86,76 @@ def test_dynamic_category_events_drive_category_and_page_progress() -> None:
     assert state.result_text == "分类采集完成，等待发布"
 
 
+def test_concurrent_categories_keep_independent_page_progress() -> None:
+    """Keep two interleaved category workers visible without overwriting each other."""
+
+    state = reduce_gui_progress(
+        GuiProgressState(),
+        {"event": "category_discovery_succeeded", "discovered_category_count": 3},
+    )
+    for run_id, order, path in (
+        ("category-a", 1, "食品饮料 > 零食 > 坚果"),
+        ("category-b", 2, "个护清洁 > 洗护 > 洗发水"),
+    ):
+        state = reduce_gui_progress(
+            state,
+            {
+                "event": "category_collection_started",
+                "category_run_id": run_id,
+                "discovery_order": order,
+                "category_path": path,
+            },
+        )
+    state = reduce_gui_progress(
+        state,
+        {
+            "event": "category_page_saved",
+            "category_run_id": "category-a",
+            "page_no": 2,
+            "target_pages": 4,
+        },
+    )
+    state = reduce_gui_progress(
+        state,
+        {
+            "event": "category_page_saved",
+            "category_run_id": "category-b",
+            "page_no": 1,
+            "target_pages": 2,
+        },
+    )
+
+    assert [(item.category_run_id, item.page_no) for item in state.category_progress] == [
+        ("category-a", 2),
+        ("category-b", 1),
+    ]
+    state = reduce_gui_progress(
+        state,
+        {
+            "event": "category_collection_succeeded",
+            "category_run_id": "category-b",
+            "target_pages": 2,
+        },
+    )
+    assert state.completed_category_count == 1
+    assert [item.category_run_id for item in state.category_progress if item.status == "active"] == [
+        "category-a"
+    ]
+
+
+def test_batch_skipped_clears_loading_progress() -> None:
+    """Stop the GUI from remaining in the preparing state after an idempotent skip."""
+
+    state = reduce_gui_progress(
+        GuiProgressState(result_text="采集中", indeterminate=True),
+        {"event": "batch_skipped"},
+    )
+
+    assert state.stage_text == "阶段：本次已跳过"
+    assert state.result_text == "已有成功版本，本次未采集"
+    assert state.indeterminate is False
+
+
 def test_gui_batch_display_ignores_notification_execution_identity() -> None:
     """Keep the visible batch ID tied to a real task batch during notification."""
 

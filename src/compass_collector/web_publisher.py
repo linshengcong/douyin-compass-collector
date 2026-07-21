@@ -17,7 +17,7 @@ from compass_collector.oss_uploader import OssUploadError, OssUploader
 # 网站对象前缀只允许安全路径段，避免环境变量改变对象层级。
 WEB_PREFIX_PATTERN = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 # 网站数据版本在前端与发布器之间保持明确兼容边界。
-WEB_SCHEMA_VERSION = 1
+WEB_SCHEMA_VERSION = 2
 
 
 class WebPublicationError(Exception):
@@ -222,7 +222,7 @@ class WebPublisher:
 
 
 def _read_csv_records(csv_path: Path) -> list[dict[str, Any]]:
-    """Convert the seven CSV columns into the stable public website record shape."""
+    """Convert the CSV columns into the stable public website record shape."""
 
     try:
         with csv_path.open("r", encoding="utf-8-sig", newline="") as file_handle:
@@ -230,6 +230,7 @@ def _read_csv_records(csv_path: Path) -> list[dict[str, Any]]:
             expected_headers = {
                 "分类",
                 "排名",
+                "商品缩略图",
                 "商品",
                 "店铺名称",
                 "用户支付金额",
@@ -255,6 +256,7 @@ def _read_csv_records(csv_path: Path) -> list[dict[str, Any]]:
                         "level2": category_parts[1],
                         "level3": category_parts[2],
                         "rank": rank,
+                        "thumbnail_url": str(row.get("商品缩略图") or ""),
                         "product_name": str(row.get("商品") or ""),
                         "shop_name": str(row.get("店铺名称") or ""),
                         "pay_amount": str(row.get("用户支付金额") or ""),

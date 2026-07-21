@@ -74,6 +74,7 @@ def build_entry(*, captured_at: datetime) -> ProductRankEntry:
                 shop_name="共享店铺",
             ),
         ),
+        image_url="https://images.example.test/shared-product.jpg",
     )
 
 
@@ -355,6 +356,9 @@ def test_official_publish_allows_same_product_and_rank_across_categories(
         ("shared-product", 1),
         ("shared-product", 1),
     ]
+    assert {row.image_url for row in product_rows} == {
+        "https://images.example.test/shared-product.jpg"
+    }
     assert shop_count == 2
     assert published_batch is not None
     assert published_batch.batch_id == collected_batch.batch_id

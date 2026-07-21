@@ -133,6 +133,10 @@ def test_clean_migration_creates_only_the_new_baseline_tables(tmp_path: Path) ->
         raw_columns = {
             column["name"] for column in database_inspector.get_columns("raw_responses")
         }
+        product_columns = {
+            column["name"]
+            for column in database_inspector.get_columns("product_rank_entries")
+        }
     finally:
         database.close()
 
@@ -156,6 +160,7 @@ def test_clean_migration_creates_only_the_new_baseline_tables(tmp_path: Path) ->
     assert {"discovery_order", "category_id", "target_page_count"} <= category_columns
     assert "category_run_id" in raw_columns
     assert "run_id" not in raw_columns
+    assert "image_url" in product_columns
 
 
 def test_rank_and_product_are_unique_inside_each_category_only(tmp_path: Path) -> None:

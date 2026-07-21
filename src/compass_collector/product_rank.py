@@ -275,6 +275,17 @@ def parse_page_entries(
                 "product name is invalid",
                 category="invalid_product",
             )
+        # 图片地址属于可选展示字段，缺失时不影响榜单采集和历史数据兼容。
+        image_url = product_info.get("image_url")
+        if image_url is not None and (
+            not isinstance(image_url, str) or not image_url.strip()
+        ):
+            raise ResponseContractError(
+                "product image url is invalid",
+                category="invalid_product",
+            )
+        if isinstance(image_url, str):
+            image_url = image_url.strip()
         # 排名必须是正整数，整榜连续性在后续统一校验。
         rank = product_info.get("rank")
         if type(rank) is not int or rank <= 0:
@@ -343,6 +354,7 @@ def parse_page_entries(
                 pay_amount=pay_amount,
                 pay_combo_count=pay_combo_count,
                 shops=tuple(shops),
+                image_url=image_url,
             )
         )
     return parsed_entries

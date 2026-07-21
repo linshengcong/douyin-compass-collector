@@ -394,6 +394,8 @@ class ProductRankEntryModel(Base):
     rank: Mapped[int] = mapped_column(Integer, nullable=False)
     product_id: Mapped[str] = mapped_column(String(128), nullable=False)
     product_name: Mapped[str] = mapped_column(String(2048), nullable=False)
+    # 图片 URL 允许为空，保证已存在的历史排名可平滑迁移。
+    image_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     newly_on_ranking: Mapped[bool] = mapped_column(Boolean, nullable=False)
     # 金额和成交件数保留平台原始区间与单位。
     pay_amount_min_value: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -952,6 +954,7 @@ class Database:
                     rank=entry.rank,
                     product_id=entry.product_id,
                     product_name=entry.product_name,
+                    image_url=entry.image_url,
                     newly_on_ranking=entry.newly_on_ranking,
                     pay_amount_min_value=entry.pay_amount.min_value,
                     pay_amount_max_value=entry.pay_amount.max_value,

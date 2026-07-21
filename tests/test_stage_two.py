@@ -56,6 +56,7 @@ def test_real_fixture_parses_and_formats_like_the_agreed_csv_contract() -> None:
     assert all(entry.captured_at == captured_at for entry in entries)
     assert first_entry.pay_amount.min_value == 1_000_000_000
     assert first_entry.pay_combo_count.min_value == 100_000
+    assert first_entry.image_url == "https://images.example.test/fixture-product-1.jpg"
     assert format_metric_range(first_entry.pay_amount) == "¥1000万-¥2500万"
     assert format_metric_range(first_entry.pay_combo_count) == "1万-2.5万"
 

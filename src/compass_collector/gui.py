@@ -120,6 +120,24 @@ class GuiLaunchRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class CategoryProgress:
+    """Represent one independently advancing category in a concurrent collection."""
+
+    # category_run_id 是并发日志事件唯一可靠的归属键。
+    category_run_id: str
+    # discovery_order 保持 GUI 列表与分类发现顺序一致。
+    discovery_order: int
+    # category_path 用于让并行进度行可直接识别业务分类。
+    category_path: str | None
+    # page_no 是已安全持久化的最新分页位置。
+    page_no: int = 0
+    # target_pages 在该分类首个成功分页后才可准确得到。
+    target_pages: int = 0
+    # status 仅用于区分活动、成功和失败分类的总量归集。
+    status: str = "active"
+
+
+@dataclass(frozen=True, slots=True)
 class GuiProgressState:
     """Represent dynamic category progress independently from Qt widgets."""
 
@@ -143,6 +161,10 @@ class GuiProgressState:
     csv_path: Path | None = None
     # indeterminate 表示分类树请求等尚无可量化总量的阶段。
     indeterminate: bool = False
+    # category_progress 按分类运行 ID 保留并发分类各自的分页进度。
+    category_progress: tuple[CategoryProgress, ...] = ()
+    # completed_category_count 是成功和失败分类之和，构成准确总体分类进度。
+    completed_category_count: int = 0
 
 
 def _event_non_negative_int(
@@ -196,6 +218,17 @@ def _category_progress_text(
 
 
 def reduce_gui_progress(
+    state: GuiProgressState,
+    event: dict[str, Any],
+) -> GuiProgressState:
+    """Reduce safe events into legacy text plus concurrent category progress state."""
+
+    # 旧单分类文本继续服务于状态摘要，独立分类进度由第二步补充。
+    legacy_state = _reduce_gui_progress_legacy(state, event)
+    return _reduce_concurrent_category_progress(legacy_state, event)
+
+
+def _reduce_gui_progress_legacy(
     state: GuiProgressState,
     event: dict[str, Any],
 ) -> GuiProgressState:
@@ -387,6 +420,15 @@ def reduce_gui_progress(
             result_text="分类采集完成，等待发布",
             indeterminate=False,
         )
+    if event_name == "batch_skipped":
+        # 手动运行遇到既有成功版本时必须终止 Loading，而非停留在准备状态。
+        return replace(
+            state,
+            stage_text="阶段：本次已跳过",
+            progress_text="已有成功版本，未启动浏览器采集",
+            result_text="已有成功版本，本次未采集",
+            indeterminate=False,
+        )
     if event_name == "publication_succeeded":
         # raw_csv_path 由正式发布事件提供，不从普通成功状态推断。
         raw_csv_path = event.get("csv_path")
@@ -485,6 +527,126 @@ def reduce_gui_progress(
             indeterminate=False,
         )
     return state
+
+
+def _event_category_run_id(
+    state: GuiProgressState,
+    event: dict[str, Any],
+) -> str | None:
+    """Resolve a category event to its stable ID, retaining single-category legacy logs."""
+
+    # 新事件始终携带上下文 ID；旧单分类事件可安全回退到唯一活动分类。
+    raw_value = event.get("category_run_id")
+    if isinstance(raw_value, str) and raw_value:
+        return raw_value
+    active_ids = [
+        item.category_run_id
+        for item in state.category_progress
+        if item.status == "active"
+    ]
+    return active_ids[0] if len(active_ids) == 1 else None
+
+
+def _replace_category_progress(
+    state: GuiProgressState,
+    category_progress: CategoryProgress,
+) -> tuple[CategoryProgress, ...]:
+    """Upsert one category progress row while keeping discovery order stable."""
+
+    rows = {
+        item.category_run_id: item
+        for item in state.category_progress
+    }
+    rows[category_progress.category_run_id] = category_progress
+    return tuple(
+        sorted(
+            rows.values(),
+            key=lambda item: (item.discovery_order, item.category_run_id),
+        )
+    )
+
+
+def _reduce_concurrent_category_progress(
+    state: GuiProgressState,
+    event: dict[str, Any],
+) -> GuiProgressState:
+    """Track interleaved category events without letting concurrent workers overwrite peers."""
+
+    event_name = str(event.get("event") or "")
+    if event_name in {"category_batch_started", "category_discovery_succeeded"}:
+        # 新批次或刚完成的新分类树都必须清除上一轮并行任务残留。
+        return replace(
+            state,
+            category_progress=(),
+            completed_category_count=0,
+        )
+    if event_name not in {
+        "category_collection_started",
+        "category_page_saved",
+        "category_collection_succeeded",
+        "category_collection_failed",
+        "category_batch_collection_ready",
+    }:
+        return state
+    if event_name == "category_batch_collection_ready":
+        return replace(
+            state,
+            completed_category_count=state.category_total,
+        )
+
+    category_run_id = _event_category_run_id(state, event)
+    if category_run_id is None:
+        return state
+    existing = next(
+        (item for item in state.category_progress if item.category_run_id == category_run_id),
+        None,
+    )
+    discovery_order = _event_non_negative_int(
+        event,
+        "discovery_order",
+        existing.discovery_order if existing is not None else state.category_index,
+    )
+    raw_path = event.get("category_path")
+    category_path = (
+        raw_path.strip()
+        if isinstance(raw_path, str) and raw_path.strip()
+        else existing.category_path if existing is not None else state.category_path
+    )
+    page_no = _event_non_negative_int(
+        event,
+        "page_no",
+        existing.page_no if existing is not None else 0,
+    )
+    target_pages = _event_non_negative_int(
+        event,
+        "target_pages",
+        existing.target_pages if existing is not None else 0,
+    )
+    status = "active"
+    if event_name == "category_collection_succeeded":
+        status = "succeeded"
+        page_no = target_pages if target_pages > 0 else page_no
+    elif event_name == "category_collection_failed":
+        status = "failed"
+    category_progress = _replace_category_progress(
+        state,
+        CategoryProgress(
+            category_run_id=category_run_id,
+            discovery_order=discovery_order,
+            category_path=category_path,
+            page_no=page_no,
+            target_pages=target_pages,
+            status=status,
+        ),
+    )
+    completed_category_count = sum(
+        1 for item in category_progress if item.status != "active"
+    )
+    return replace(
+        state,
+        category_progress=category_progress,
+        completed_category_count=completed_category_count,
+    )
 
 
 class CollectionWorker(QObject):
@@ -718,17 +880,44 @@ class CollectorWindow(QMainWindow):
         status_layout.addWidget(self.scheduler_status_label, 3, 1, 1, 3)
         root_layout.addWidget(status_group)
 
-        # 进度区由动态分类和分页结构化事件驱动。
-        progress_layout = QHBoxLayout()
+        # 进度区展示准确分类完成度和固定槽位的并发分类明细。
+        progress_group = QGroupBox("采集进度")
+        progress_layout = QVBoxLayout(progress_group)
         self.stage_label = QLabel(self.progress_state.stage_text)
+        progress_layout.addWidget(self.stage_label)
+        category_progress_layout = QHBoxLayout()
+        self.category_progress_label = QLabel("总体分类")
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
         self.progress_text = QLabel(self.progress_state.progress_text)
-        progress_layout.addWidget(self.stage_label)
-        progress_layout.addWidget(self.progress_bar, 1)
-        progress_layout.addWidget(self.progress_text)
-        root_layout.addLayout(progress_layout)
+        category_progress_layout.addWidget(self.category_progress_label)
+        category_progress_layout.addWidget(self.progress_bar, 1)
+        category_progress_layout.addWidget(self.progress_text)
+        progress_layout.addLayout(category_progress_layout)
+        self.active_category_progress_layout = QVBoxLayout()
+        # 槽位数量与一级分类并发数一致，后续更新内容而不增删行以避免窗口跳动。
+        self.active_category_progress_rows: list[
+            tuple[QLabel, QProgressBar, QLabel]
+        ] = []
+        for slot_index in range(max(1, self.config.http.level1_concurrency)):
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            category_label = QLabel(f"并发槽位 {slot_index + 1} · 等待分类")
+            category_bar = QProgressBar()
+            category_bar.setRange(0, 1)
+            category_bar.setValue(0)
+            page_label = QLabel("空闲")
+            row_layout.addWidget(category_label, 1)
+            row_layout.addWidget(category_bar, 1)
+            row_layout.addWidget(page_label)
+            self.active_category_progress_layout.addWidget(row)
+            self.active_category_progress_rows.append(
+                (category_label, category_bar, page_label)
+            )
+        progress_layout.addLayout(self.active_category_progress_layout)
+        root_layout.addWidget(progress_group)
 
         # 日志工具栏只筛选内存显示，不修改 JSONL。
         log_toolbar = QHBoxLayout()
@@ -776,13 +965,13 @@ class CollectorWindow(QMainWindow):
             "试运行（保留审计，不发布正式商品/CSV）",
             RunMode.DRY_RUN.value,
         )
-        self.force_checkbox = QCheckBox("强制新版本")
+        self.force_checkbox = QCheckBox("每次自动新版本")
         # 命令启动的 GUI 锁定对应模式，make app 才允许选择。
         initial_mode = RunMode.DRY_RUN if self.request.dry_run else RunMode.OFFICIAL
         self.mode_combo.setCurrentIndex(1 if initial_mode is RunMode.DRY_RUN else 0)
-        self.force_checkbox.setChecked(self.request.force)
+        self.force_checkbox.setChecked(True)
         self.mode_combo.setEnabled(not self.request.lock_mode)
-        self.force_checkbox.setEnabled(not self.request.lock_mode)
+        self.force_checkbox.setEnabled(False)
         self.start_button = QPushButton("开始采集")
         self.start_button.clicked.connect(self.start_collection)
         self.abort_button = QPushButton("中止本次采集")
@@ -834,19 +1023,8 @@ class CollectorWindow(QMainWindow):
 
         if self.collecting:
             return
-        # force 每次启动都需要明确二次确认，避免误生成新版本。
-        force = self.force_checkbox.isChecked()
-        if force:
-            answer = QMessageBox.question(
-                self,
-                "确认强制采集",
-                "强制采集会忽略本计划时间已有成功记录并创建新版本，"
-                "是否继续？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                return
+        # GUI 手动开始始终生成新版本，保证用户主动更新时会进入 Chrome 采集链路。
+        force = True
         # control 的事件回调只发 Qt Signal，不直接操作控件。
         self.collection_control = CollectionControl(keep_browser_open=True)
         # worker 绑定当前模式，运行期间界面不允许修改。
@@ -919,33 +1097,66 @@ class CollectorWindow(QMainWindow):
         """Render the pure progress state into the existing Qt controls."""
 
         self.stage_label.setText(self.progress_state.stage_text)
-        self.progress_text.setText(self.progress_state.progress_text)
+        self.progress_text.setText(
+            f"完成 {self.progress_state.completed_category_count} / "
+            f"{self.progress_state.category_total} 个分类"
+            if self.progress_state.category_total > 0
+            else self.progress_state.progress_text
+        )
         if self.progress_state.result_text is not None:
             self.result_label.setText(self.progress_state.result_text)
         if self.progress_state.indeterminate:
             self.progress_bar.setRange(0, 0)
-        elif self.progress_state.target_pages > 0:
-            self.progress_bar.setRange(0, self.progress_state.target_pages)
-            self.progress_bar.setValue(
-                min(self.progress_state.page_no, self.progress_state.target_pages)
-            )
         elif self.progress_state.category_total > 0:
             self.progress_bar.setRange(0, self.progress_state.category_total)
             self.progress_bar.setValue(
                 min(
-                    self.progress_state.category_index,
+                    self.progress_state.completed_category_count,
                     self.progress_state.category_total,
                 )
             )
         else:
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(0)
+        self._render_active_category_progress()
         # current_csv_path 与纯状态保持一致，禁止从普通成功文案推断 CSV。
         self.current_csv_path = self.progress_state.csv_path
         self.csv_label.setText(str(self.current_csv_path) if self.current_csv_path else "-")
         self.open_csv_button.setEnabled(
             self.current_csv_path is not None and self.current_csv_path.exists()
         )
+
+    def _render_active_category_progress(self) -> None:
+        """Update fixed concurrent slots without inserting or removing layout rows."""
+        active_categories = [
+            item
+            for item in self.progress_state.category_progress
+            if item.status == "active"
+        ]
+        for slot_index, (category_label, category_bar, page_label) in enumerate(
+            self.active_category_progress_rows
+        ):
+            category = (
+                active_categories[slot_index]
+                if slot_index < len(active_categories)
+                else None
+            )
+            if category is None:
+                category_label.setText(f"并发槽位 {slot_index + 1} · 等待分类")
+                category_bar.setRange(0, 1)
+                category_bar.setValue(0)
+                page_label.setText("空闲")
+                continue
+            category_label.setText(
+                f"进行中 · {category.category_path or '三级分类'}"
+            )
+            if category.target_pages > 0:
+                category_bar.setRange(0, category.target_pages)
+                category_bar.setValue(min(category.page_no, category.target_pages))
+                page_label.setText(f"{category.page_no} / {category.target_pages} 页")
+            else:
+                category_bar.setRange(0, 0)
+                page_label.setText("等待首页")
 
     def _apply_notification_event(self, event: dict[str, Any]) -> bool:
         """Apply one notification lifecycle event and report whether it matched."""

@@ -4,6 +4,7 @@ import { useInfiniteReveal } from "../hooks/useInfiniteReveal";
 import { SortDirection, SortField, type LatestIndex, type RankingFilters, type RankingRecord } from "../types";
 import { CompositeFilterSheet } from "./CompositeFilterSheet";
 import { RankMark } from "./RankMark";
+import { ImagePreview, ProductThumbnail } from "./ProductThumbnail";
 
 interface MobileRankingViewProps {
   snapshotRecords: RankingRecord[];
@@ -22,6 +23,8 @@ export function MobileRankingView(props: MobileRankingViewProps) {
   const [isToolbarStuck, setToolbarStuck] = useState(false);
   // 仅在已应用条件发生变化时显示短暂加载态，明确列表正在刷新。
   const [isFiltering, setFiltering] = useState(false);
+  // 当前移动端列表仅保留一个选中图片，关闭预览后立即清空。
+  const [preview, setPreview] = useState<{ imageUrl: string | null; productName: string }>({ imageUrl: null, productName: "" });
   // 工具栏节点用于根据实际页面位置判断吸顶状态。
   const toolbarRef = useRef<HTMLElement | null>(null);
   const { visibleItems, visibleCount, sentinelRef } = useInfiniteReveal(records, 50);
@@ -74,10 +77,10 @@ export function MobileRankingView(props: MobileRankingViewProps) {
     <section className="mobile-results" aria-busy={isFiltering}>
       <div className="mobile-result-title"><strong>共 {records.length.toLocaleString()} 条结果</strong><span>已显示 {visibleCount} 条</span></div>
       {isFiltering ? <div className="mobile-rendering"><i />筛选结果加载中…</div> : null}
-      {visibleItems.length ? <div className="mobile-list">{visibleItems.map((item, index) => <article key={`${item.category}-${item.rank}-${item.product_name}`}><RankMark rank={index + 1} /><div className="mobile-card-body"><p className="category-line">{item.category}</p><h2>{item.product_name}</h2><p className="shop-line">{item.shop_name}</p><div className="metric-row"><span><small>用户支付金额</small>{item.pay_amount}</span><span><small>成交件数</small>{item.pay_combo_count}</span>{item.newly_on_ranking ? <em>首次上榜</em> : null}</div></div></article>)}</div> : <div className="empty-state">没有符合当前筛选条件的商品</div>}
+      {visibleItems.length ? <div className="mobile-list">{visibleItems.map((item, index) => <article key={`${item.category}-${item.rank}-${item.product_name}`}><RankMark rank={index + 1} /><ProductThumbnail imageUrl={item.thumbnail_url} productName={item.product_name} size="mobile" onPreview={(imageUrl, productName) => setPreview({ imageUrl, productName })} /><div className="mobile-card-body"><p className="category-line">{item.category}</p><h2>{item.product_name}</h2><p className="shop-line">{item.shop_name}</p><div className="metric-row"><span><small>用户支付金额</small>{item.pay_amount}</span><span><small>成交件数</small>{item.pay_combo_count}</span>{item.newly_on_ranking ? <em>首次上榜</em> : null}</div></div></article>)}</div> : <div className="empty-state">没有符合当前筛选条件的商品</div>}
       {visibleCount < records.length ? <div className="mobile-load-more" ref={sentinelRef}><i /><span>上拉加载更多</span></div> : records.length > 0 ? <div className="mobile-load-more finished">已加载全部 {records.length.toLocaleString()} 条</div> : null}
     </section>
-    {isCompositeFilterOpen ? <CompositeFilterSheet records={snapshotRecords} filters={filters} onClose={() => setCompositeFilterOpen(false)} onApply={applyMobileFilters} onReset={() => applyMobileFilters(DEFAULT_RANKING_FILTERS)} /> : null}
+    {isCompositeFilterOpen ? <CompositeFilterSheet records={snapshotRecords} filters={filters} onClose={() => setCompositeFilterOpen(false)} onApply={applyMobileFilters} onReset={() => applyMobileFilters(DEFAULT_RANKING_FILTERS)} /> : null}<ImagePreview imageUrl={preview.imageUrl} productName={preview.productName} onClose={() => setPreview({ imageUrl: null, productName: "" })} />
   </div>;
 }
 

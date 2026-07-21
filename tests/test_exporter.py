@@ -38,6 +38,7 @@ def build_entry(*, rank: int, product_name: str, newly_on_ranking: bool) -> Prod
         pay_amount=MetricRange(min_value=100_000, max_value=250_000, unit="price"),
         pay_combo_count=MetricRange(min_value=100, max_value=250, unit="number"),
         shops=shops,
+        image_url=f"https://images.example.test/{product_name}.jpg",
     )
 
 
@@ -129,17 +130,18 @@ def test_prepare_exports_categories_in_discovery_and_rank_order(tmp_path: Path) 
     assert rows[1] == [
         "食品饮料 > 粮油干货/方便速食 > 食用油",
         "1",
+        "https://images.example.test/食用油一号.jpg",
         "食用油一号",
         "店铺乙 | 店铺甲",
         "¥1000-¥2500",
         "10-25",
         "true",
     ]
-    assert [(row[0], row[1], row[2], row[6]) for row in rows[1:]] == [
-        ("食品饮料 > 粮油干货/方便速食 > 食用油", "1", "食用油一号", "true"),
-        ("食品饮料 > 粮油干货/方便速食 > 食用油", "2", "食用油二号", "false"),
-        ("食品饮料 > 冲调饮品 > 咖啡", "1", "咖啡一号", "true"),
-        ("食品饮料 > 冲调饮品 > 咖啡", "2", "咖啡二号", "false"),
+    assert [(row[0], row[1], row[2], row[3], row[7]) for row in rows[1:]] == [
+        ("食品饮料 > 粮油干货/方便速食 > 食用油", "1", "https://images.example.test/食用油一号.jpg", "食用油一号", "true"),
+        ("食品饮料 > 粮油干货/方便速食 > 食用油", "2", "https://images.example.test/食用油二号.jpg", "食用油二号", "false"),
+        ("食品饮料 > 冲调饮品 > 咖啡", "1", "https://images.example.test/咖啡一号.jpg", "咖啡一号", "true"),
+        ("食品饮料 > 冲调饮品 > 咖啡", "2", "https://images.example.test/咖啡二号.jpg", "咖啡二号", "false"),
     ]
 
 

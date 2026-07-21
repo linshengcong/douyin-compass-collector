@@ -38,6 +38,8 @@ class ProductRankEntry:
     pay_amount: MetricRange
     pay_combo_count: MetricRange
     shops: tuple[ProductShop, ...]
+    # image_url 是平台商品图片地址；旧响应缺失时保留空值以兼容历史快照。
+    image_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -86,6 +86,11 @@
 }
 
 @media (max-width: 900px) {
+  /* 商品缩略图占据独立固定列，避免长标题挤压图片或排名。 */
+  .mobile-list article { grid-template-columns: 42px 72px minmax(0, 1fr); }
+}
+
+@media (max-width: 900px) {
   /* 不裁切移动端容器，让吸顶工具栏以页面滚动条作为定位参照。 */
   .mobile-view { overflow: visible; }
   /* 常态保持页面留白，真正吸顶后才呈现毛玻璃承托层。 */

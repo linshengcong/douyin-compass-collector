@@ -16,6 +16,7 @@ from compass_collector.models import CollectedCategoryRun, MetricRange
 CSV_HEADERS = (
     "分类",
     "排名",
+    "商品缩略图",
     "商品",
     "店铺名称",
     "用户支付金额",
@@ -170,6 +171,7 @@ class CsvExporter:
                             (
                                 category_run.plan.category.display_path,
                                 entry.rank,
+                                entry.image_url or "",
                                 entry.product_name,
                                 shop_names,
                                 format_metric_range(entry.pay_amount),
