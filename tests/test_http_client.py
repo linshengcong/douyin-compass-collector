@@ -333,6 +333,51 @@ def test_failed_request_still_forces_delay_before_next_attempt(
     assert CURRENT_INTERVAL_MIN <= observed_delays[0] <= CURRENT_INTERVAL_MAX
 
 
+def test_network_failure_retries_with_bounded_exponential_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retry one transport failure before returning a later successful response."""
+
+    # 首次连接失败、第二次成功，验证重试不需要上层重新调度分类。
+    request_count = 0
+
+    def handle_request(_request: httpx.Request) -> httpx.Response:
+        """Raise one transient connection error before a valid response."""
+
+        nonlocal request_count
+        request_count += 1
+        if request_count == 1:
+            raise httpx.ConnectError("synthetic connection reset")
+        return httpx.Response(200, json={"st": 0, "data": {}})
+
+    patch_httpx_client(monkeypatch, handle_request)
+    # fake waiter 记录退避与常规请求间隔，不在测试中真实等待。
+    observed_delays: list[float] = []
+
+    def wait_for_delay(delay_seconds: float) -> bool:
+        """Record retry and normal throttle delays while allowing the retry."""
+
+        observed_delays.append(delay_seconds)
+        return False
+
+    client = CompassHttpClient(
+        build_http_config(),
+        cookies=[],
+        user_agent="CompassCollectorTest/1.0",
+        wait_for_delay=wait_for_delay,
+    )
+    try:
+        response = client.get_category_tree(build_category_request_params())
+    finally:
+        client.close()
+
+    assert response.status_code == 200
+    assert request_count == 2
+    assert observed_delays[0] == 1.0
+    assert len(observed_delays) == 2
+    assert CURRENT_INTERVAL_MIN <= observed_delays[1] <= CURRENT_INTERVAL_MAX
+
+
 def test_cookie_scope_covers_category_and_ranking_endpoints() -> None:
     """Query Playwright with both API paths before applying the name allowlist."""
 

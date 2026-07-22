@@ -442,3 +442,30 @@ def test_terminal_batch_between_categories_needs_no_current_run(
         "not_started",
         "not_started",
     ]
+
+
+def test_terminal_batch_without_current_category_closes_parallel_running_categories(
+    tmp_path: Path,
+) -> None:
+    """Close every active category when a worker fails before naming one category."""
+
+    # 两个运行中分类模拟一级分类工作线程在回报结果前异常。
+    database, category_run_plans = prepare_database(tmp_path, category_count=3)
+    try:
+        for category_run_plan in category_run_plans[:2]:
+            database.start_category_run(category_run_plan.category_run_id, STARTED_AT)
+        snapshot = database.terminate_collection_batch(
+            "batch-stage-three",
+            "abandoned",
+            "internal_error",
+            FINISHED_AT,
+        )
+    finally:
+        database.close()
+
+    assert snapshot.status == "abandoned"
+    assert [category.status for category in snapshot.categories] == [
+        "abandoned",
+        "abandoned",
+        "not_started",
+    ]

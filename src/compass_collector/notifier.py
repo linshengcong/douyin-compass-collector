@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from math import ceil
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -63,6 +64,16 @@ class TaskNotificationStatus(str, Enum):
     SKIPPED_BUSY = "skipped_busy"
     MISSED = "missed"
     NOT_STARTED = "not_started"
+
+
+@dataclass(frozen=True, slots=True)
+class CategoryNotificationIssue:
+    """Describe one failed or skipped category using notification-safe fields."""
+
+    # category_path 来自本地 Manifest 的分类快照，不包含请求参数或响应内容。
+    category_path: str
+    # error_category 只允许采集器定义的稳定错误分类。
+    error_category: str
 
 
 class BatchNotificationStatus(str, Enum):
@@ -132,6 +143,8 @@ class TaskNotificationResult:
     oss_error_category: str | None = None
     # error_category 使用采集器稳定安全分类。
     error_category: str | None = None
+    # category_issues 仅包含本任务中失败或已跳过的分类明细。
+    category_issues: tuple[CategoryNotificationIssue, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -346,6 +359,8 @@ def render_batch_markdown(summary: BatchNotificationSummary) -> tuple[str, str]:
         0,
         int((summary.finished_at - summary.started_at).total_seconds()),
     )
+    # 分钟向上取整，让不足一分钟的有效执行不会显示为零耗时。
+    duration_minutes = max(1, ceil(duration_seconds / 60))
     title = _batch_title(summary.status)
     # 必须保留的头部不包含本机路径或认证信息。
     lines = [
@@ -356,7 +371,7 @@ def render_batch_markdown(summary: BatchNotificationSummary) -> tuple[str, str]:
         f"- 批次：`{summary.batch_id}`",
         f"- 开始：{summary.started_at.astimezone(SHANGHAI_TIMEZONE):%Y-%m-%d %H:%M:%S}",
         f"- 结束：{summary.finished_at.astimezone(SHANGHAI_TIMEZONE):%Y-%m-%d %H:%M:%S}",
-        f"- 耗时：{duration_seconds} 秒",
+        f"- 耗时：{duration_minutes} 分钟",
         f"- 总状态：`{summary.status.value}`",
         "",
         "| 任务 | 状态 | 页数 | 条数 | 结果 |",
@@ -395,6 +410,35 @@ def render_batch_markdown(summary: BatchNotificationSummary) -> tuple[str, str]:
     lines.extend(task_lines)
     if omitted_count:
         lines.extend(["", f"另有 {omitted_count} 个任务未展开"])
+    # 分类问题按任务配置顺序和 Manifest 发现顺序展示，便于定位局部缺口。
+    category_issue_lines: list[str] = []
+    omitted_issue_count = 0
+    for task in summary.tasks:
+        for issue in task.category_issues:
+            issue_label = (
+                "已跳过（越权）"
+                if issue.error_category == "category_unavailable"
+                else f"失败（{issue.error_category}）"
+            )
+            issue_line = (
+                f"- {_escape_markdown_cell(task.display_name)}："
+                f"{_escape_markdown_cell(issue.category_path)} · {issue_label}"
+            )
+            candidate_lines = (
+                lines
+                + ["", "#### 失败 / 跳过分类"]
+                + category_issue_lines
+                + [issue_line, "", "另有 9999 个分类问题未展开"]
+            )
+            if len("\n".join(candidate_lines).encode("utf-8")) > MAX_MARKDOWN_BYTES:
+                omitted_issue_count += 1
+                continue
+            category_issue_lines.append(issue_line)
+    if category_issue_lines or omitted_issue_count:
+        lines.extend(["", "#### 失败 / 跳过分类"])
+        lines.extend(category_issue_lines)
+    if omitted_issue_count:
+        lines.append(f"另有 {omitted_issue_count} 个分类问题未展开")
     markdown = "\n".join(lines)
     # 固定头部理论上远低于上限，最终切片只作为防御性兜底。
     if len(markdown.encode("utf-8")) > MAX_MARKDOWN_BYTES:

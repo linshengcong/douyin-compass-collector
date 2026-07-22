@@ -16,6 +16,7 @@ def test_real_config_is_valid() -> None:
     assert config.http.level1_concurrency == 3
     assert config.http.page_concurrency == 3
     assert config.http.max_in_flight_requests == 9
+    assert config.http.network_retry_attempts == 2
     # 首个任务是当前唯一启用的全一级分类任务。
     task = CURRENT_TASK
     assert task.id == "product_hot_sale_all_level3"
@@ -34,6 +35,8 @@ def test_real_config_is_valid() -> None:
         ("page_concurrency", 5),
         ("max_in_flight_requests", 0),
         ("max_in_flight_requests", 10),
+        ("network_retry_attempts", -1),
+        ("network_retry_attempts", 4),
     ],
 )
 def test_unsupported_http_concurrency_is_rejected(

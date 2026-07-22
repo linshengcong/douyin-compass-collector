@@ -19,6 +19,7 @@ from compass_collector.notifier import (
     BatchNotificationStatus,
     BatchNotificationSummary,
     BatchSource,
+    CategoryNotificationIssue,
     DingTalkNotifier,
     NotificationDeliveryStatus,
     TaskNotificationResult,
@@ -163,6 +164,16 @@ def test_summary_reports_partial_failure_and_never_exposes_csv_path() -> None:
             saved_pages=1,
             saved_items=10,
             error_category="response_contract_error",
+            category_issues=(
+                CategoryNotificationIssue(
+                    category_path="3C数码家电 > 3C数码及配件 > 电脑",
+                    error_category="category_unavailable",
+                ),
+                CategoryNotificationIssue(
+                    category_path="智能家居 > 餐饮厨具 > 餐具",
+                    error_category="network_error",
+                ),
+            ),
         ),
     )
 
@@ -172,6 +183,10 @@ def test_summary_reports_partial_failure_and_never_exposes_csv_path() -> None:
     assert "部分失败" in title
     assert "safe.csv" in markdown
     assert "response_contract_error" in markdown
+    assert "耗时：1 分钟" in markdown
+    assert "失败 / 跳过分类" in markdown
+    assert "电脑 · 已跳过（越权）" in markdown
+    assert "餐具 · 失败（network_error）" in markdown
     assert "/Users/" not in markdown
     assert len(markdown.encode("utf-8")) <= MAX_MARKDOWN_BYTES
 

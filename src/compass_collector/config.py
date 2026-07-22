@@ -75,6 +75,8 @@ class HttpConfig(StrictModel):
     page_concurrency: int = Field(ge=1, le=4, default=1)
     # max_in_flight_requests 限制所有分类共享的未完成 HTTP 请求数量。
     max_in_flight_requests: int = Field(ge=1, le=9, default=1)
+    # network_retry_attempts 限制一次临时网络失败后的额外请求次数。
+    network_retry_attempts: int = Field(ge=0, le=3, default=2)
     # 分类树和榜单分页共用同一请求间隔。
     request_interval_seconds: IntervalConfig
     connect_timeout_seconds: float = Field(gt=0)

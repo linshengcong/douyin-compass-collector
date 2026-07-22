@@ -941,6 +941,20 @@ def _collect_category_batch_by_level1(
                     except Exception as error:
                         # 未能转换为安全分类失败的 worker 异常必须终止批次。
                         if terminal_failure is None:
+                            _safe_emit(
+                                runtime_logger,
+                                level="ERROR",
+                                event="level1_worker_failed",
+                                message=(
+                                    f"[{task.id}] 一级分类工作线程异常，正在安全收口批次"
+                                ),
+                                stage="category_collection",
+                                context=LogContext(
+                                    batch_id=prepared_batch.batch_id,
+                                    task_id=task.id,
+                                ),
+                                details={"exception_type": type(error).__name__},
+                            )
                             safe_error = CollectorError(
                                 "Unexpected level-one collection worker failure",
                                 category="internal_error",
@@ -993,13 +1007,22 @@ def _collect_category_batch_by_level1(
             elif isinstance(failure.cause, ORDINARY_CATEGORY_ERRORS):
                 failed_category_count += 1
                 last_ordinary_failure = (outcome.plan, failure)
+                is_category_unavailable = failure.cause.category == "category_unavailable"
                 _safe_emit(
                     runtime_logger,
-                    level="ERROR",
-                    event="category_collection_failed",
+                    level="WARNING" if is_category_unavailable else "ERROR",
+                    event=(
+                        "category_unavailable"
+                        if is_category_unavailable
+                        else "category_collection_failed"
+                    ),
                     message=(
-                        f"[{task.id}] {outcome.plan.category.display_path} 采集失败，"
-                        f"category={failure.cause.category}"
+                        f"[{task.id}] {outcome.plan.category.display_path} "
+                        + (
+                            "当前账号无权访问，已跳过"
+                            if is_category_unavailable
+                            else f"采集失败，category={failure.cause.category}"
+                        )
                     ),
                     stage="category_collection",
                     context=LogContext(
@@ -1204,13 +1227,22 @@ def collect_category_batch(
                 # 单分类请求或数据契约异常留档后跳过，批次继续采集其他分类。
                 failed_category_count += 1
                 last_ordinary_failure = (plan, failure)
+                is_category_unavailable = failure.cause.category == "category_unavailable"
                 _safe_emit(
                     runtime_logger,
-                    level="ERROR",
-                    event="category_collection_failed",
+                    level="WARNING" if is_category_unavailable else "ERROR",
+                    event=(
+                        "category_unavailable"
+                        if is_category_unavailable
+                        else "category_collection_failed"
+                    ),
                     message=(
-                        f"[{task.id}] {plan.category.display_path} 采集失败，"
-                        f"category={failure.cause.category}"
+                        f"[{task.id}] {plan.category.display_path} "
+                        + (
+                            "当前账号无权访问，已跳过"
+                            if is_category_unavailable
+                            else f"采集失败，category={failure.cause.category}"
+                        )
                     ),
                     stage="category_collection",
                     context=LogContext(

@@ -1402,10 +1402,16 @@ class Database:
                 )
             ).all()
             if current_category_run_id is None:
-                if running_category_runs:
-                    raise RuntimeError("running category id is required for termination")
                 if failed_page is not None:
                     raise ValueError("failed page requires a current category run")
+                # 工作线程在报告具体分类前异常时，统一收口所有并行中的分类。
+                terminal_category_status = (
+                    "interrupted" if status == "interrupted" else "abandoned"
+                )
+                for running_category_run in running_category_runs:
+                    running_category_run.status = terminal_category_status
+                    running_category_run.error_category = error_category
+                    running_category_run.finished_at = stored_finished_at
             else:
                 # 当前分类必须是本批次的一个 running 分类。
                 current_category_run = next(

@@ -585,6 +585,7 @@ def _reduce_concurrent_category_progress(
         "category_page_saved",
         "category_collection_succeeded",
         "category_collection_failed",
+        "category_unavailable",
         "category_batch_collection_ready",
     }:
         return state
@@ -626,7 +627,8 @@ def _reduce_concurrent_category_progress(
     if event_name == "category_collection_succeeded":
         status = "succeeded"
         page_no = target_pages if target_pages > 0 else page_no
-    elif event_name == "category_collection_failed":
+    elif event_name in {"category_collection_failed", "category_unavailable"}:
+        # 平台越权分类已完成跳过，不能继续占用并发槽位显示为等待首页。
         status = "failed"
     category_progress = _replace_category_progress(
         state,

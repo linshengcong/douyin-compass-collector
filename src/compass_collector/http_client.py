@@ -28,6 +28,8 @@ REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 DelayWaiter = Callable[[float], bool]
 # 单分类分页预取只开放四个 worker，避免分类级生命周期被并发放大。
 MAX_PAGE_FETCH_WORKERS = 4
+# 临时网络或网关失败统一使用有限指数退避，避免立即重试放大波动。
+NETWORK_RETRY_BACKOFF_SECONDS = (1.0, 2.0, 4.0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +115,8 @@ class CompassHttpClient:
         self.level1_fetch_workers = config.level1_concurrency
         # 请求信号量跨一级分类和分页线程共享，限制真实在途 HTTP 请求数。
         self._in_flight_requests = BoundedSemaphore(config.max_in_flight_requests)
+        # network_retry_attempts 只覆盖临时链路与网关异常，不重试鉴权或业务结果。
+        self.network_retry_attempts = config.network_retry_attempts
 
     def close(self) -> None:
         """Release connections and the in-memory Cookie jar."""
@@ -138,43 +142,78 @@ class CompassHttpClient:
                     category="interrupted",
                 )
 
+    def _wait_before_network_retry(self, retry_index: int) -> None:
+        """Wait with bounded exponential backoff before a retryable request retry."""
+
+        # retry_index 从零开始，与固定退避序列一一对应。
+        retry_delay_seconds = NETWORK_RETRY_BACKOFF_SECONDS[retry_index]
+        if self._wait_for_delay(retry_delay_seconds):
+            raise CollectionInterruptedError(
+                "Collection interrupted during network retry backoff",
+                category="interrupted",
+            )
+
     def _get_json(
         self,
         endpoint_path: str,
         params: dict[str, str | int],
     ) -> HttpJsonResponse:
-        """Request one fixed Compass endpoint without retries and parse its JSON."""
+        """Request one fixed Compass endpoint with bounded transient-error retries."""
 
-        # 取得名额后才进入统一启动间隔，等待响应期间持续占用名额。
-        # 等待名额也必须有上限，后台失联请求不能让后续分类永久卡住。
-        acquired_request_slot = self._in_flight_requests.acquire(
-            timeout=self.request_slot_wait_timeout_seconds
-        )
-        if not acquired_request_slot:
-            raise HttpRequestError(
-                "Timed out waiting for an available Compass request slot",
-                category="timeout",
+        # 固定源与代码内部路径组成不含动态签名的接口地址。
+        endpoint_url = f"{COMPASS_API_ORIGIN}{endpoint_path}"
+        # response 仅在某次 HTTP 尝试真正收到响应后赋值。
+        response: httpx.Response | None = None
+        for attempt_index in range(self.network_retry_attempts + 1):
+            # retryable_error 只承载不会泄露请求细节的稳定异常分类。
+            retryable_error: HttpRequestError | HttpResponseError | None = None
+            # 取得名额后才进入统一启动间隔，等待响应期间持续占用名额。
+            # 等待名额也必须有上限，后台失联请求不能让后续分类永久卡住。
+            acquired_request_slot = self._in_flight_requests.acquire(
+                timeout=self.request_slot_wait_timeout_seconds
             )
-        try:
-            self._wait_before_request()
-            # 固定源与代码内部路径组成不含动态签名的接口地址。
-            endpoint_url = f"{COMPASS_API_ORIGIN}{endpoint_path}"
-            try:
-                # 业务参数由 httpx 编码，请求 URL 不写入日志。
-                response = self._client.get(endpoint_url, params=params)
-            except httpx.TimeoutException as exc:
+            if not acquired_request_slot:
                 raise HttpRequestError(
-                    "HTTP request timed out",
+                    "Timed out waiting for an available Compass request slot",
                     category="timeout",
-                ) from exc
-            except httpx.RequestError as exc:
-                raise HttpRequestError(
-                    "HTTP request failed before receiving a response",
-                    category="network_error",
-                ) from exc
-        finally:
-            # 包括启动间隔中止和网络异常在内的所有路径都必须归还名额。
-            self._in_flight_requests.release()
+                )
+            try:
+                self._wait_before_request()
+                try:
+                    # 业务参数由 httpx 编码，请求 URL 不写入日志。
+                    response = self._client.get(endpoint_url, params=params)
+                except httpx.TimeoutException:
+                    retryable_error = HttpRequestError(
+                        "HTTP request timed out",
+                        category="timeout",
+                    )
+                except httpx.RequestError:
+                    retryable_error = HttpRequestError(
+                        "HTTP request failed before receiving a response",
+                        category="network_error",
+                    )
+            finally:
+                # 包括启动间隔中止和网络异常在内的所有路径都必须归还名额。
+                self._in_flight_requests.release()
+            if retryable_error is not None:
+                if attempt_index == self.network_retry_attempts:
+                    raise retryable_error
+                self._wait_before_network_retry(attempt_index)
+                continue
+            assert response is not None
+            if response.status_code in {429, 502, 503, 504}:
+                retryable_error = HttpResponseError(
+                    "Compass returned a retryable gateway or rate-limit response",
+                    category=("rate_limited" if response.status_code == 429 else "http_error"),
+                    status_code=response.status_code,
+                    response_body=response.content,
+                )
+                if attempt_index == self.network_retry_attempts:
+                    raise retryable_error
+                self._wait_before_network_retry(attempt_index)
+                continue
+            break
+        assert response is not None
         # 响应 body 仅用于 JSON 解析或本地受限失败留档。
         response_body = response.content
         if response.status_code in {401, 403} | REDIRECT_STATUS_CODES:

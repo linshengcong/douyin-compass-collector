@@ -30,6 +30,7 @@ from compass_collector.notifier import (
     BatchMode,
     BatchNotificationSummary,
     BatchSource,
+    CategoryNotificationIssue,
     TaskNotificationResult,
     TaskNotificationStatus,
     deliver_batch_notification,
@@ -132,6 +133,29 @@ def build_task_notification_result(
     )
     # 对外只发送 CSV 文件名，绝不发送本机目录。
     csv_filename = csv_path.name if csv_path is not None else None
+    # category_issues 从 Manifest 分类快照提取，不读取任何失败响应正文。
+    category_issues: list[CategoryNotificationIssue] = []
+    raw_categories = manifest.get("categories")
+    if isinstance(raw_categories, list):
+        for raw_category in raw_categories:
+            if not isinstance(raw_category, dict) or raw_category.get("status") != "failed":
+                continue
+            category_names = (
+                raw_category.get("level1_category_name"),
+                raw_category.get("level2_category_name"),
+                raw_category.get("category_name"),
+            )
+            error_category_text = raw_category.get("error_category")
+            if not all(isinstance(name, str) and name for name in category_names):
+                continue
+            if not isinstance(error_category_text, str) or not error_category_text:
+                continue
+            category_issues.append(
+                CategoryNotificationIssue(
+                    category_path=" > ".join(category_names),
+                    error_category=error_category_text,
+                )
+            )
     return TaskNotificationResult(
         task_id=task.id,
         display_name=task.display_name,
@@ -142,6 +166,7 @@ def build_task_notification_result(
         csv_download_url=csv_download_url,
         oss_error_category=oss_error_category,
         error_category=error_category,
+        category_issues=tuple(category_issues),
     )
 
 

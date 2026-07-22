@@ -73,6 +73,20 @@ def test_real_fixture_matches_verified_first_page_contract() -> None:
     assert contract.item_count == 10
 
 
+def test_category_unavailable_business_code_is_classified_as_skippable() -> None:
+    """Classify Compass status 600003 without treating it as a contract change."""
+
+    # 600003 是平台对部分分类返回的稳定“越权”业务结果。
+    payload = {"st": 600003, "data": {}, "msg": "越权"}
+
+    assert_page_error(
+        payload,
+        requested_page=1,
+        expected_total=None,
+        expected_category="category_unavailable",
+    )
+
+
 def test_request_params_use_cascaded_category_and_exact_twelve_fields() -> None:
     """Build the verified fields with the full level-two/level-three category path."""
 

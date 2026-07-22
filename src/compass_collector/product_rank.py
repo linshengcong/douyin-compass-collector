@@ -106,6 +106,12 @@ def validate_page_payload(
             "response root is not an object",
             category="invalid_contract",
         )
+    # 600003 表示平台允许登录但不允许读取该分类，属于可跳过的业务结果。
+    if payload.get("st") == 600003:
+        raise ResponseContractError(
+            "category is not accessible for the current Compass account",
+            category="category_unavailable",
+        )
     if type(payload.get("st")) is not int or payload["st"] != 0:
         raise ResponseContractError(
             "response st is not zero",

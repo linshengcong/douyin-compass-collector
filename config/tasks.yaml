@@ -45,9 +45,11 @@ http:
   level1_concurrency: 3
   page_concurrency: 3
   max_in_flight_requests: 9
+  # 网络断连最多额外重试两次，按 1 秒、2 秒退避。
+  network_retry_attempts: 2
   request_interval_seconds:
-    min: 0.01
-    max: 0.03
+    min: 0.067
+    max: 0.1
   connect_timeout_seconds: 10
   read_timeout_seconds: 30
 
