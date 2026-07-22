@@ -13,9 +13,9 @@ def test_real_config_is_valid() -> None:
 
     # 加载后的应用配置用于核对动态三级分类契约。
     config = CURRENT_CONFIG
-    assert config.http.level1_concurrency == 2
-    assert config.http.page_concurrency == 4
-    assert config.http.max_in_flight_requests == 8
+    assert config.http.level1_concurrency == 3
+    assert config.http.page_concurrency == 3
+    assert config.http.max_in_flight_requests == 9
     # 首个任务是当前唯一启用的全一级分类任务。
     task = CURRENT_TASK
     assert task.id == "product_hot_sale_all_level3"
@@ -29,11 +29,11 @@ def test_real_config_is_valid() -> None:
     ("field_name", "invalid_value"),
     [
         ("level1_concurrency", 0),
-        ("level1_concurrency", 3),
+        ("level1_concurrency", 4),
         ("page_concurrency", 0),
         ("page_concurrency", 5),
         ("max_in_flight_requests", 0),
-        ("max_in_flight_requests", 9),
+        ("max_in_flight_requests", 10),
     ],
 )
 def test_unsupported_http_concurrency_is_rejected(

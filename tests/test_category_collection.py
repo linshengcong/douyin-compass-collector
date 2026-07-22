@@ -589,10 +589,10 @@ def test_level_one_groups_fetch_concurrently_but_persist_on_owner_thread() -> No
     assert set(storage.write_thread_ids) == {owner_thread_id}
 
 
-def test_parallel_group_auth_failure_does_not_start_a_waiting_third_group() -> None:
-    """Stop group scheduling after auth failure while preserving its terminal reason."""
+def test_parallel_group_completion_immediately_refills_a_free_slot_before_auth_failure() -> None:
+    """Refill a free group slot, then stop the batch once a later auth failure arrives."""
 
-    # 两个槽位先启动前两个一级分类；第三组必须等待可用槽位而不能抢跑。
+    # 第二组先完成后，空闲槽位应立即启动第三组；第一组随后报告认证失效。
     events: list[tuple[Any, ...]] = []
     storage = FakeBatchStorage(events)
     database = FakeDatabase(events)
@@ -609,7 +609,6 @@ def test_parallel_group_auth_failure_does_not_start_a_waiting_third_group() -> N
         },
         level1_fetch_workers=2,
         # category-2 先完成并释放一个 worker 槽位；category-1 随后才报告认证失效。
-        # 旧的“空槽立即补组”调度会因此错误启动 category-3。
         delay_by_category_page={("category-1", 1): 0.03},
     )
     prepared_batch = build_prepared_batch(
@@ -628,7 +627,7 @@ def test_parallel_group_auth_failure_does_not_start_a_waiting_third_group() -> N
         )
 
     assert error_info.value.cause.category == "auth_required"
-    assert all(category_id != "category-3" for category_id, _page_no in client.calls)
+    assert any(category_id == "category-3" for category_id, _page_no in client.calls)
     assert database.terminate_calls[0]["status"] == "auth_required"
 
 

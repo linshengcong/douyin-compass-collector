@@ -885,7 +885,7 @@ def _collect_category_batch_by_level1(
 
     # next_group_index identifies the next discovered一级分类组 that may enter a free slot.
     next_group_index = 0
-    # max_group_workers prevents empty pools and enforces the configured two-group limit.
+    # max_group_workers prevents empty pools and enforces the configured group limit.
     max_group_workers = min(client.level1_fetch_workers, len(level1_groups))
     # active_futures tracks groups that can still enqueue persistence work or outcomes.
     active_futures: set[Future[None]] = set()
@@ -916,8 +916,7 @@ def _collect_category_batch_by_level1(
         return True
 
     with ThreadPoolExecutor(max_workers=max_group_workers) as executor:
-        # 一级分类组按并发批次推进：当前批次所有组正常退出后，才允许启动下一批。
-        # 这样任一并行组稍后报告认证失效时，不会让已释放的槽位抢先启动等待组。
+        # 任一一级分类组退出就立即补位；认证失效或中止一经 owner 确认即冻结后续提交。
         while active_futures or (
             terminal_failure is None and next_group_index < len(level1_groups)
         ):
@@ -958,6 +957,13 @@ def _collect_category_batch_by_level1(
                                 "abandoned",
                             )
                             batch_stop_event.set()
+                # 已完成组释放的槽位立即补充下一组，避免慢组造成长期空闲槽位。
+                while (
+                    terminal_failure is None
+                    and len(active_futures) < max_group_workers
+                    and submit_next_group(executor)
+                ):
+                    pass
                 continue
 
             # 首个终态原因是批次审计依据；后续并行组只释放并退出，不能覆盖它。
