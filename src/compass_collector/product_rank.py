@@ -112,6 +112,12 @@ def validate_page_payload(
             "category is not accessible for the current Compass account",
             category="category_unavailable",
         )
+    # 11001 是平台明确返回的暂时不可用，不是单个分类的数据或权限问题。
+    if payload.get("st") == 11001:
+        raise ResponseContractError(
+            "Compass platform is temporarily unavailable",
+            category="platform_temporarily_unavailable",
+        )
     if type(payload.get("st")) is not int or payload["st"] != 0:
         raise ResponseContractError(
             "response st is not zero",

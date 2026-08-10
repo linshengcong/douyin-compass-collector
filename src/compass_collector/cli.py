@@ -7,7 +7,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from compass_collector.config import AppConfig, load_config
-from compass_collector.local_data import clear_local_data_with_locks
+from compass_collector.local_data import clear_auth_data_with_locks, clear_local_data_with_locks
 from compass_collector.notifier import load_project_environment, run_notification_test
 from compass_collector.runner import run_collection, run_login, run_status
 from compass_collector.runtime_locks import RuntimeLockBusy
@@ -55,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clear_data_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     clear_data_parser.add_argument("--yes", action="store_true")
+
+    # clear-auth 清除 Chrome 持久化登录态，不删除采集数据。
+    clear_auth_parser = subparsers.add_parser(
+        "clear-auth",
+        help="delete the persistent Chrome profile to reset login state",
+    )
+    clear_auth_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    clear_auth_parser.add_argument("--yes", action="store_true")
 
     # run 命令默认使用 GUI，--no-gui 显式回退终端模式。
     run_parser = subparsers.add_parser(
@@ -196,6 +204,16 @@ def _dispatch_configured_command(
             f"失败 {cleanup_summary.failures}"
         )
         exit_code = 0 if cleanup_summary.succeeded else 1
+    elif arguments.command == "clear-auth":
+        if not arguments.yes:
+            raise ValueError("clear-auth requires --yes")
+        # 获取采集锁后删除 Chrome Profile 目录，保留原始 runtime 结构。
+        cleared = clear_auth_data_with_locks(runtime_root(), config.browser.profile_dir)
+        if cleared:
+            print("登录态已清除：Chrome 浏览器 Profile 已重置")
+        else:
+            print("登录态无需清除：Chrome Profile 目录不存在")
+        exit_code = 0
     elif arguments.command == "status":
         if arguments.limit <= 0:
             raise ValueError("status --limit must be positive")

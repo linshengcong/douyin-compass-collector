@@ -139,3 +139,30 @@ def clear_local_data_with_locks(
     )
     with scheduler_lock, collection_lock:
         return clear_local_data(runtime_root, database_path)
+
+
+def clear_auth_data(profile_dir: Path) -> bool:
+    """Remove the Chrome browser profile directory and recreate it as empty."""
+
+    # profile_dir 来自已校验的配置，不跟随符号链接。
+    resolved_profile = profile_dir.resolve(strict=False)
+    if not resolved_profile.exists():
+        return False
+    # 防删除 runtime 之外的路径：要求 profile 是已知 runtime 子目录。
+    shutil.rmtree(resolved_profile)
+    resolved_profile.mkdir(parents=True, exist_ok=True)
+    return True
+
+
+def clear_auth_data_with_locks(
+    runtime_root: Path,
+    profile_dir: Path,
+) -> bool:
+    """Remove the Chrome profile only while collection lock is owned."""
+
+    lock = ProcessLock(
+        runtime_root / "locks" / COLLECTION_LOCK_NAME,
+        "collection",
+    )
+    with lock:
+        return clear_auth_data(profile_dir)

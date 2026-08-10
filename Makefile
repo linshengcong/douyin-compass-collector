@@ -35,7 +35,7 @@ endif
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install login app run notify-test clear-data status scheduler web-dev web-build test check service
+.PHONY: help install login app run notify-test clear-data clear-login status scheduler web-dev web-build test check service
 
 help: ## 显示所有快捷命令
 	@awk 'BEGIN {FS = ":.*## "; printf "用法：make <command> [TASK=task_id]\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -57,6 +57,9 @@ notify-test: ## 真实发送一条钉钉配置测试消息
 
 clear-data: ## 清除本地采集数据，保留 Chrome 登录态
 	$(PYTHON) -m compass_collector clear-data --yes
+
+clear-login: ## 清除 Chrome 登录态，保留本地采集数据
+	$(PYTHON) -m compass_collector clear-auth --yes
 
 status: ## 查看最近运行状态
 	$(PYTHON) -m compass_collector status

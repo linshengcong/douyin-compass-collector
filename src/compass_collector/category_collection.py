@@ -51,6 +51,10 @@ ORDINARY_CATEGORY_ERRORS = (
 )
 # 分页预取从第二页开始，第一页必须先串行建立 total 和目标页数。
 FIRST_PREFETCH_PAGE_NO = 2
+# 平台连续三次返回 11001 时停止本批，避免持续请求已暂时不可用的服务。
+MAX_CONSECUTIVE_PLATFORM_UNAVAILABLE_FAILURES = 3
+# 该分类由产品榜单契约层专门映射自平台响应 st=11001。
+PLATFORM_TEMPORARY_UNAVAILABLE_ERROR_CATEGORY = "platform_temporarily_unavailable"
 
 
 @dataclass(slots=True)
@@ -874,6 +878,8 @@ def _collect_category_batch_by_level1(
     failed_category_count = 0
     # last_ordinary_failure 在所有分类均失败时提供稳定的终态原因。
     last_ordinary_failure: tuple[CategoryRunPlan, _CategoryAttemptFailed] | None = None
+    # 连续计数按 owner 处理 outcome 的顺序更新，成功或其他错误都会清零。
+    consecutive_platform_unavailable_failures = 0
     # owner 线程执行所有 SQLite、raw、Manifest 和日志副作用。
     persistence = _MainThreadPersistence()
     # stop 信号同时阻止补充新一级分类组和组内启动下一个三级分类。
@@ -988,6 +994,8 @@ def _collect_category_batch_by_level1(
 
             if outcome.collected_run is not None:
                 completed_category_runs.append(outcome.collected_run)
+                # 成功响应说明平台已恢复，不能把此前 11001 计入后续连续失败。
+                consecutive_platform_unavailable_failures = 0
                 outcome.should_continue = terminal_failure is None
                 outcome.continue_event.set()
                 continue
@@ -1008,6 +1016,16 @@ def _collect_category_batch_by_level1(
                 failed_category_count += 1
                 last_ordinary_failure = (outcome.plan, failure)
                 is_category_unavailable = failure.cause.category == "category_unavailable"
+                is_platform_temporarily_unavailable = (
+                    failure.cause.category
+                    == PLATFORM_TEMPORARY_UNAVAILABLE_ERROR_CATEGORY
+                )
+                # 仅连续的 11001 触发熔断；越权及其他分类错误保持原有跳过语义。
+                consecutive_platform_unavailable_failures = (
+                    consecutive_platform_unavailable_failures + 1
+                    if is_platform_temporarily_unavailable
+                    else 0
+                )
                 _safe_emit(
                     runtime_logger,
                     level="WARNING" if is_category_unavailable else "ERROR",
@@ -1064,6 +1082,34 @@ def _collect_category_batch_by_level1(
                         ),
                         "abandoned",
                     )
+                if (
+                    terminal_failure is None
+                    and consecutive_platform_unavailable_failures
+                    >= MAX_CONSECUTIVE_PLATFORM_UNAVAILABLE_FAILURES
+                ):
+                    _safe_emit(
+                        runtime_logger,
+                        level="ERROR",
+                        event="platform_unavailable_circuit_opened",
+                        message=(
+                            f"[{task.id}] 平台连续返回 11001 达到 "
+                            f"{MAX_CONSECUTIVE_PLATFORM_UNAVAILABLE_FAILURES} 次，"
+                            "停止本批采集"
+                        ),
+                        stage="category_collection",
+                        context=LogContext(
+                            batch_id=prepared_batch.batch_id,
+                            task_id=task.id,
+                            category_run_id=outcome.plan.category_run_id,
+                        ),
+                        details={
+                            "error_category": failure.cause.category,
+                            "consecutive_failure_count": (
+                                consecutive_platform_unavailable_failures
+                            ),
+                        },
+                    )
+                    terminal_failure = (outcome.plan, failure, "failed")
             else:
                 terminal_failure = (outcome.plan, failure, "abandoned")
 
@@ -1176,6 +1222,8 @@ def collect_category_batch(
     failed_category_count = 0
     # last_ordinary_failure 在全部分类失败时提供批次终态原因。
     last_ordinary_failure: tuple[CategoryRunPlan, _CategoryAttemptFailed] | None = None
+    # 串行路径与一级分类并发路径使用相同的 11001 连续失败熔断规则。
+    consecutive_platform_unavailable_failures = 0
 
     for plan in prepared_batch.category_run_plans:
         if control is not None and control.stop_requested():
@@ -1228,6 +1276,16 @@ def collect_category_batch(
                 failed_category_count += 1
                 last_ordinary_failure = (plan, failure)
                 is_category_unavailable = failure.cause.category == "category_unavailable"
+                is_platform_temporarily_unavailable = (
+                    failure.cause.category
+                    == PLATFORM_TEMPORARY_UNAVAILABLE_ERROR_CATEGORY
+                )
+                # 非 11001 的失败会中断连续序列，保持其他普通错误的原有语义。
+                consecutive_platform_unavailable_failures = (
+                    consecutive_platform_unavailable_failures + 1
+                    if is_platform_temporarily_unavailable
+                    else 0
+                )
                 _safe_emit(
                     runtime_logger,
                     level="WARNING" if is_category_unavailable else "ERROR",
@@ -1296,6 +1354,41 @@ def collect_category_batch(
                         runtime_logger=runtime_logger,
                         completed_category_runs=completed_category_runs,
                     )
+                if (
+                    consecutive_platform_unavailable_failures
+                    >= MAX_CONSECUTIVE_PLATFORM_UNAVAILABLE_FAILURES
+                ):
+                    _safe_emit(
+                        runtime_logger,
+                        level="ERROR",
+                        event="platform_unavailable_circuit_opened",
+                        message=(
+                            f"[{task.id}] 平台连续返回 11001 达到 "
+                            f"{MAX_CONSECUTIVE_PLATFORM_UNAVAILABLE_FAILURES} 次，"
+                            "停止本批采集"
+                        ),
+                        stage="category_collection",
+                        context=LogContext(
+                            batch_id=prepared_batch.batch_id,
+                            task_id=task.id,
+                            category_run_id=plan.category_run_id,
+                        ),
+                        details={
+                            "error_category": failure.cause.category,
+                            "consecutive_failure_count": (
+                                consecutive_platform_unavailable_failures
+                            ),
+                        },
+                    )
+                    _terminate_batch_and_raise(
+                        prepared_batch=prepared_batch,
+                        plan=plan,
+                        failure=failure,
+                        status="failed",
+                        database=database,
+                        runtime_logger=runtime_logger,
+                        completed_category_runs=completed_category_runs,
+                    )
                 continue
             # 数据库、Manifest 或未知 CollectorError 都不能按普通接口失败跳过。
             _terminate_batch_and_raise(
@@ -1308,6 +1401,8 @@ def collect_category_batch(
                 completed_category_runs=completed_category_runs,
             )
         completed_category_runs.append(collected_run)
+        # 任何成功分类都会中断 11001 连续失败序列。
+        consecutive_platform_unavailable_failures = 0
 
     if control is not None and control.stop_requested():
         _interrupt_before_next_category(

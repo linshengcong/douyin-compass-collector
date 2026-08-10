@@ -87,6 +87,20 @@ def test_category_unavailable_business_code_is_classified_as_skippable() -> None
     )
 
 
+def test_platform_temporarily_unavailable_code_is_classified_for_circuit_breaker() -> None:
+    """Classify Compass status 11001 as a temporary batch-level availability signal."""
+
+    # 11001 应与普通业务错误分开，供采集层统计连续失败并安全熔断。
+    payload = {"st": 11001, "data": None, "msg": "当前网络不稳定，请稍后再试"}
+
+    assert_page_error(
+        payload,
+        requested_page=1,
+        expected_total=None,
+        expected_category="platform_temporarily_unavailable",
+    )
+
+
 def test_request_params_use_cascaded_category_and_exact_twelve_fields() -> None:
     """Build the verified fields with the full level-two/level-three category path."""
 

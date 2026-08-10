@@ -18,6 +18,7 @@ from compass_collector.errors import (
     AuthRequiredError,
     CategoryBatchCollectionError,
     HttpRequestError,
+    ResponseContractError,
 )
 from compass_collector.http_client import HttpJsonResponse
 from compass_collector.models import (
@@ -860,6 +861,60 @@ def test_all_ordinary_failures_terminate_only_after_every_category_is_attempted(
         }
     ]
     assert len(storage.failure_calls) == 4
+
+
+def test_three_consecutive_platform_unavailable_failures_open_circuit_breaker() -> None:
+    """Stop before a fourth category after three consecutive Compass 11001 responses."""
+
+    # 连续三个 11001 必须保留失败材料后终止，避免继续放大平台临时故障。
+    events: list[tuple[Any, ...]] = []
+    storage = FakeBatchStorage(events)
+    database = FakeDatabase(events)
+    platform_unavailable = ResponseContractError(
+        "Compass platform is temporarily unavailable",
+        category="platform_temporarily_unavailable",
+    )
+    client = FakeRankingClient(
+        {
+            category_id: platform_unavailable
+            for category_id in (
+                "category-1",
+                "category-2",
+                "category-3",
+                "category-4",
+            )
+        }
+    )
+    prepared_batch = build_prepared_batch(category_count=4, storage=storage)
+    runtime_logger = FakeRuntimeLogger()
+
+    with pytest.raises(CategoryBatchCollectionError) as error_info:
+        collect_category_batch(
+            prepared_batch=prepared_batch,
+            task=load_task(),
+            client=client,  # type: ignore[arg-type]
+            database=database,  # type: ignore[arg-type]
+            runtime_logger=runtime_logger,  # type: ignore[arg-type]
+        )
+
+    assert error_info.value.cause.category == "platform_temporarily_unavailable"
+    assert client.calls == [
+        ("category-1", 1),
+        ("category-2", 1),
+        ("category-3", 1),
+    ]
+    assert [call["category_run_id"] for call in database.failure_calls] == [
+        "run-1",
+        "run-2",
+        "run-3",
+    ]
+    assert database.terminate_calls[0]["status"] == "failed"
+    assert database.terminate_calls[0]["error_category"] == "platform_temporarily_unavailable"
+    assert any(
+        event["event"] == "platform_unavailable_circuit_opened"
+        and event["details"]["consecutive_failure_count"] == 3
+        for event in runtime_logger.events
+    )
 
 
 def test_auth_failure_stops_before_the_next_category() -> None:

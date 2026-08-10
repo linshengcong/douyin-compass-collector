@@ -13,9 +13,9 @@ def test_real_config_is_valid() -> None:
 
     # 加载后的应用配置用于核对动态三级分类契约。
     config = CURRENT_CONFIG
-    assert config.http.level1_concurrency == 3
-    assert config.http.page_concurrency == 3
-    assert config.http.max_in_flight_requests == 9
+    assert config.http.level1_concurrency == 2
+    assert config.http.page_concurrency == 4
+    assert config.http.max_in_flight_requests == 8
     assert config.http.network_retry_attempts == 2
     # 首个任务是当前唯一启用的全一级分类任务。
     task = CURRENT_TASK
