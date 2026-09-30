@@ -9,7 +9,7 @@ import pytest
 
 from compass_collector.errors import ResponseContractError
 from compass_collector.models import DiscoveredCategory
-from compass_collector.product_rank import build_request_params, validate_page_payload
+from compass_collector.platforms.compass_product_rank import build_request_params, validate_page_payload
 from current_contract import CURRENT_BRAND_TYPE, CURRENT_PRICE_BIN, CURRENT_TASK
 
 

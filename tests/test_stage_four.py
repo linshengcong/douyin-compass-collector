@@ -71,7 +71,9 @@ def test_first_reconcile_runs_today_once_and_advances_checkpoint(
 
     # 临时配置和日志目录隔离真实数据库与 runtime。
     config = temporary_config(tmp_path)
-    monkeypatch.setattr("compass_collector.scheduler.RUNTIME_ROOT", tmp_path / "runtime")
+    monkeypatch.setattr(
+        "compass_collector.scheduler.RUNTIME_ROOT", tmp_path / "runtime"
+    )
     # 回调捕获到期任务但不启动真实 Chrome。
     calls: list[tuple[list[str], datetime]] = []
 
@@ -93,14 +95,16 @@ def test_first_reconcile_runs_today_once_and_advances_checkpoint(
 
     assert calls == [
         (
-            ["product_hot_sale_all_level3"],
+            ["compass_household_cleaning_realtime"],
             datetime(2026, 7, 16, 14, 0, tzinfo=SHANGHAI_TIMEZONE),
         )
     ]
     # 持久化检查点证明第二次调用没有依赖进程内状态。
     database = Database(config.database.path)
     try:
-        checkpoint = database.scheduler_checkpoint("product_hot_sale_all_level3")
+        checkpoint = database.scheduler_checkpoint(
+            "compass_household_cleaning_realtime"
+        )
     finally:
         database.close()
     assert checkpoint == datetime(2026, 7, 16, 15, 0)
@@ -114,12 +118,14 @@ def test_cross_day_occurrence_is_missed_and_never_dispatched(
 
     # 临时数据库先写入昨天计划时间之前的检查点。
     config = temporary_config(tmp_path)
-    monkeypatch.setattr("compass_collector.scheduler.RUNTIME_ROOT", tmp_path / "runtime")
+    monkeypatch.setattr(
+        "compass_collector.scheduler.RUNTIME_ROOT", tmp_path / "runtime"
+    )
     upgrade_database(config.database.path)
     database = Database(config.database.path)
     try:
         database.set_scheduler_checkpoint(
-            "product_hot_sale_all_level3",
+            "compass_household_cleaning_realtime",
             datetime(2026, 7, 15, 13, 0, tzinfo=SHANGHAI_TIMEZONE),
         )
     finally:
@@ -163,7 +169,9 @@ def test_same_cron_tasks_dispatch_as_one_serial_batch(
     first_task = config.tasks[0]
     second_task = first_task.model_copy(update={"id": "product_hot_sale_second"})
     config = config.model_copy(update={"tasks": [first_task, second_task]})
-    monkeypatch.setattr("compass_collector.scheduler.RUNTIME_ROOT", tmp_path / "runtime")
+    monkeypatch.setattr(
+        "compass_collector.scheduler.RUNTIME_ROOT", tmp_path / "runtime"
+    )
     # 单次调用中的任务顺序用于验证严格串行批次边界。
     calls: list[list[str]] = []
 
@@ -181,7 +189,7 @@ def test_same_cron_tasks_dispatch_as_one_serial_batch(
     now = datetime(2026, 7, 16, 15, 0, tzinfo=SHANGHAI_TIMEZONE)
     reconcile_scheduler_once(config, now=now, run_callback=fake_run)
 
-    assert calls == [["product_hot_sale_all_level3", "product_hot_sale_second"]]
+    assert calls == [["compass_household_cleaning_realtime", "product_hot_sale_second"]]
 
 
 def test_scheduler_auth_failure_closes_browser_without_waiting(
@@ -199,10 +207,11 @@ def test_scheduler_auth_failure_closes_browser_without_waiting(
     class FakeBrowserSession:
         """Expose only the browser methods reached before missing-auth handling."""
 
-        def whitelisted_cookies(self, cookie_names):
-            """Return no authentication state to trigger batch blocking."""
+        def discover_scopes(self, task):
+            """Simulate an unattended authentication challenge."""
+            from compass_collector.errors import AuthRequiredError
 
-            return []
+            raise AuthRequiredError("Authentication required", category="auth_required")
 
         def wait_for_manual_exit(self, message: str) -> None:
             """Record an invalid Scheduler wait instead of blocking the test."""
@@ -216,8 +225,8 @@ def test_scheduler_auth_failure_closes_browser_without_waiting(
 
     # 浏览器启动替换为无 Cookie 的轻量会话。
     monkeypatch.setattr(
-        "compass_collector.runner.open_browser",
-        lambda browser_config: FakeBrowserSession(),
+        "compass_collector.runner.create_adapter",
+        lambda *args, **kwargs: FakeBrowserSession(),
     )
     # Scheduler 使用准确计划时间而不是当前测试日期重新计算。
     task = config.tasks[0]
@@ -246,7 +255,7 @@ def test_scheduler_auth_failure_closes_browser_without_waiting(
     assert lifecycle == {"closed": 1, "waited": 0}
     assert len(rows) == 2
     assert {row.task_id for row in rows} == {
-        "product_hot_sale_all_level3",
+        "compass_household_cleaning_realtime",
         "product_hot_sale_second",
     }
     assert {row.status for row in rows} == {"auth_required"}

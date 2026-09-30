@@ -35,8 +35,8 @@ def build_entry(*, rank: int, product_name: str, newly_on_ranking: bool) -> Prod
         product_id=f"product-{product_name}",
         product_name=product_name,
         newly_on_ranking=newly_on_ranking,
-        pay_amount=MetricRange(min_value=100_000, max_value=250_000, unit="price"),
-        pay_combo_count=MetricRange(min_value=100, max_value=250, unit="number"),
+        pay_amount=MetricRange(min_value=1000, max_value=2500, unit="CNY"),
+        pay_combo_count=MetricRange(min_value=10, max_value=25, unit="count"),
         shops=shops,
         image_url=f"https://images.example.test/{product_name}.jpg",
     )
@@ -171,7 +171,7 @@ def test_prepare_uses_chinese_name_version_and_safe_path(tmp_path: Path) -> None
 
     # 两个文件必须位于同一个业务日期和任务隔离目录下。
     expected_directory = (
-        tmp_path / "2026-07-17" / "product_hot_sale_food_level3"
+        tmp_path / "compass" / "2026-07-17" / "product_hot_sale_food_level3"
     )
     assert version_one.final_path == expected_directory / "食品_饮料_三级榜_1405.csv"
     assert version_two.final_path == expected_directory / "食品_饮料_三级榜_1405_v2.csv"

@@ -4,9 +4,16 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from compass_collector.app_paths import is_packaged_application, runtime_root
+from compass_collector.platforms.compass_config import (
+    CategoryTargetConfig as CategoryTargetConfig,
+    CategoryScopeConfig,
+    FiltersConfig,
+    RankConfig,
+    DateConfig,
+)
 
 
 class StrictModel(BaseModel):
@@ -16,43 +23,37 @@ class StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class BrowserConfig(StrictModel):
-    """Configure the persistent Chrome profile used for authentication."""
+class BrowserSettings(StrictModel):
+    """Common visible Chrome settings shared across platforms."""
 
     channel: Literal["chrome"] = "chrome"
     headless: Literal[False] = False
-    profile_dir: Path
     locale: str = "zh-CN"
     timezone_id: Literal["Asia/Shanghai"] = "Asia/Shanghai"
     keep_open_after_manual_run: bool = True
 
 
-class AuthConfig(StrictModel):
-    """Configure the Cookie-name allowlist without ever storing Cookie values."""
+class BrowserConfig(BrowserSettings):
+    """Resolved session settings, including the selected platform profile."""
 
-    cookie_names: list[str] = Field(min_length=1)
+    # 每个会话使用已解析的平台 Profile，不共享账号目录。
+    profile_dir: Path
 
-    @field_validator("cookie_names")
-    @classmethod
-    def validate_cookie_names(cls, value: list[str]) -> list[str]:
-        """Require unique, non-empty Cookie names."""
 
-        # 去除名称两端空白，避免配置中出现视觉上难以发现的错误。
-        normalized_names = [name.strip() for name in value]
-        if any(not name for name in normalized_names):
-            raise ValueError("cookie_names cannot contain blank names")
-        if len(normalized_names) != len(set(normalized_names)):
-            raise ValueError("cookie_names cannot contain duplicates")
-        return normalized_names
+class PlatformConfig(StrictModel):
+    """Configure a platform profile independently from task selection."""
+
+    # 罗盘继续复用旧目录，未来平台必须声明自己的独立目录。
+    profile_dir: Path
 
 
 class IntervalConfig(StrictModel):
     """Configure the randomized delay between serial Compass API requests."""
 
-    # 所有罗盘 API 请求的最小随机间隔。
-    min: float = Field(ge=0.01, le=1)
-    # 所有罗盘 API 请求的最大随机间隔。
-    max: float = Field(ge=0.01, le=1)
+    # 所有罗盘 API 请求的最小随机间隔，支持风控恢复期的低频运行。
+    min: float = Field(ge=0.01, le=10)
+    # 所有罗盘 API 请求的最大随机间隔，支持风控恢复期的低频运行。
+    max: float = Field(ge=0.01, le=10)
 
     @field_validator("max")
     @classmethod
@@ -62,25 +63,35 @@ class IntervalConfig(StrictModel):
         # Pydantic 已校验的最小值用于比较间隔上下界。
         minimum = info.data.get("min")
         if minimum is not None and value < minimum:
-            raise ValueError("request interval max must be greater than or equal to min")
+            raise ValueError(
+                "request interval max must be greater than or equal to min"
+            )
         return value
 
 
-class HttpConfig(StrictModel):
-    """Configure the synchronous HTTP client shared by category and rank requests."""
+class CollectionConfig(StrictModel):
+    """Configure bounded, interruptible serial page operations."""
 
-    # level1_concurrency 限制同时采集的一级分类组数量。
-    level1_concurrency: int = Field(ge=1, le=3, default=1)
-    # page_concurrency 限制单个三级分类后续分页的预取 worker 数量。
-    page_concurrency: int = Field(ge=1, le=4, default=1)
-    # max_in_flight_requests 限制所有分类共享的未完成 HTTP 请求数量。
-    max_in_flight_requests: int = Field(ge=1, le=9, default=1)
-    # network_retry_attempts 限制一次临时网络失败后的额外请求次数。
+    # 重试必须先恢复页面状态，不能重复盲点下一页。
     network_retry_attempts: int = Field(ge=0, le=3, default=2)
-    # 分类树和榜单分页共用同一请求间隔。
-    request_interval_seconds: IntervalConfig
-    connect_timeout_seconds: float = Field(gt=0)
-    read_timeout_seconds: float = Field(gt=0)
+    # 页面操作之间的间隔，沿用已有低频范围。
+    request_interval_seconds: IntervalConfig = Field(
+        default_factory=lambda: IntervalConfig(min=0.5, max=1)
+    )
+    # 单次 DOM 操作及完整响应分别有独立超时。
+    action_timeout_seconds: float = Field(gt=0, default=30)
+    response_timeout_seconds: float = Field(gt=0, default=45)
+    # 滚动后等待页面布局稳定，再重新定位分页；等待中仍响应停止。
+    scroll_settle_seconds: float = Field(ge=0.1, le=10, default=1.5)
+    # 只允许手动任务限时人工恢复，定时任务不等待。
+    manual_auth_wait_seconds: float = Field(gt=0, default=180)
+
+
+class PublicationConfig(StrictModel):
+    """Choose the task allowed to update the legacy website index."""
+
+    # 只有主任务可覆盖旧网站根索引，其他任务只更新隔离索引。
+    web_primary_task_id: str = "compass_household_cleaning_realtime"
 
 
 class RetentionConfig(StrictModel):
@@ -109,53 +120,16 @@ class SchedulerConfig(StrictModel):
     cross_day_backfill: Literal[False] = False
 
 
-class CategoryScopeConfig(StrictModel):
-    """Discover target-level descendants below every level-one category."""
-
-    # 当前任务遍历分类接口返回的全部非汇总一级分类。
-    mode: Literal["all_level1"] = "all_level1"
-    # 当前数据契约只采集三级分类。
-    target_level: Literal[3] = 3
-    # “全部”节点必须排除，避免与子分类重复。
-    exclude_all: Literal[True] = True
-
-
-class FiltersConfig(StrictModel):
-    """Configure the verified product ranking filters."""
-
-    # 当前只开放真实请求验证过的不限和非知名品牌值。
-    brand_type: Literal[-1, 0] = -1
-    # 当前只开放真实请求验证过的不限和严格大于一万元价格带。
-    price_bin: Literal["不限", "10001-?"] = "不限"
-    search_info: Literal[""] = ""
-
-
-class RankConfig(StrictModel):
-    """Configure the verified product hot-sale endpoint."""
-
-    type: Literal["product_hot_sale"] = "product_hot_sale"
-    endpoint_path: Literal[
-        "/compass_api/shop/product/product_rank/market_hot_sale"
-    ]
-    rank_data_type: Literal[1] = 1
-    activity_id: Literal[""] = ""
-
-
-class DateConfig(StrictModel):
-    """Restrict collection to the verified current-day request semantics."""
-
-    strategy: Literal["today"] = "today"
-    date_type: Literal[1] = 1
-
-
 class TaskConfig(StrictModel):
     """Describe one independently runnable product ranking task."""
 
     id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    # 平台名称由显式注册表校验，不允许动态模块路径。
+    platform: str = "compass"
     enabled: bool = True
     display_name: str = Field(min_length=1)
     schedule: str = Field(min_length=1)
-    rank: RankConfig
+    rank: RankConfig = Field(default_factory=RankConfig)
     # 分类范围每次任务从平台分类树动态发现。
     category_scope: CategoryScopeConfig
     filters: FiltersConfig
@@ -184,13 +158,44 @@ class TaskConfig(StrictModel):
 class AppConfig(StrictModel):
     """Aggregate all currently supported configuration sections."""
 
-    browser: BrowserConfig
+    browser: BrowserSettings
+    # 平台级 Profile 与任务业务配置分离。
+    platforms: dict[str, PlatformConfig]
     scheduler: SchedulerConfig
-    auth: AuthConfig
-    http: HttpConfig
+    collection: CollectionConfig
+    publication: PublicationConfig = Field(default_factory=PublicationConfig)
     database: DatabaseConfig
     retention: RetentionConfig
     tasks: list[TaskConfig] = Field(min_length=1)
+
+    def browser_for(self, platform: str) -> BrowserConfig:
+        """Resolve the selected platform's Chrome configuration."""
+        if platform not in self.platforms:
+            raise ValueError("platform is not configured")
+        return BrowserConfig(
+            **self.browser.model_dump(),
+            profile_dir=self.platforms[platform].profile_dir,
+        )
+
+    @model_validator(mode="after")
+    def validate_platforms(self):
+        """Reject unsupported platforms and profile aliasing before Chrome starts."""
+        # 目前仅有经过真实验收的罗盘适配器。
+        from compass_collector.platforms.registry import registered_platforms
+
+        if set(self.platforms) - registered_platforms():
+            raise ValueError("platform adapter is not registered")
+        if any(task.platform not in self.platforms for task in self.tasks):
+            raise ValueError("task platform is not configured")
+        # resolve 不创建目录；不同平台不能指向同一持久化 Profile。
+        profiles = [
+            platform.profile_dir.resolve() for platform in self.platforms.values()
+        ]
+        if len(profiles) != len(set(profiles)):
+            raise ValueError("platform profiles must be distinct")
+        if self.publication.web_primary_task_id not in {task.id for task in self.tasks}:
+            raise ValueError("primary publication task is not configured")
+        return self
 
     @field_validator("tasks")
     @classmethod
@@ -227,9 +232,12 @@ def load_config(config_path: Path) -> AppConfig:
 
     return config.model_copy(
         update={
-            "browser": config.browser.model_copy(
-                update={"profile_dir": resolve_runtime_value(config.browser.profile_dir)}
-            ),
+            "platforms": {
+                name: platform.model_copy(
+                    update={"profile_dir": resolve_runtime_value(platform.profile_dir)}
+                )
+                for name, platform in config.platforms.items()
+            },
             "database": config.database.model_copy(
                 update={"path": resolve_runtime_value(config.database.path)}
             ),

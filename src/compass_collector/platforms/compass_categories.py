@@ -1,4 +1,4 @@
-"""Dynamic category-tree request contract and level-three discovery parser."""
+"""Compass category-tree response contract and level-three discovery parser."""
 
 from typing import Any
 
@@ -11,19 +11,6 @@ from compass_collector.models import CategoryDiscoveryResult, DiscoveredCategory
 
 # 分类接口路径不包含追踪、签名或账号参数。
 CATEGORY_TREE_ENDPOINT_PATH = "/compass_api/config_center/category/cate_list"
-# 首版只保留已确认的三个分类业务参数。
-CATEGORY_TREE_REQUEST_PARAMS = {
-    "level": 4,
-    "scene": 9,
-    "default_cate_to_level": 2,
-}
-
-
-def build_category_request_params() -> dict[str, int]:
-    """Return a fresh minimal parameter mapping for one category-tree request."""
-
-    # 返回副本避免调用方修改模块级契约。
-    return dict(CATEGORY_TREE_REQUEST_PARAMS)
 
 
 def _node_identity(node: Any, *, context: str) -> tuple[str, str]:

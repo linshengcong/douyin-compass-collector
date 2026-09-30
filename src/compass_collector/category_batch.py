@@ -7,11 +7,6 @@ from typing import Literal
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from compass_collector.category_discovery import (
-    CATEGORY_TREE_ENDPOINT_PATH,
-    build_category_request_params,
-    parse_category_tree,
-)
 from compass_collector.config import TaskConfig
 from compass_collector.errors import (
     AuthRequiredError,
@@ -20,7 +15,7 @@ from compass_collector.errors import (
     CollectionInterruptedError,
     CollectorError,
 )
-from compass_collector.http_client import CompassHttpClient
+from compass_collector.platforms.contracts import PlatformAdapter
 from compass_collector.models import (
     CategoryDiscoveryResult,
     CategoryRunPlan,
@@ -127,7 +122,7 @@ def _finish_failed_batch(
             response_body=error.response_body,
             failed_step="category_tree_request_or_contract",
             exception_type=exception_type,
-            safe_endpoint_path=CATEGORY_TREE_ENDPOINT_PATH,
+            safe_endpoint_path=None,
         )
     except OSError:
         # 诊断材料写入失败不能覆盖已经持久化的业务终态。
@@ -160,7 +155,7 @@ def prepare_category_batch(
     business_date: date,
     planned_at: datetime,
     mode: BatchMode,
-    client: CompassHttpClient,
+    client: PlatformAdapter,
     database: Database,
     runtime_logger: RuntimeLogger,
     control: CollectionControl | None = None,
@@ -178,6 +173,8 @@ def prepare_category_batch(
         planned_at=planned_at,
         mode=mode,
         started_at=started_at,
+        platform=task.platform,
+        config_snapshot=task.model_dump(mode="json"),
     )
     try:
         database.create_batch(
@@ -190,6 +187,8 @@ def prepare_category_batch(
             price_bin=task.filters.price_bin,
             manifest_path=storage.manifest_path,
             started_at=started_at,
+            platform=task.platform,
+            config_snapshot=task.model_dump(mode="json"),
         )
     except Exception as error:
         # 数据库批次未创建时只能终止 Manifest，不能伪造 SQLite 终态。
@@ -221,7 +220,7 @@ def prepare_category_batch(
                 category="interrupted",
             )
         # 分类接口只使用三个已确认的固定业务参数。
-        category_response = client.get_category_tree(build_category_request_params())
+        category_response = client.discover_scopes(task)
         # 完整响应只写入 runtime，不进入仓库 Fixture、日志或 Manifest。
         category_tree_path = storage.write_category_tree(category_response.payload)
         database.record_category_tree_raw(
@@ -239,7 +238,7 @@ def prepare_category_batch(
                 category="interrupted",
             )
         # 所有一级分类和目标三级分类只从当次 data.cate_list 动态解析。
-        discovery = parse_category_tree(category_response.payload)
+        discovery = category_response.discovery
         # 一级分类数量从发现结果去重得到，不制造虚假的批次根节点。
         level1_category_count = len(
             {category.level1_category_id for category in discovery.categories}
@@ -301,6 +300,15 @@ def prepare_category_batch(
             category_run_plans=category_run_plans,
         )
     except CollectorError as error:
+        # 适配器范围校验失败仍保留当次树，禁止创建任何待采分类。
+        if error.discovery_payload is not None:
+            category_tree_path = storage.write_category_tree(error.discovery_payload)
+            database.record_category_tree_raw(
+                batch_id=batch_id, category_tree_raw_path=category_tree_path
+            )
+            storage.record_category_tree_saved(
+                category_tree_path, captured_at=datetime.now(SHANGHAI_TIMEZONE)
+            )
         _finish_failed_batch(
             database=database,
             storage=storage,

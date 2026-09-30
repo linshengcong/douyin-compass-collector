@@ -100,7 +100,7 @@ def test_disabled_oss_skips_upload_without_creating_an_sdk_client(tmp_path: Path
     assert uploader.upload_csv(
         csv_path=csv_path,
         business_date=date(2026, 7, 17),
-        task_id="product_hot_sale_all_level3",
+        task_id="compass_household_cleaning_realtime",
         batch_id="a" * 32,
     ) is None
 
@@ -116,7 +116,7 @@ def test_enabled_oss_uploads_private_csv_and_generates_seven_day_url(tmp_path: P
     result = uploader.upload_csv(
         csv_path=csv_path,
         business_date=date(2026, 7, 17),
-        task_id="product_hot_sale_all_level3",
+        task_id="compass_household_cleaning_realtime",
         batch_id="a" * 32,
     )
 
@@ -124,7 +124,7 @@ def test_enabled_oss_uploads_private_csv_and_generates_seven_day_url(tmp_path: P
     assert result.download_url.endswith("signature=fake")
     upload_request, uploaded_path = client.upload_calls[0]
     assert upload_request.key == (
-        "compass/2026-07-17/product_hot_sale_all_level3/"
+        "compass/compass/2026-07-17/compass_household_cleaning_realtime/"
         f"{'a' * 32}/{csv_path.name}"
     )
     assert uploaded_path == str(csv_path)
@@ -181,7 +181,7 @@ def test_upload_failure_keeps_provider_details_out_of_the_error(tmp_path: Path) 
         uploader.upload_csv(
             csv_path=csv_path,
             business_date=date(2026, 7, 17),
-            task_id="product_hot_sale_all_level3",
+            task_id="compass_household_cleaning_realtime",
             batch_id="a" * 32,
         )
 

@@ -1,6 +1,7 @@
 """Conservative date-based cleanup for disposable runtime material."""
 
 import shutil
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -60,7 +61,7 @@ def cleanup_dated_directories(root: Path, cutoff: date) -> tuple[int, int]:
     # 删除数量与失败数量独立统计，清理失败不阻断采集。
     deleted_count = 0
     failure_count = 0
-    if not root.exists():
+    if not root.exists() or root.is_symlink():
         return deleted_count, failure_count
     for candidate in root.iterdir():
         # 非日期目录和符号链接永远不由自动清理处理。
@@ -86,11 +87,13 @@ def cleanup_log_files(root: Path, cutoff: date) -> tuple[int, int]:
     # 删除数量与失败数量独立统计，避免单文件权限问题阻断采集。
     deleted_count = 0
     failure_count = 0
-    if not root.exists():
+    if not root.exists() or root.is_symlink():
         return deleted_count, failure_count
     for candidate in root.iterdir():
         # 只有约定扩展名的日期日志参与自动清理。
-        candidate_date = parse_date_name(candidate.stem) if candidate.suffix == ".jsonl" else None
+        candidate_date = (
+            parse_date_name(candidate.stem) if candidate.suffix == ".jsonl" else None
+        )
         if (
             candidate_date is None
             or candidate_date >= cutoff
@@ -122,7 +125,7 @@ def cleanup_runtime(
         current_time.date(), config.failure_artifact_days
     )
     log_cutoff = oldest_retained_date(current_time.date(), config.log_days)
-    # 原始响应只删除 raw 下的日期一级目录。
+    # 同时处理历史日期目录和新平台下日期目录，不遍历任意子目录。
     raw_deleted, raw_failures = cleanup_dated_directories(
         runtime_root / "raw", raw_cutoff
     )
@@ -130,6 +133,26 @@ def cleanup_runtime(
     artifact_deleted, artifact_failures = cleanup_dated_directories(
         runtime_root / "artifacts", artifact_cutoff
     )
+    for directory, cutoff in (("raw", raw_cutoff), ("artifacts", artifact_cutoff)):
+        # 平台目录只接受安全名称，符号链接永远不参与自动清理。
+        root = runtime_root / directory
+        if not root.is_dir() or root.is_symlink():
+            continue
+        for platform in root.iterdir():
+            if (
+                not platform.is_dir()
+                or platform.is_symlink()
+                or re.fullmatch(r"[a-z][a-z0-9_-]*", platform.name) is None
+                or parse_date_name(platform.name) is not None
+            ):
+                continue
+            deleted, failures = cleanup_dated_directories(platform, cutoff)
+            if directory == "raw":
+                raw_deleted += deleted
+                raw_failures += failures
+            else:
+                artifact_deleted += deleted
+                artifact_failures += failures
     # 日志只删除 logs 下的按日 JSONL 文件。
     log_deleted, log_failures = cleanup_log_files(runtime_root / "logs", log_cutoff)
     return CleanupSummary(
@@ -138,4 +161,3 @@ def cleanup_runtime(
         log_files=log_deleted,
         failures=raw_failures + artifact_failures + log_failures,
     )
-

@@ -2,7 +2,7 @@
 
 import pytest
 
-from compass_collector.product_rank import calculate_pagination_plan
+from compass_collector.platforms.compass_product_rank import calculate_pagination_plan
 
 
 @pytest.mark.parametrize(

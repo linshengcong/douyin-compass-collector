@@ -7,7 +7,7 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from compass_collector.browser import BrowserSession, open_browser
+from compass_collector.browser import BrowserSession
 from compass_collector.category_batch import (
     BatchMode as CollectionBatchMode,
     prepare_category_batch,
@@ -24,7 +24,8 @@ from compass_collector.errors import (
     PublicationError,
 )
 from compass_collector.exporter import CsvExporter
-from compass_collector.http_client import CompassHttpClient
+from compass_collector.platforms.contracts import PlatformAdapter
+from compass_collector.platforms.registry import create_adapter
 from compass_collector.models import CollectedCategoryBatch, CollectedCategoryRun
 from compass_collector.notifier import (
     BatchMode,
@@ -138,12 +139,21 @@ def build_task_notification_result(
     raw_categories = manifest.get("categories")
     if isinstance(raw_categories, list):
         for raw_category in raw_categories:
-            if not isinstance(raw_category, dict) or raw_category.get("status") != "failed":
+            if (
+                not isinstance(raw_category, dict)
+                or raw_category.get("status") != "failed"
+            ):
                 continue
-            category_names = (
-                raw_category.get("level1_category_name"),
-                raw_category.get("level2_category_name"),
-                raw_category.get("category_name"),
+            # 新分类使用任意深度通用路径，旧 Manifest 继续读三级投影。
+            category_names = raw_category.get("scope_path") or tuple(
+                filter(
+                    None,
+                    (
+                        raw_category.get("level1_category_name"),
+                        raw_category.get("level2_category_name"),
+                        raw_category.get("category_name"),
+                    ),
+                )
             )
             error_category_text = raw_category.get("error_category")
             if not all(isinstance(name, str) and name for name in category_names):
@@ -275,27 +285,33 @@ def prepare_task_plans(
     return task_plans
 
 
-def run_login(config: AppConfig) -> int:
+def run_login(config: AppConfig, platform: str = "compass") -> int:
     """Open the persistent profile for manual login and close on Enter."""
 
     # 登录与采集不能同时打开同一个持久化 Chrome Profile。
-    login_lock = ProcessLock(RUNTIME_ROOT / "locks" / COLLECTION_LOCK_NAME, "collection")
+    login_lock = ProcessLock(
+        RUNTIME_ROOT / "locks" / COLLECTION_LOCK_NAME, "collection"
+    )
     with login_lock:
         # 登录命令仅管理 Chrome，不创建 HTTP 客户端或数据库。
-        browser_session = open_browser(config.browser)
+        # 登录导航由平台决定，共享入口不包含平台 URL。
+        adapter = create_adapter(
+            platform, config.browser_for(platform), config.collection, manual=True
+        )
         try:
-            browser_session.wait_for_manual_exit(
-                "Chrome 已打开。完成登录和检查后，按 Enter 关闭浏览器\n"
+            adapter.open_session(login_only=True)
+            adapter.session.wait_for_manual_exit(
+                "Chrome 已打开。完成登录后，按 Enter 关闭浏览器\n"
             )
         finally:
-            browser_session.close()
+            adapter.close()
     return 0
 
 
 def collect_task(
     plan: TaskExecutionPlan,
     config: AppConfig,
-    client: CompassHttpClient,
+    client: PlatformAdapter,
     runtime_logger: RuntimeLogger,
     batch_id: str,
     control: CollectionControl | None = None,
@@ -318,7 +334,7 @@ def collect_task(
         runtime_logger=runtime_logger,
         control=control,
     )
-    # 同一个 HTTP 客户端继续按共享全局节流采集全部动态三级分类分页。
+    # 同一适配器在创建它的线程中串行操作页面和分页。
     return collect_category_batch(
         prepared_batch=prepared_batch,
         task=plan.task,
@@ -365,6 +381,8 @@ def _record_precollection_terminal(
         business_date=plan.business_date,
         planned_at=plan.planned_at,
         mode=mode,
+        platform=plan.task.platform,
+        config_snapshot=plan.task.model_dump(mode="json"),
         started_at=started_at,
     )
     database.create_batch(
@@ -373,6 +391,8 @@ def _record_precollection_terminal(
         business_date=plan.business_date,
         planned_at=plan.planned_at,
         mode=mode,
+        platform=plan.task.platform,
+        config_snapshot=plan.task.model_dump(mode="json"),
         brand_type=plan.task.filters.brand_type,
         price_bin=plan.task.filters.price_bin,
         manifest_path=storage.manifest_path,
@@ -423,7 +443,7 @@ def record_missing_auth(
         error_category="auth_required",
         failed_step="read_authentication",
         exception_type="AuthRequiredError",
-        safe_endpoint_path=plan.task.rank.endpoint_path,
+        safe_endpoint_path=None,
     )
 
 
@@ -457,10 +477,7 @@ def record_auth_required_plans(
         runtime_logger.emit(
             level="ERROR",
             event="authentication_required",
-            message=(
-                f"[{plan.task.id}] 未找到可用的白名单认证状态，"
-                "本批次任务已阻断"
-            ),
+            message=(f"[{plan.task.id}] 浏览器登录或验证状态不可用，本批次任务已阻断"),
             stage="authentication",
             context=auth_log_context,
             details={
@@ -491,9 +508,7 @@ def record_browser_failure(
         error_category=error.category,
         failed_step=error.failed_step,
         exception_type=error.exception_type,
-        safe_endpoint_path=(
-            error.safe_page_path or plan.task.rank.endpoint_path
-        ),
+        safe_endpoint_path=(error.safe_page_path),
     )
     try:
         # 浏览器专用诊断覆盖通用 failure.json，并原子保存可用截图。
@@ -525,8 +540,7 @@ def _successful_item_count(collected_batch: CollectedCategoryBatch) -> int:
     """Count only entries belonging to fully successful category runs."""
 
     return sum(
-        len(category_run.entries)
-        for category_run in collected_batch.category_runs
+        len(category_run.entries) for category_run in collected_batch.category_runs
     )
 
 
@@ -597,6 +611,7 @@ def _publish_website_after_collection(
     oss_uploader: OssUploader,
     execution_batch_id: str,
     runtime_logger: RuntimeLogger,
+    primary_task_id: str = "compass_household_cleaning_realtime",
 ) -> None:
     """Publish the latest public website snapshot after the CSV summary is delivered."""
 
@@ -606,11 +621,15 @@ def _publish_website_after_collection(
     publisher = WebPublisher.from_environment(oss_uploader, runtime_root=RUNTIME_ROOT)
     if not publisher.settings.enabled:
         return
+    # 只有主任务上传成功才宣布现有单任务网站已更新。
+    primary_published = False
     for candidate in candidates:
         try:
             publication = publisher.publish(
                 csv_path=candidate.csv_path,
                 task_id=candidate.task.id,
+                platform=candidate.task.platform,
+                update_legacy_index=candidate.task.id == primary_task_id,
                 batch_id=candidate.batch_id,
                 business_date=candidate.collected_batch.business_date,
                 published_at=candidate.published_at,
@@ -640,8 +659,11 @@ def _publish_website_after_collection(
                 site_url=None,
                 error_category=error.category,
             )
-            return
+            continue
         if publication is not None:
+            primary_published = (
+                primary_published or candidate.task.id == primary_task_id
+            )
             _safe_emit(
                 runtime_logger,
                 level="INFO",
@@ -654,6 +676,8 @@ def _publish_website_after_collection(
                 ),
                 details={"uploaded": True},
             )
+    if not primary_published:
+        return
     deployer = VercelDeployer.from_environment()
     # 静态托管无需在每批数据上传后重新构建；直接通知固定公开入口。
     if not deployer.settings.enabled and publisher.settings.site_url is not None:
@@ -794,6 +818,7 @@ def _run_collection_unlocked(
         )
         deliver_batch_notification(summary, runtime_logger)
         notification_sent = True
+
     # 保留清理在新运行材料创建前执行，且不触碰数据库、CSV 和 Profile。
     cleanup_summary = cleanup_runtime(RUNTIME_ROOT, config.retention)
     runtime_logger.emit(
@@ -840,315 +865,151 @@ def _run_collection_unlocked(
                 send_batch_notification_once()
             return 0
         # 每个顶层 TaskExecutionPlan 预分配独立 collection batch ID。
-        task_batch_ids = {
-            plan.task.id: uuid4().hex
-            for plan in task_plans
-        }
+        task_batch_ids = {plan.task.id: uuid4().hex for plan in task_plans}
         # 手动 run 的 Chrome 在本次命令中统一复用。
         browser_session: BrowserSession | None = None
-        # HTTP 客户端可能在登录态检查失败前尚未创建。
-        http_client: CompassHttpClient | None = None
+        # 每个平台独立会话，任务只顺序操作各自适配器。
+        adapters: dict[str, PlatformAdapter] = {}
         # active_task 精确标记 KeyboardInterrupt 发生时正在处理的顶层任务。
         active_task: TaskConfig | None = None
         # 任何任务失败都让 CLI 返回非零状态。
         has_failures = False
         try:
-            browser_session = open_browser(config.browser)
-            # 运行时仅读取白名单内且对目标 API 适用的 Cookie。
-            cookies = browser_session.whitelisted_cookies(config.auth.cookie_names)
-            runtime_logger.emit(
-                level="INFO",
-                event="authentication_loaded",
-                message=f"已从当前 Profile 读取 {len(cookies)} 项白名单认证状态",
-                stage="authentication",
-                details={"authentication_item_count": len(cookies)},
-            )
-            if not cookies:
-                # 鉴权缺失为每个顶层任务写入独立 auth_required 批次。
-                blocked_storages = record_auth_required_plans(
-                    task_plans,
-                    database=database,
-                    runtime_logger=runtime_logger,
-                    batch_ids=task_batch_ids,
-                    mode=collection_mode,
-                )
-                for blocked_plan in task_plans:
-                    task_results[blocked_plan.task.id] = build_task_notification_result(
-                        blocked_plan.task,
-                        TaskNotificationStatus.AUTH_REQUIRED,
-                        storage=blocked_storages[blocked_plan.task.id],
-                        error_category="auth_required",
+            # CSV 展示层只在正式发布路径使用。
+            csv_exporter = CsvExporter(RUNTIME_ROOT / "exports")
+            for plan_index, plan in enumerate(task_plans):
+                # 认证阻断只跳过同平台的后续任务，其他平台可以继续执行。
+                if (
+                    task_results[plan.task.id].status
+                    is TaskNotificationStatus.AUTH_REQUIRED
+                ):
+                    continue
+                if plan.task.platform not in adapters:
+                    adapters[plan.task.platform] = create_adapter(
+                        plan.task.platform,
+                        config.browser_for(plan.task.platform),
+                        config.collection,
+                        manual=manual,
+                        control=control,
                     )
-                runtime_logger.emit(
-                    level="ERROR",
-                    event="authentication_batch_blocked",
-                    message="未找到可用的白名单认证状态，请先在当前 Chrome 中登录",
-                    stage="authentication",
-                )
-                has_failures = True
-            else:
-                # User-Agent 从当前正式版 Chrome 动态读取。
-                user_agent = browser_session.user_agent()
-                # 统一 HTTP 节流在 GUI 中可被协作式中止。
-                delay_waiter = control.wait_for_delay if control is not None else None
-                http_client = CompassHttpClient(
-                    config.http,
-                    cookies,
-                    user_agent,
-                    wait_for_delay=delay_waiter,
-                )
-                # CSV 展示层只在正式发布路径使用。
-                csv_exporter = CsvExporter(RUNTIME_ROOT / "exports")
-                for plan_index, plan in enumerate(task_plans):
-                    # 当前计划在提交后边界中断时不得误标下一个未启动任务。
-                    active_task = plan.task
-                    # 当前顶层任务所有日志、raw、SQLite 和 Manifest 共用该 ID。
-                    task_batch_id = task_batch_ids[plan.task.id]
-                    try:
-                        collected_batch = collect_task(
-                            plan,
-                            config,
-                            http_client,
-                            runtime_logger,
-                            task_batch_id,
-                            control,
-                            database=database,
-                            mode=collection_mode,
-                        )
-                    except (
-                        CategoryBatchPreparationError,
-                        CategoryBatchCollectionError,
-                    ) as task_error:
-                        has_failures = True
-                        # 采集阶段终止时只统计已完整成功的分类结果。
-                        completed_category_runs = (
-                            task_error.completed_category_runs
-                            if isinstance(task_error, CategoryBatchCollectionError)
-                            else ()
-                        )
-                        if isinstance(task_error.cause, CollectionInterruptedError):
-                            task_results[plan.task.id] = build_task_notification_result(
-                                plan.task,
-                                TaskNotificationStatus.INTERRUPTED,
-                                storage=task_error.storage,
-                                category_runs=completed_category_runs,
-                                error_category="interrupted",
-                            )
-                            runtime_logger.emit(
-                                level="WARNING",
-                                event="batch_interrupted",
-                                message="已中止本次采集，未发布不完整数据",
-                                stage="collection",
-                                context=LogContext(
-                                    batch_id=task_batch_id,
-                                    task_id=plan.task.id,
-                                ),
-                                details={"error_category": "interrupted"},
-                            )
-                            break
-                        if isinstance(task_error.cause, AuthRequiredError):
-                            task_results[plan.task.id] = build_task_notification_result(
-                                plan.task,
-                                TaskNotificationStatus.AUTH_REQUIRED,
-                                storage=task_error.storage,
-                                category_runs=completed_category_runs,
-                                error_category="auth_required",
-                            )
-                            runtime_logger.emit(
-                                level="ERROR",
-                                event="authentication_expired",
-                                message="登录态失效，本次运行停止后续任务",
-                                stage="authentication",
-                                context=LogContext(
-                                    batch_id=task_batch_id,
-                                    task_id=plan.task.id,
-                                ),
-                                details={"error_category": "auth_required"},
-                            )
-                            # 后续同批次任务不再请求接口，并写入阻断终态。
-                            blocked_plans = task_plans[plan_index + 1 :]
-                            blocked_storages = record_auth_required_plans(
-                                blocked_plans,
-                                database=database,
-                                runtime_logger=runtime_logger,
-                                batch_ids=task_batch_ids,
-                                mode=collection_mode,
-                            )
-                            for blocked_plan in blocked_plans:
-                                task_results[blocked_plan.task.id] = (
-                                    build_task_notification_result(
-                                        blocked_plan.task,
-                                        TaskNotificationStatus.AUTH_REQUIRED,
-                                        storage=blocked_storages[
-                                            blocked_plan.task.id
-                                        ],
-                                        error_category="auth_required",
-                                    )
-                                )
-                            break
+                # 共享编排不接触页面对象，适配器只在 discover_scopes 中打开 Chrome。
+                adapter = adapters[plan.task.platform]
+                # 当前计划在提交后边界中断时不得误标下一个未启动任务。
+                active_task = plan.task
+                # 当前顶层任务所有日志、raw、SQLite 和 Manifest 共用该 ID。
+                task_batch_id = task_batch_ids[plan.task.id]
+                try:
+                    collected_batch = collect_task(
+                        plan,
+                        config,
+                        adapter,
+                        runtime_logger,
+                        task_batch_id,
+                        control,
+                        database=database,
+                        mode=collection_mode,
+                    )
+                except (
+                    CategoryBatchPreparationError,
+                    CategoryBatchCollectionError,
+                ) as task_error:
+                    has_failures = True
+                    # 采集阶段终止时只统计已完整成功的分类结果。
+                    completed_category_runs = (
+                        task_error.completed_category_runs
+                        if isinstance(task_error, CategoryBatchCollectionError)
+                        else ()
+                    )
+                    if isinstance(task_error.cause, CollectionInterruptedError):
                         task_results[plan.task.id] = build_task_notification_result(
                             plan.task,
-                            TaskNotificationStatus.FAILED,
+                            TaskNotificationStatus.INTERRUPTED,
                             storage=task_error.storage,
                             category_runs=completed_category_runs,
-                            error_category=task_error.cause.category,
+                            error_category="interrupted",
                         )
-                        continue
-                    if dry_run:
-                        try:
-                            # dry-run 只终结审计批次，不写商品正式表、CSV 或版本。
-                            dry_run_snapshot = database.finalize_dry_run(
-                                collected_batch,
-                                finished_at=datetime.now(SHANGHAI_TIMEZONE),
-                            )
-                            # 成功结果赋值必须留在中断保护区内，覆盖提交后的返回边界。
-                            task_results[plan.task.id] = _build_committed_task_result(
-                                task=plan.task,
-                                collected_batch=collected_batch,
-                                snapshot=dry_run_snapshot,
-                            )
-                        except Exception as error:
-                            # 发布层未知异常统一转换为稳定安全分类。
-                            publication_error = (
-                                error
-                                if isinstance(error, PublicationError)
-                                else PublicationError(
-                                    "Unexpected dry-run finalization failure",
-                                    category="publication_internal",
-                                )
-                            )
-                            _finish_unpublished_batch(
-                                collected_batch=collected_batch,
-                                database=database,
-                                error=publication_error,
-                                exception_type=type(error).__name__,
-                                status="failed",
-                            )
-                            has_failures = True
-                            task_results[plan.task.id] = build_task_notification_result(
-                                plan.task,
-                                TaskNotificationStatus.FAILED,
-                                storage=collected_batch.storage,
-                                category_runs=collected_batch.category_runs,
-                                error_category=publication_error.category,
-                            )
-                            continue
-                        except BaseException as error:
-                            # authoritative_snapshot 区分提交前中止和提交后返回边界中止。
-                            authoritative_snapshot = database.collection_snapshot(
-                                collected_batch.batch_id
-                            )
-                            if authoritative_snapshot.status in {
-                                "success",
-                                "partial_success",
-                            }:
-                                task_results[plan.task.id] = (
-                                    _build_committed_task_result(
-                                        task=plan.task,
-                                        collected_batch=collected_batch,
-                                        snapshot=authoritative_snapshot,
-                                    )
-                                )
-                                # 已提交成功只能保留权威结果，禁止反向 terminate。
-                                raise
-                            # interruption_error 将提交前中止映射为稳定审计终态。
-                            interruption_error = CollectionInterruptedError(
-                                "Dry-run finalization interrupted",
-                                category="interrupted",
-                            )
-                            _finish_unpublished_batch(
-                                collected_batch=collected_batch,
-                                database=database,
-                                error=interruption_error,
-                                exception_type=type(error).__name__,
-                                status="interrupted",
-                            )
-                            task_results[plan.task.id] = (
-                                build_task_notification_result(
-                                    plan.task,
-                                    TaskNotificationStatus.INTERRUPTED,
-                                    storage=collected_batch.storage,
-                                    category_runs=collected_batch.category_runs,
-                                    error_category="interrupted",
-                                )
-                            )
-                            # 外层保留 KeyboardInterrupt/SystemExit 行为并发送汇总通知。
-                            raise
-                        # dry_run_partial 仅控制成功日志级别和展示文案。
-                        dry_run_partial = dry_run_snapshot.status == "partial_success"
-                        try:
-                            _sync_collection_snapshot(
-                                collected_batch.storage,
-                                dry_run_snapshot,
-                            )
-                        except Exception:
-                            # SQLite 已形成成功终态，Manifest 差异留给恢复流程处理。
-                            _safe_emit(
-                                runtime_logger,
-                                level="ERROR",
-                                event="manifest_sync_failed",
-                                message=f"[{plan.task.id}] dry-run Manifest 同步失败",
-                                stage="publication",
-                                context=LogContext(
-                                    batch_id=task_batch_id,
-                                    task_id=plan.task.id,
-                                ),
-                                details={"error_category": "manifest_sync_failed"},
-                            )
-                        _safe_emit(
-                            runtime_logger,
-                            level="WARNING" if dry_run_partial else "INFO",
-                            event="dry_run_succeeded",
-                            message=(
-                                f"[{plan.task.id}] dry-run 通过，"
-                                f"已校验 {_successful_item_count(collected_batch)} 条，"
-                                f"失败分类 {collected_batch.failed_category_count} 个，"
-                                "未写入正式商品表/CSV"
-                            ),
-                            stage="publication",
+                        runtime_logger.emit(
+                            level="WARNING",
+                            event="batch_interrupted",
+                            message="已中止本次采集，未发布不完整数据",
+                            stage="collection",
                             context=LogContext(
                                 batch_id=task_batch_id,
                                 task_id=plan.task.id,
                             ),
-                            details={
-                                "dry_run": True,
-                                "batch_status": dry_run_snapshot.status,
-                                "saved_items": _successful_item_count(
-                                    collected_batch
-                                ),
-                            },
+                            details={"error_category": "interrupted"},
                         )
+                        break
+                    if isinstance(task_error.cause, AuthRequiredError):
+                        task_results[plan.task.id] = build_task_notification_result(
+                            plan.task,
+                            TaskNotificationStatus.AUTH_REQUIRED,
+                            storage=task_error.storage,
+                            category_runs=completed_category_runs,
+                            error_category="auth_required",
+                        )
+                        runtime_logger.emit(
+                            level="ERROR",
+                            event="authentication_expired",
+                            message="登录态失效，本次运行停止后续任务",
+                            stage="authentication",
+                            context=LogContext(
+                                batch_id=task_batch_id,
+                                task_id=plan.task.id,
+                            ),
+                            details={"error_category": "auth_required"},
+                        )
+                        # 后续同批次任务不再请求接口，并写入阻断终态。
+                        blocked_plans = [
+                            pending
+                            for pending in task_plans[plan_index + 1 :]
+                            if pending.task.platform == plan.task.platform
+                        ]
+                        blocked_storages = record_auth_required_plans(
+                            blocked_plans,
+                            database=database,
+                            runtime_logger=runtime_logger,
+                            batch_ids=task_batch_ids,
+                            mode=collection_mode,
+                        )
+                        for blocked_plan in blocked_plans:
+                            task_results[blocked_plan.task.id] = (
+                                build_task_notification_result(
+                                    blocked_plan.task,
+                                    TaskNotificationStatus.AUTH_REQUIRED,
+                                    storage=blocked_storages[blocked_plan.task.id],
+                                    error_category="auth_required",
+                                )
+                            )
                         continue
+                    task_results[plan.task.id] = build_task_notification_result(
+                        plan.task,
+                        TaskNotificationStatus.FAILED,
+                        storage=task_error.storage,
+                        category_runs=completed_category_runs,
+                        error_category=task_error.cause.category,
+                    )
+                    continue
+                if dry_run:
                     try:
-                        # CSV 先写完临时文件，正式文件由数据库事务内发布。
-                        staged_csv = csv_exporter.prepare(
-                            task_id=plan.task.id,
-                            display_name=plan.task.display_name,
-                            planned_at=plan.planned_at,
-                            version=plan.version,
-                            batch_id=collected_batch.batch_id,
-                            category_runs=collected_batch.category_runs,
-                        )
-                        # 数据库记录和 CSV 原子替换作为一次协调发布。
-                        publication_result = database.publish_collected_batch(
+                        # dry-run 只终结审计批次，不写商品正式表、CSV 或版本。
+                        dry_run_snapshot = database.finalize_dry_run(
                             collected_batch,
-                            version=plan.version,
-                            staged_csv=staged_csv,
-                            published_at=datetime.now(SHANGHAI_TIMEZONE),
+                            finished_at=datetime.now(SHANGHAI_TIMEZONE),
                         )
                         # 成功结果赋值必须留在中断保护区内，覆盖提交后的返回边界。
                         task_results[plan.task.id] = _build_committed_task_result(
                             task=plan.task,
                             collected_batch=collected_batch,
-                            snapshot=publication_result.snapshot,
+                            snapshot=dry_run_snapshot,
                         )
                     except Exception as error:
-                        # CSV 或事务失败不允许留下 running 批次。
+                        # 发布层未知异常统一转换为稳定安全分类。
                         publication_error = (
                             error
                             if isinstance(error, PublicationError)
                             else PublicationError(
-                                "Unexpected collection publication failure",
+                                "Unexpected dry-run finalization failure",
                                 category="publication_internal",
                             )
                         )
@@ -1158,26 +1019,6 @@ def _run_collection_unlocked(
                             error=publication_error,
                             exception_type=type(error).__name__,
                             status="failed",
-                        )
-                        _safe_emit(
-                            runtime_logger,
-                            level="ERROR",
-                            event="publication_failed",
-                            message=(
-                                f"[{plan.task.id}] 发布失败，"
-                                f"category={publication_error.category}"
-                            ),
-                            stage="publication",
-                            context=LogContext(
-                                batch_id=task_batch_id,
-                                task_id=plan.task.id,
-                            ),
-                            details={
-                                "error_category": publication_error.category,
-                                "artifact_path": str(
-                                    collected_batch.storage.artifact_dir
-                                ),
-                            },
                         )
                         has_failures = True
                         task_results[plan.task.id] = build_task_notification_result(
@@ -1189,7 +1030,7 @@ def _run_collection_unlocked(
                         )
                         continue
                     except BaseException as error:
-                        # authoritative_snapshot 防止提交后返回边界中止被反向收口。
+                        # authoritative_snapshot 区分提交前中止和提交后返回边界中止。
                         authoritative_snapshot = database.collection_snapshot(
                             collected_batch.batch_id
                         )
@@ -1202,11 +1043,11 @@ def _run_collection_unlocked(
                                 collected_batch=collected_batch,
                                 snapshot=authoritative_snapshot,
                             )
-                            # SQLite 已正式发布时保留 CSV 和成功通知，禁止 terminate。
+                            # 已提交成功只能保留权威结果，禁止反向 terminate。
                             raise
-                        # interruption_error 将进程级中止映射为稳定的本地终态分类。
+                        # interruption_error 将提交前中止映射为稳定审计终态。
                         interruption_error = CollectionInterruptedError(
-                            "Collection publication interrupted",
+                            "Dry-run finalization interrupted",
                             category="interrupted",
                         )
                         _finish_unpublished_batch(
@@ -1223,26 +1064,22 @@ def _run_collection_unlocked(
                             category_runs=collected_batch.category_runs,
                             error_category="interrupted",
                         )
-                        # 外层保留 KeyboardInterrupt/SystemExit 行为并统一发送汇总通知。
+                        # 外层保留 KeyboardInterrupt/SystemExit 行为并发送汇总通知。
                         raise
-                    # partial_success 只控制正式发布日志级别和文案。
-                    partial_success = (
-                        publication_result.snapshot.status == "partial_success"
-                    )
-                    # published_batch 保存正式版本和 CSV 路径供日志展示。
-                    published_batch = publication_result.published_batch
-                    # SQLite 已正式发布后，Manifest 同步失败不能反向撤销 CSV。
+                    # dry_run_partial 仅控制成功日志级别和展示文案。
+                    dry_run_partial = dry_run_snapshot.status == "partial_success"
                     try:
                         _sync_collection_snapshot(
                             collected_batch.storage,
-                            publication_result.snapshot,
+                            dry_run_snapshot,
                         )
                     except Exception:
+                        # SQLite 已形成成功终态，Manifest 差异留给恢复流程处理。
                         _safe_emit(
                             runtime_logger,
                             level="ERROR",
                             event="manifest_sync_failed",
-                            message=f"[{plan.task.id}] 发布后 Manifest 同步失败",
+                            message=f"[{plan.task.id}] dry-run Manifest 同步失败",
                             stage="publication",
                             context=LogContext(
                                 batch_id=task_batch_id,
@@ -1252,12 +1089,13 @@ def _run_collection_unlocked(
                         )
                     _safe_emit(
                         runtime_logger,
-                        level="WARNING" if partial_success else "INFO",
-                        event="publication_succeeded",
+                        level="WARNING" if dry_run_partial else "INFO",
+                        event="dry_run_succeeded",
                         message=(
-                            f"[{plan.task.id}] 已发布 v{published_batch.version}，"
+                            f"[{plan.task.id}] dry-run 通过，"
+                            f"已校验 {_successful_item_count(collected_batch)} 条，"
                             f"失败分类 {collected_batch.failed_category_count} 个，"
-                            f"CSV={published_batch.csv_path}"
+                            "未写入正式商品表/CSV"
                         ),
                         stage="publication",
                         context=LogContext(
@@ -1265,20 +1103,199 @@ def _run_collection_unlocked(
                             task_id=plan.task.id,
                         ),
                         details={
-                            "batch_status": publication_result.snapshot.status,
-                            "version": published_batch.version,
-                            "csv_path": str(published_batch.csv_path),
+                            "dry_run": True,
+                            "batch_status": dry_run_snapshot.status,
+                            "saved_items": _successful_item_count(collected_batch),
                         },
                     )
-                    # 正式 CSV 已由 SQLite 协调发布后才允许上传；上传失败不回滚业务发布。
-                    try:
-                        oss_upload = oss_uploader.upload_csv(
-                            csv_path=published_batch.csv_path,
-                            business_date=plan.business_date,
-                            task_id=plan.task.id,
-                            batch_id=published_batch.batch_id,
+                    continue
+                try:
+                    # CSV 先写完临时文件，正式文件由数据库事务内发布。
+                    staged_csv = csv_exporter.prepare(
+                        task_id=plan.task.id,
+                        display_name=plan.task.display_name,
+                        planned_at=plan.planned_at,
+                        version=plan.version,
+                        batch_id=collected_batch.batch_id,
+                        category_runs=collected_batch.category_runs,
+                        platform=plan.task.platform,
+                    )
+                    # 数据库记录和 CSV 原子替换作为一次协调发布。
+                    publication_result = database.publish_collected_batch(
+                        collected_batch,
+                        version=plan.version,
+                        staged_csv=staged_csv,
+                        published_at=datetime.now(SHANGHAI_TIMEZONE),
+                    )
+                    # 成功结果赋值必须留在中断保护区内，覆盖提交后的返回边界。
+                    task_results[plan.task.id] = _build_committed_task_result(
+                        task=plan.task,
+                        collected_batch=collected_batch,
+                        snapshot=publication_result.snapshot,
+                    )
+                except Exception as error:
+                    # CSV 或事务失败不允许留下 running 批次。
+                    publication_error = (
+                        error
+                        if isinstance(error, PublicationError)
+                        else PublicationError(
+                            "Unexpected collection publication failure",
+                            category="publication_internal",
                         )
-                    except OssUploadError as error:
+                    )
+                    _finish_unpublished_batch(
+                        collected_batch=collected_batch,
+                        database=database,
+                        error=publication_error,
+                        exception_type=type(error).__name__,
+                        status="failed",
+                    )
+                    _safe_emit(
+                        runtime_logger,
+                        level="ERROR",
+                        event="publication_failed",
+                        message=(
+                            f"[{plan.task.id}] 发布失败，"
+                            f"category={publication_error.category}"
+                        ),
+                        stage="publication",
+                        context=LogContext(
+                            batch_id=task_batch_id,
+                            task_id=plan.task.id,
+                        ),
+                        details={
+                            "error_category": publication_error.category,
+                            "artifact_path": str(collected_batch.storage.artifact_dir),
+                        },
+                    )
+                    has_failures = True
+                    task_results[plan.task.id] = build_task_notification_result(
+                        plan.task,
+                        TaskNotificationStatus.FAILED,
+                        storage=collected_batch.storage,
+                        category_runs=collected_batch.category_runs,
+                        error_category=publication_error.category,
+                    )
+                    continue
+                except BaseException as error:
+                    # authoritative_snapshot 防止提交后返回边界中止被反向收口。
+                    authoritative_snapshot = database.collection_snapshot(
+                        collected_batch.batch_id
+                    )
+                    if authoritative_snapshot.status in {
+                        "success",
+                        "partial_success",
+                    }:
+                        task_results[plan.task.id] = _build_committed_task_result(
+                            task=plan.task,
+                            collected_batch=collected_batch,
+                            snapshot=authoritative_snapshot,
+                        )
+                        # SQLite 已正式发布时保留 CSV 和成功通知，禁止 terminate。
+                        raise
+                    # interruption_error 将进程级中止映射为稳定的本地终态分类。
+                    interruption_error = CollectionInterruptedError(
+                        "Collection publication interrupted",
+                        category="interrupted",
+                    )
+                    _finish_unpublished_batch(
+                        collected_batch=collected_batch,
+                        database=database,
+                        error=interruption_error,
+                        exception_type=type(error).__name__,
+                        status="interrupted",
+                    )
+                    task_results[plan.task.id] = build_task_notification_result(
+                        plan.task,
+                        TaskNotificationStatus.INTERRUPTED,
+                        storage=collected_batch.storage,
+                        category_runs=collected_batch.category_runs,
+                        error_category="interrupted",
+                    )
+                    # 外层保留 KeyboardInterrupt/SystemExit 行为并统一发送汇总通知。
+                    raise
+                # partial_success 只控制正式发布日志级别和文案。
+                partial_success = (
+                    publication_result.snapshot.status == "partial_success"
+                )
+                # published_batch 保存正式版本和 CSV 路径供日志展示。
+                published_batch = publication_result.published_batch
+                # SQLite 已正式发布后，Manifest 同步失败不能反向撤销 CSV。
+                try:
+                    _sync_collection_snapshot(
+                        collected_batch.storage,
+                        publication_result.snapshot,
+                    )
+                except Exception:
+                    _safe_emit(
+                        runtime_logger,
+                        level="ERROR",
+                        event="manifest_sync_failed",
+                        message=f"[{plan.task.id}] 发布后 Manifest 同步失败",
+                        stage="publication",
+                        context=LogContext(
+                            batch_id=task_batch_id,
+                            task_id=plan.task.id,
+                        ),
+                        details={"error_category": "manifest_sync_failed"},
+                    )
+                _safe_emit(
+                    runtime_logger,
+                    level="WARNING" if partial_success else "INFO",
+                    event="publication_succeeded",
+                    message=(
+                        f"[{plan.task.id}] 已发布 v{published_batch.version}，"
+                        f"失败分类 {collected_batch.failed_category_count} 个，"
+                        f"CSV={published_batch.csv_path}"
+                    ),
+                    stage="publication",
+                    context=LogContext(
+                        batch_id=task_batch_id,
+                        task_id=plan.task.id,
+                    ),
+                    details={
+                        "batch_status": publication_result.snapshot.status,
+                        "version": published_batch.version,
+                        "csv_path": str(published_batch.csv_path),
+                    },
+                )
+                # 正式 CSV 已由 SQLite 协调发布后才允许上传；上传失败不回滚业务发布。
+                try:
+                    oss_upload = oss_uploader.upload_csv(
+                        csv_path=published_batch.csv_path,
+                        business_date=plan.business_date,
+                        task_id=plan.task.id,
+                        batch_id=published_batch.batch_id,
+                        platform=plan.task.platform,
+                    )
+                except OssUploadError as error:
+                    task_results[plan.task.id] = build_task_notification_result(
+                        plan.task,
+                        TaskNotificationStatus.PARTIAL_SUCCESS
+                        if partial_success
+                        else TaskNotificationStatus.SUCCESS,
+                        storage=collected_batch.storage,
+                        category_runs=collected_batch.category_runs,
+                        csv_path=published_batch.csv_path,
+                        oss_error_category=error.category,
+                    )
+                    _safe_emit(
+                        runtime_logger,
+                        level="ERROR",
+                        event="oss_upload_failed",
+                        message=(
+                            f"[{plan.task.id}] CSV 已发布，但 OSS 上传失败，"
+                            f"category={error.category}"
+                        ),
+                        stage="oss_upload",
+                        context=LogContext(
+                            batch_id=task_batch_id,
+                            task_id=plan.task.id,
+                        ),
+                        details={"error_category": error.category},
+                    )
+                else:
+                    if oss_upload is not None:
                         task_results[plan.task.id] = build_task_notification_result(
                             plan.task,
                             TaskNotificationStatus.PARTIAL_SUCCESS
@@ -1287,67 +1304,43 @@ def _run_collection_unlocked(
                             storage=collected_batch.storage,
                             category_runs=collected_batch.category_runs,
                             csv_path=published_batch.csv_path,
-                            oss_error_category=error.category,
+                            csv_download_url=oss_upload.download_url,
                         )
                         _safe_emit(
                             runtime_logger,
-                            level="ERROR",
-                            event="oss_upload_failed",
-                            message=(
-                                f"[{plan.task.id}] CSV 已发布，但 OSS 上传失败，"
-                                f"category={error.category}"
-                            ),
+                            level="INFO",
+                            event="oss_upload_succeeded",
+                            message=f"[{plan.task.id}] CSV 已上传 OSS",
                             stage="oss_upload",
                             context=LogContext(
                                 batch_id=task_batch_id,
                                 task_id=plan.task.id,
                             ),
-                            details={"error_category": error.category},
+                            details={"uploaded": True},
                         )
-                    else:
-                        if oss_upload is not None:
-                            task_results[plan.task.id] = build_task_notification_result(
-                                plan.task,
-                                TaskNotificationStatus.PARTIAL_SUCCESS
-                                if partial_success
-                                else TaskNotificationStatus.SUCCESS,
-                                storage=collected_batch.storage,
-                                category_runs=collected_batch.category_runs,
-                                csv_path=published_batch.csv_path,
-                                csv_download_url=oss_upload.download_url,
-                            )
-                            _safe_emit(
-                                runtime_logger,
-                                level="INFO",
-                                event="oss_upload_succeeded",
-                                message=f"[{plan.task.id}] CSV 已上传 OSS",
-                                stage="oss_upload",
-                                context=LogContext(
-                                    batch_id=task_batch_id,
-                                    task_id=plan.task.id,
-                                ),
-                                details={"uploaded": True},
-                            )
-                    # 无论私有 CSV 上传是否成功，正式 CSV 都可独立作为公开网站快照来源。
-                    website_publication_candidates.append(
-                        WebsitePublicationCandidate(
-                            task=plan.task,
-                            collected_batch=collected_batch,
-                            csv_path=published_batch.csv_path,
-                            batch_id=published_batch.batch_id,
-                            published_at=publication_result.snapshot.published_at
-                            or datetime.now(SHANGHAI_TIMEZONE),
-                        )
+                # 无论私有 CSV 上传是否成功，正式 CSV 都可独立作为公开网站快照来源。
+                website_publication_candidates.append(
+                    WebsitePublicationCandidate(
+                        task=plan.task,
+                        collected_batch=collected_batch,
+                        csv_path=published_batch.csv_path,
+                        batch_id=published_batch.batch_id,
+                        published_at=publication_result.snapshot.published_at
+                        or datetime.now(SHANGHAI_TIMEZONE),
                     )
+                )
             # 通知在任务终态形成后立即发送，不等待人工关闭 Chrome。
             send_batch_notification_once()
             # 第二条通知仅在首条采集汇总完成后，反映网页数据和 Vercel 的独立结果。
             _publish_website_after_collection(
                 candidates=website_publication_candidates,
+                primary_task_id=config.publication.web_primary_task_id,
                 oss_uploader=oss_uploader,
                 execution_batch_id=execution_batch_id,
                 runtime_logger=runtime_logger,
             )
+            # 仅最后操作的平台页面用于手动检查，不参与采集数据流。
+            browser_session = getattr(adapter, "session", None) if adapters else None
             if (
                 manual
                 and config.browser.keep_open_after_manual_run
@@ -1456,10 +1449,8 @@ def _run_collection_unlocked(
             )
             send_batch_notification_once()
         finally:
-            if http_client is not None:
-                http_client.close()
-            if browser_session is not None:
-                browser_session.close()
+            for adapter in adapters.values():
+                adapter.close()
         return 1 if has_failures else 0
     finally:
         database.close()
@@ -1557,8 +1548,7 @@ def run_scheduled_collection(
                     level="WARNING",
                     event="scheduled_task_skipped_busy",
                     message=(
-                        f"[{task.id}] Chrome 正被其他任务使用，"
-                        "本次定时采集已跳过"
+                        f"[{task.id}] Chrome 正被其他任务使用，本次定时采集已跳过"
                     ),
                     stage="scheduling",
                     context=LogContext(

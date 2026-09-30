@@ -69,10 +69,14 @@ def load_web_publication_settings() -> WebPublicationSettings:
     # 不配置时保持现有 CSV 私有上传和采集行为不变。
     enabled_text = os.environ.get("WEB_ENABLED", "false").strip().lower()
     if enabled_text not in {"true", "false"}:
-        return WebPublicationSettings(enabled=False, error_category="web_config_invalid")
+        return WebPublicationSettings(
+            enabled=False, error_category="web_config_invalid"
+        )
     if enabled_text == "false":
         return WebPublicationSettings(enabled=False)
-    public_prefix = os.environ.get("WEB_PUBLIC_PREFIX", "compass/web").strip().strip("/")
+    public_prefix = (
+        os.environ.get("WEB_PUBLIC_PREFIX", "compass/web").strip().strip("/")
+    )
     if not public_prefix or WEB_PREFIX_PATTERN.fullmatch(public_prefix) is None:
         return WebPublicationSettings(enabled=True, error_category="web_config_invalid")
     # 空值保留 Vercel 旧链路；非空静态网站地址必须是无凭据 HTTPS URL。
@@ -123,7 +127,9 @@ class WebPublisher:
         self.runtime_root = runtime_root
 
     @classmethod
-    def from_environment(cls, uploader: OssUploader, *, runtime_root: Path) -> "WebPublisher":
+    def from_environment(
+        cls, uploader: OssUploader, *, runtime_root: Path
+    ) -> "WebPublisher":
         """Create a disabled-or-configured publisher without exposing credentials."""
 
         return cls(load_web_publication_settings(), uploader, runtime_root=runtime_root)
@@ -139,27 +145,40 @@ class WebPublisher:
         successful_category_count: int,
         failed_category_count: int,
         item_count: int,
+        platform: str = "compass",
+        update_legacy_index: bool = False,
     ) -> WebPublicationResult | None:
         """Upload versioned CSV/data first and replace the public index last."""
 
         if not self.settings.enabled:
             return None
         if not self.settings.valid:
-            raise WebPublicationError(self.settings.error_category or "web_config_invalid")
+            raise WebPublicationError(
+                self.settings.error_category or "web_config_invalid"
+            )
         if not self.uploader.settings.valid:
             raise WebPublicationError("web_oss_unavailable")
         if not csv_path.is_file() or not re.fullmatch(r"[0-9a-f]{32}", batch_id):
             raise WebPublicationError("web_publication_input_invalid")
 
         # 每次发布使用独立 runtime 目录，便于排查但不进入 Git。
-        staging_directory = self.runtime_root / "web-publication" / batch_id
+        # 平台及任务标识只能作为安全路径段，不能改变公开对象前缀。
+        if not re.fullmatch(r"[a-z][a-z0-9_-]*", platform) or not re.fullmatch(
+            r"[a-z][a-z0-9_]*", task_id
+        ):
+            raise WebPublicationError("web_publication_input_invalid")
+        staging_directory = (
+            self.runtime_root / "web-publication" / platform / task_id / batch_id
+        )
         staging_directory.mkdir(parents=True, exist_ok=True)
         data_path = staging_directory / "data.json.gz"
         index_path = staging_directory / "latest.json"
         records = _read_csv_records(csv_path)
-        data_key = f"{self.settings.public_prefix}/batches/{batch_id}.json.gz"
-        csv_key = f"{self.settings.public_prefix}/batches/{batch_id}.csv"
-        latest_key = f"{self.settings.public_prefix}/latest.json"
+        # 各任务拥有独立索引，非主任务禁止覆盖旧网站根索引。
+        prefix = f"{self.settings.public_prefix}/{platform}/{task_id}"
+        data_key = f"{prefix}/batches/{batch_id}.json.gz"
+        csv_key = f"{prefix}/batches/{batch_id}.csv"
+        latest_key = f"{prefix}/latest.json"
         data_url = self.uploader.public_object_url(data_key)
         csv_url = self.uploader.public_object_url(csv_key)
         index_url = self.uploader.public_object_url(latest_key)
@@ -168,17 +187,21 @@ class WebPublisher:
             "schema_version": WEB_SCHEMA_VERSION,
             "batch_id": batch_id,
             "task_id": task_id,
+            "platform": platform,
             "business_date": business_date.isoformat(),
             "published_at": published_at.isoformat(),
             "records": records,
         }
         with gzip.open(data_path, "wt", encoding="utf-8") as file_handle:
-            json.dump(data_payload, file_handle, ensure_ascii=False, separators=(",", ":"))
+            json.dump(
+                data_payload, file_handle, ensure_ascii=False, separators=(",", ":")
+            )
         # latest.json 不包含业务行，只提供当前快照元信息和公开资源 URL。
         index_payload = {
             "schema_version": WEB_SCHEMA_VERSION,
             "batch_id": batch_id,
             "task_id": task_id,
+            "platform": platform,
             "business_date": business_date.isoformat(),
             "published_at": published_at.isoformat(),
             "successful_category_count": successful_category_count,
@@ -212,6 +235,13 @@ class WebPublisher:
                 content_type="application/json",
                 cache_control="no-store, max-age=0",
             )
+            if update_legacy_index:
+                self.uploader.upload_public_file(
+                    file_path=index_path,
+                    object_key=f"{self.settings.public_prefix}/latest.json",
+                    content_type="application/json",
+                    cache_control="no-store, max-age=0",
+                )
         except OssUploadError as error:
             raise WebPublicationError(error.category) from None
         return WebPublicationResult(

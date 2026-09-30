@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from compass_collector.category_discovery import parse_category_tree
+from compass_collector.platforms.compass_categories import parse_category_tree
 from compass_collector.errors import ResponseContractError
 
 

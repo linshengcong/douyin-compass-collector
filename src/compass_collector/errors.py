@@ -23,6 +23,8 @@ class CollectorError(Exception):
         self.status_code = status_code
         # 失败响应仅供受限本地留档，不进入错误文本。
         self.response_body = response_body
+        # 分类发现错误可携带本地原始树，不向调用者公开请求信息。
+        self.discovery_payload: dict | None = None
 
 
 class AuthRequiredError(CollectorError):

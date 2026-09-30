@@ -29,7 +29,7 @@ def test_documents_use_only_the_current_dynamic_category_contract() -> None:
         "all_level1",
         "排除",
         "忽略四级",
-        "每次任务请求一次分类树",
+        "每次任务保存分类树快照",
         "二级分类 ID 与三级分类 ID",
         "完整请求全部页",
         CURRENT_INTERVAL_LABEL,
@@ -42,8 +42,6 @@ def test_documents_use_only_the_current_dynamic_category_contract() -> None:
     obsolete_markers = (
         "水饮冲调",
         "max_items",
-        "200 条",
-        "200条",
         "collection_runs",
         "不写 SQLite",
         "最近成功 CSV",
@@ -73,7 +71,7 @@ def test_documents_define_dry_run_publication_and_csv_boundaries() -> None:
     assert "category_runs" in readme
     assert "raw_responses" in readme
     assert "published_at" in readme
-    assert "runtime/exports/<YYYY-MM-DD>/<task_id>/" in readme
+    assert "runtime/exports/<platform>/<YYYY-MM-DD>/<task_id>/" in readme
     assert "分类、排名、商品缩略图、商品、店铺名称、用户支付金额、成交件数、首次上榜" in readme
     assert "published_at IS NOT NULL" in design
     assert "dry-run 不写正式商品和店铺记录" in design

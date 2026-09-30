@@ -1,6 +1,7 @@
 """SQLite schema, Alembic upgrades, publication identity, and scheduler state."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import sqlite3
 from datetime import date, datetime
 from pathlib import Path
 from typing import Protocol
@@ -16,6 +17,8 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    JSON,
+    Numeric,
     String,
     UniqueConstraint,
     create_engine,
@@ -83,6 +86,9 @@ class CollectionBatch(Base):
     """Store one top-level task attempt, including dry-run and failed attempts."""
 
     __tablename__ = "collection_batches"
+    # 历史任务默认归属罗盘，配置快照不会使用当前配置补写未知历史。
+    platform: Mapped[str] = mapped_column(String(64), nullable=False, default="compass")
+    config_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     __table_args__ = (
         CheckConstraint(
             "mode IN ('normal', 'dry_run', 'force')",
@@ -238,6 +244,9 @@ class CategoryRun(Base):
     """Store one discovered level-three category execution inside a batch."""
 
     __tablename__ = "category_runs"
+    # 通用分类路径和平台元数据独立于旧三级投影，支持任意路径深度。
+    scope_path: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    platform_metadata: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     __table_args__ = (
         CheckConstraint(
             "discovery_order >= 1",
@@ -349,6 +358,8 @@ class RawResponse(Base):
     path: Mapped[str] = mapped_column(String(1024), nullable=False)
     item_count: Mapped[int] = mapped_column(Integer, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # 安全业务参数与原始响应独立索引，旧响应未知参数保持空。
+    safe_params: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
 
 class ProductRankEntryModel(Base):
@@ -398,11 +409,15 @@ class ProductRankEntryModel(Base):
     image_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     newly_on_ranking: Mapped[bool] = mapped_column(Boolean, nullable=False)
     # 金额和成交件数保留平台原始区间与单位。
-    pay_amount_min_value: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    pay_amount_max_value: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    pay_amount_min_value: Mapped[object] = mapped_column(Numeric(24, 4), nullable=False)
+    pay_amount_max_value: Mapped[object] = mapped_column(Numeric(24, 4), nullable=False)
     pay_amount_unit: Mapped[str] = mapped_column(String(32), nullable=False)
-    pay_combo_count_min_value: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    pay_combo_count_max_value: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    pay_combo_count_min_value: Mapped[object] = mapped_column(
+        Numeric(24, 4), nullable=False
+    )
+    pay_combo_count_max_value: Mapped[object] = mapped_column(
+        Numeric(24, 4), nullable=False
+    )
     pay_combo_count_unit: Mapped[str] = mapped_column(String(32), nullable=False)
 
 
@@ -517,6 +532,9 @@ class CategoryRunSnapshot:
     error_category: str | None
     started_at: datetime | None
     finished_at: datetime | None
+    # 通用路径不强制未来平台采用三级分类。
+    scope_path: tuple[str, ...] = ()
+    platform_metadata: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -553,6 +571,9 @@ class BatchCollectionSnapshot:
     published_at: datetime | None
     # categories 保持 discovery_order 顺序，供 Manifest 一次性投影。
     categories: tuple[CategoryRunSnapshot, ...]
+    # 平台及配置跟随批次，历史未知配置保持未知。
+    platform: str = "compass"
+    config_snapshot: dict | None = None
 
 
 def normalize_datetime(value: datetime) -> datetime:
@@ -587,6 +608,29 @@ def upgrade_database(database_path: Path) -> None:
     """Upgrade the configured SQLite database to the latest Alembic revision."""
 
     database_path.parent.mkdir(parents=True, exist_ok=True)
+    if database_path.is_file():
+        # sqlite backup 包含 WAL 中已提交数据，比复制主文件更可靠。
+        with sqlite3.connect(database_path) as source:
+            tables = {
+                row[0]
+                for row in source.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            revision = (
+                source.execute("SELECT version_num FROM alembic_version").fetchone()
+                if "alembic_version" in tables
+                else None
+            )
+            if revision != ("0005_platform_capture",):
+                backup_dir = database_path.parent / "backups"
+                backup_dir.mkdir(exist_ok=True)
+                backup_path = (
+                    backup_dir
+                    / f"{database_path.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.db"
+                )
+                with sqlite3.connect(backup_path) as destination:
+                    source.backup(destination)
     # 迁移资源在开发时来自仓库，PyInstaller 中来自打包的数据目录。
     from compass_collector.app_paths import resource_root
 
@@ -625,6 +669,8 @@ class Database:
         """Detach one category row from its transaction as an immutable snapshot."""
 
         return CategoryRunSnapshot(
+            scope_path=tuple(category_run.scope_path),
+            platform_metadata=category_run.platform_metadata,
             category_run_id=category_run.id,
             batch_id=category_run.batch_id,
             discovery_order=category_run.discovery_order,
@@ -662,8 +708,7 @@ class Database:
         ).all()
         # ORM 行在事务结束前转换为不可变记录，调用方无需持有 Session。
         category_snapshots = tuple(
-            self._category_run_snapshot(category_run)
-            for category_run in category_runs
+            self._category_run_snapshot(category_run) for category_run in category_runs
         )
         return BatchCollectionSnapshot(
             batch_id=batch.id,
@@ -691,6 +736,8 @@ class Database:
             finished_at=batch.finished_at,
             published_at=batch.published_at,
             categories=category_snapshots,
+            platform=batch.platform,
+            config_snapshot=batch.config_snapshot,
         )
 
     def _recalculate_batch_counts(
@@ -707,7 +754,9 @@ class Database:
             select(CategoryRun).where(CategoryRun.batch_id == batch.id)
         ).all()
         if len(category_runs) != batch.discovered_category_count:
-            raise RuntimeError("category run count does not match batch discovery count")
+            raise RuntimeError(
+                "category run count does not match batch discovery count"
+            )
         # 成功、失败和未开始数量按当前终态统一重算。
         batch.successful_category_count = sum(
             category_run.status == "success" for category_run in category_runs
@@ -875,8 +924,7 @@ class Database:
                 != category_run.target_page_count
                 or len(collected_category_run.raw_pages)
                 != category_run.saved_page_count
-                or len(collected_category_run.entries)
-                != category_run.saved_item_count
+                or len(collected_category_run.entries) != category_run.saved_item_count
             ):
                 raise PublicationError(
                     "collected category totals do not match SQLite",
@@ -896,9 +944,7 @@ class Database:
             collected_page_numbers = tuple(
                 raw_page.page_no for raw_page in collected_category_run.raw_pages
             )
-            expected_page_numbers = tuple(
-                range(1, category_run.saved_page_count + 1)
-            )
+            expected_page_numbers = tuple(range(1, category_run.saved_page_count + 1))
             collected_item_count = sum(
                 raw_page.item_count for raw_page in collected_category_run.raw_pages
             )
@@ -1000,6 +1046,8 @@ class Database:
         price_bin: str,
         manifest_path: Path,
         started_at: datetime,
+        platform: str = "compass",
+        config_snapshot: dict | None = None,
     ) -> None:
         """Create one running task batch before the category-tree request."""
 
@@ -1015,6 +1063,8 @@ class Database:
                 CollectionBatch(
                     id=batch_id,
                     task_id=task_id,
+                    platform=platform,
+                    config_snapshot=config_snapshot,
                     business_date=business_date,
                     planned_at=stored_planned_at,
                     mode=mode,
@@ -1096,9 +1146,7 @@ class Database:
                 raise RuntimeError("category tree must be recorded before categories")
             # 已存在任意分类表示本批次已经完成过发现登记。
             existing_category_run_id = session.scalar(
-                select(CategoryRun.id)
-                .where(CategoryRun.batch_id == batch_id)
-                .limit(1)
+                select(CategoryRun.id).where(CategoryRun.batch_id == batch_id).limit(1)
             )
             if existing_category_run_id is not None:
                 raise RuntimeError("category runs have already been created")
@@ -1120,6 +1168,8 @@ class Database:
                         level2_category_name=category.level2_category_name,
                         category_id=category.category_id,
                         category_name=category.category_name,
+                        scope_path=list(category.path),
+                        platform_metadata=category.platform_metadata,
                         status="pending",
                         api_total=None,
                         target_page_count=None,
@@ -1255,7 +1305,9 @@ class Database:
                     category_run.api_total is not None
                     or category_run.target_page_count is not None
                 ):
-                    raise RuntimeError("category pagination plan is already initialized")
+                    raise RuntimeError(
+                        "category pagination plan is already initialized"
+                    )
                 category_run.api_total = api_total
                 category_run.target_page_count = target_page_count
             elif (
@@ -1279,6 +1331,7 @@ class Database:
                     category_run_id=category_run_id,
                     page_no=raw_page.page_no,
                     path=str(raw_page.path),
+                    safe_params=raw_page.safe_params,
                     item_count=raw_page.item_count,
                     captured_at=stored_captured_at,
                 )
@@ -1423,18 +1476,19 @@ class Database:
                     None,
                 )
                 if current_category_run is None:
-                    raise RuntimeError("current category run is not the running category")
+                    raise RuntimeError(
+                        "current category run is not the running category"
+                    )
                 # 当前分类可能没有成功页，也可能在后续页终止。
                 # 最后一页完整性校验失败和下一页请求失败都属于合法失败位置。
                 allowed_failed_pages = {
                     max(1, current_category_run.saved_page_count),
                     current_category_run.saved_page_count + 1,
                 }
-                if (
-                    failed_page is not None
-                    and failed_page not in allowed_failed_pages
-                ):
-                    raise RuntimeError("failed page is inconsistent with saved progress")
+                if failed_page is not None and failed_page not in allowed_failed_pages:
+                    raise RuntimeError(
+                        "failed page is inconsistent with saved progress"
+                    )
                 # 人工中止和放弃使用独立分类终态，其余终止均记为 failed。
                 if status == "interrupted":
                     current_category_status = "interrupted"
@@ -1748,11 +1802,11 @@ class Database:
                     business_date=business_date,
                     planned_at=stored_planned_at,
                     mode="normal",
-                status=status,
-                version=None,
-                brand_type=None,
-                price_bin=None,
-                root_category_id=None,
+                    status=status,
+                    version=None,
+                    brand_type=None,
+                    price_bin=None,
+                    root_category_id=None,
                     root_category_name=None,
                     manifest_path=None,
                     category_tree_raw_path=None,

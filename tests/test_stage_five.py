@@ -136,4 +136,4 @@ def test_makefile_exposes_compact_parameterized_commands() -> None:
     assert "GUI ?= yes" in makefile
     assert "ACTION ?= check" in makefile
     assert "--frozen" in makefile
-    assert "TASK ?= product_hot_sale_all_level3" in makefile
+    assert "TASK ?= compass_household_cleaning_realtime" in makefile

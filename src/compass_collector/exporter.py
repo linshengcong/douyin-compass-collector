@@ -23,10 +23,6 @@ CSV_HEADERS = (
     "成交件数",
     "首次上榜",
 )
-# 平台 price 原值除以 100 得到元。
-PRICE_SCALE = Decimal(100)
-# 平台 number 原值除以 10 得到件数。
-NUMBER_SCALE = Decimal(10)
 # 中文紧凑展示使用万和亿两个量级。
 TEN_THOUSAND = Decimal(10_000)
 HUNDRED_MILLION = Decimal(100_000_000)
@@ -59,17 +55,17 @@ def format_compact_value(value: Decimal) -> str:
 
 
 def format_metric_range(metric_range: MetricRange) -> str:
-    """Convert one raw platform range into the agreed CSV display format."""
+    """Format one normalized range without platform-specific scaling."""
 
-    if metric_range.unit == "price":
-        # 金额上下界分别从原值换算为元。
-        minimum = Decimal(metric_range.min_value) / PRICE_SCALE
-        maximum = Decimal(metric_range.max_value) / PRICE_SCALE
+    if metric_range.unit == "CNY":
+        # 金额已是人民币元，只做紧凑展示。
+        minimum = Decimal(metric_range.min_value)
+        maximum = Decimal(metric_range.max_value)
         return f"¥{format_compact_value(minimum)}-¥{format_compact_value(maximum)}"
-    if metric_range.unit == "number":
-        # 成交件数上下界分别从平台原值换算。
-        minimum = Decimal(metric_range.min_value) / NUMBER_SCALE
-        maximum = Decimal(metric_range.max_value) / NUMBER_SCALE
+    if metric_range.unit == "count":
+        # 件数已是实际件，只做紧凑展示。
+        minimum = Decimal(metric_range.min_value)
+        maximum = Decimal(metric_range.max_value)
         return f"{format_compact_value(minimum)}-{format_compact_value(maximum)}"
     raise PublicationError(
         "unsupported metric unit for CSV",
@@ -123,17 +119,21 @@ class CsvExporter:
         version: int,
         batch_id: str,
         category_runs: tuple[CollectedCategoryRun, ...],
+        platform: str = "compass",
     ) -> StagedCsvExport:
         """Write a complete UTF-8 BOM CSV to a temporary file."""
 
-        if TASK_ID_PATTERN.fullmatch(task_id) is None:
+        if (
+            TASK_ID_PATTERN.fullmatch(task_id) is None
+            or re.fullmatch(r"[a-z][a-z0-9_-]*", platform) is None
+        ):
             raise PublicationError(
                 "invalid task_id for CSV path",
                 category="csv_path_error",
             )
         # 业务日期和任务目录共同隔离同名、同计划时间的不同任务。
         export_directory = (
-            self.export_root / planned_at.date().isoformat() / task_id
+            self.export_root / platform / planned_at.date().isoformat() / task_id
         )
         export_directory.mkdir(parents=True, exist_ok=True)
         # 中文展示名中的路径分隔符统一替换，避免意外创建子目录。
@@ -147,7 +147,9 @@ class CsvExporter:
         # 临时文件包含 batch_id，避免并行调试名称冲突。
         temporary_path = final_path.with_name(f".{final_path.name}.{batch_id}.tmp")
         try:
-            with temporary_path.open("w", encoding="utf-8-sig", newline="") as file_handle:
+            with temporary_path.open(
+                "w", encoding="utf-8-sig", newline=""
+            ) as file_handle:
                 # CSV writer 由标准库处理逗号、换行和引号转义。
                 writer = csv.writer(file_handle)
                 writer.writerow(CSV_HEADERS)
@@ -164,9 +166,7 @@ class CsvExporter:
                     )
                     for entry in sorted_entries:
                         # 店铺名称严格按接口原始顺序拼接。
-                        shop_names = " | ".join(
-                            shop.shop_name for shop in entry.shops
-                        )
+                        shop_names = " | ".join(shop.shop_name for shop in entry.shops)
                         writer.writerow(
                             (
                                 category_run.plan.category.display_path,

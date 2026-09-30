@@ -13,17 +13,32 @@ def test_real_config_is_valid() -> None:
 
     # 加载后的应用配置用于核对动态三级分类契约。
     config = CURRENT_CONFIG
-    assert config.http.level1_concurrency == 2
-    assert config.http.page_concurrency == 4
-    assert config.http.max_in_flight_requests == 8
-    assert config.http.network_retry_attempts == 2
-    # 首个任务是当前唯一启用的全一级分类任务。
+    assert config.collection.request_interval_seconds.min == 0.5
+    assert config.collection.request_interval_seconds.max == 1
+    assert config.collection.network_retry_attempts == 2
+    # 首个任务仅遍历个护家清行业下的全部三级分类。
     task = CURRENT_TASK
-    assert task.id == "product_hot_sale_all_level3"
-    assert task.display_name == "全行业三级分类商品实时榜"
+    assert task.id == "compass_household_cleaning_realtime"
+    assert task.display_name == "个护家清实时榜"
     assert task.category_scope.mode == "all_level1"
+    assert task.category_scope.industry_id == "5"
+    assert task.category_scope.targets == []
+    assert task.date.date_type == 1
+    assert task.filters.brand_type == -1
     assert task.category_scope.target_level == 3
     assert task.category_scope.exclude_all is True
+
+
+def test_request_interval_supports_configured_operating_range() -> None:
+    """Accept the checked-in request interval operating range."""
+
+    # 配置校验必须允许当前随机请求间隔。
+    raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
+    raw_config["collection"]["request_interval_seconds"] = {"min": 0.5, "max": 1}
+
+    config = AppConfig.model_validate(raw_config)
+
+    assert config.collection.request_interval_seconds.max == 1
 
 
 @pytest.mark.parametrize(
@@ -47,7 +62,7 @@ def test_unsupported_http_concurrency_is_rejected(
 
     # 真实 YAML 只替换并发值，避免测试和其他配置默认值分叉。
     raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw_config["http"][field_name] = invalid_value
+    raw_config["collection"][field_name] = invalid_value
 
     with pytest.raises(ValidationError):
         AppConfig.model_validate(raw_config)
@@ -79,7 +94,7 @@ def test_unknown_config_field_is_rejected() -> None:
 
     # 真实 YAML 用于构造只增加一个未知字段的配置。
     raw_config = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
-    raw_config["http"]["unexpected_retry"] = True
+    raw_config["collection"]["unexpected_retry"] = True
     with pytest.raises(ValidationError):
         AppConfig.model_validate(raw_config)
 

@@ -1,8 +1,8 @@
 # 抖音电商罗盘榜单采集器
 
-这是一个本地 macOS/Windows 工程：使用独立 Chrome Profile 保存人工登录态，Playwright 读取白名单内认证状态，`httpx` 请求抖音电商罗盘商品榜单。所有模式都会保留 SQLite、Manifest 和 gzip 原始响应审计；正式模式额外发布商品数据与 CSV。
+这是一个本地 macOS/Windows 工程：使用独立 Chrome Profile 保存人工登录态，通过真实 Chrome 页面点击、滚动和响应监听采集商品榜单。正式采集不提取 Cookie，也不主动调用榜单 HTTP 接口。通知和部署查询仍使用各自的网络客户端。
 
-当前业务范围为分类接口动态返回的所有一级分类及其全部三级分类：排除“全部”，忽略四级及更深节点。最多两个一级分类并行，单个三级分类的分页最多四线程预取；全局最多八个在途 HTTP 请求，所有请求启动共用随机 0.067～0.1 秒间隔。网络断连和临时网关错误最多额外重试两次（1 秒、2 秒退避）；平台连续三次返回 `11001` 时安全停止本批。
+默认任务为个护家清实时榜，只循环 `industry_id=5` 下的全部三级分类，页面选择实时榜（`date_type=1`），品牌不限（`brand_type=-1`）、price_bin=不限。支持指定分类列表及 `all_level1` 自动发现；设置 `category_scope.industry_id` 时限定行业，未设置时发现所有行业。排除“全部”，忽略四级及更深节点。任务、分类和分页全部串行执行，页面操作间隔为 0.5～1 秒，超时后有限恢复重试；平台连续三次返回 `11001` 时安全停止本批。
 
 > 当前代码已接通动态分类发现、完整分页、正式发布、Scheduler、PySide6 GUI 和钉钉汇总。仓库自动化测试不等于真实账号、真实 Webhook、LaunchAgent 或第二台 Mac 的外部验收；这些操作仍需人工执行。
 
@@ -18,7 +18,7 @@
 - 钉钉签名 Webhook 批次汇总，GUI 展示发送状态；
 - 用户级 `launchd` 安装、卸载和状态脚本。
 
-当前不包含页面点击采集、云主机部署或其他榜单类型。
+当前已实现罗盘页面适配器。其他平台通过显式注册表扩展，本次不包含淘宝实现或网页平台切换界面。
 
 ## 快捷命令
 
@@ -44,7 +44,7 @@ make service ACTION=status         # 查看 LaunchAgent 状态
 make service ACTION=uninstall      # 卸载 LaunchAgent
 ```
 
-默认任务为 `product_hot_sale_all_level3`，可按需覆盖：
+默认任务为 `compass_household_cleaning_realtime`，可按需覆盖：
 
 ```bash
 make run TASK=another_task_id
@@ -75,118 +75,38 @@ uv run --frozen python -m compass_collector --help
 
 ## 3. 配置
 
-主配置位于 `config/tasks.yaml`。可以调整任务启停、每日执行时刻、动态分类范围、筛选条件和保留天数。
+主配置位于 `config/tasks.yaml`，GUI 只读展示平台、Profile、任务范围及执行状态，不提供配置编辑器。未知平台、缺失主任务、重复任务 ID、重复分类组合和无效配置在启动 Chrome 前报错；行业归属错误或不存在的分类，在当次分类发现阶段使整个任务失败。
 
-当前 cron 只支持每日固定时间：
+- `browser`：共享 Chrome 参数；
+- `platforms.<id>.profile_dir`：每个平台独立 Profile；罗盘复用 `runtime/browser-profile`；
+- `collection`：页面动作超时、响应超时、采集间隔、有限重试及人工等待；
+- `tasks`：任务 ID、平台、启停、名称、每日时间、分类、筛选与日期；
+- `publication.web_primary_task_id`：唯一可更新现有网站根索引的主任务；
+- 数据库、保留策略和调度仍在各自配置节管理。
+
+指定分类按配置顺序执行，名称从本次平台分类树解析：
 
 ```yaml
-tasks:
-  - id: product_hot_sale_all_level3
-    schedule: "0 14 * * *"
-    category_scope:
-      mode: all_level1
-      target_level: 3
-      exclude_all: true
-    filters:
-      brand_type: 0
-      price_bin: "不限"
-      search_info: ""
+category_scope:
+  mode: selected
+  targets:
+    - industry_id: "5"
+      category_id: "1000004647,1000004649"
 ```
 
-Scheduler 使用 `Asia/Shanghai`。`misfire_grace_minutes: 600` 表示当天计划时间之后最多延迟 10 小时补采；跨天只记录 `missed`，不会用第二天实时榜单冒充前一天数据。
+默认的个护家清自动发现模式：
 
-配置中的认证部分只能维护 Cookie 名称白名单。Cookie 值、Token、Webhook 和其他凭证不得写入 YAML、源码、日志或 Git。
-
-当前已验证的筛选值为：`brand_type=-1` 表示不限、`brand_type=0` 表示非知名品牌；`price_bin=不限` 表示不限价格、`price_bin=10001-?` 表示价格严格大于 10000 且没有上限。新批次会在 SQLite 和 Manifest 中保存这两个实际请求值，配置变化不会改写历史批次。
-
-每次任务只请求一次分类树，按接口原始顺序遍历所有非汇总一级分类，并枚举其三级分类；ID 为 `0` 或名称为“全部”的节点会排除，四级及更深节点不会进入采集队列。批次不制造“全部行业”根 ID，每个分类运行单独保存真实一级分类。榜单请求的 `industry_id` 使用当前三级分类所属的一级分类 ID，`category_id` 按级联选择器格式拼接二级分类 ID 与三级分类 ID。每个三级分类固定 `page_size=10`，按照第一页 `total` 完整请求全部页，不设置条数上限。
-
-网络、HTTP 或响应契约类的普通分类失败会留下分类级失败材料，并跳过该分类继续后续采集。网络断连和临时网关错误最多额外重试两次；平台连续三次返回 `11001` 则停止本批。只要至少一个分类成功，正式模式就发布其余成功分类并标记 `partial_success`；只有全部分类都失败时才以 `failed` 收口且不发布。登录失效、中止、数据库、Manifest 或其他内部错误不适用该容错规则，会直接收口任务。
-
-### 钉钉批次汇总
-
-从示例创建本机配置：
-
-```bash
-cp .env.example .env
+```yaml
+category_scope:
+  mode: all_level1
+  industry_id: "5"
 ```
 
-将已轮换的机器人配置写入仓库根目录 `.env`，并显式启用：
+自动发现模式不填写 `targets`，可用 `industry_id` 限定行业；删除该字段才遍历所有行业。指定列表的行业仍填写在各 target 中。罗盘三级类目的请求组合为二级分类 ID 与三级分类 ID，平台逻辑负责这种映射，只选择到三级。支持 `brand_type=-1`（不限）、`0`（非知名品牌），价格支持 `不限` 与 `10001-?`（严格大于一万元）；自定义价格通过真实页面对话框设置，无法确认条件时任务报错，不降级为不限。
 
-```dotenv
-DINGTALK_ENABLED=true
-DINGTALK_WEBHOOK_URL=<钉钉自定义机器人 Webhook>
-DINGTALK_SECRET=<加签密钥>
-```
+每次任务保存分类树快照，完整请求全部页。手动任务遇到登录或验证可人工恢复，默认 180 秒；定时任务结束并进入通知链路。恢复会重建分类和筛选条件，回到尚未持久化页；已完成页不重复入库。任务冻结北京时间业务日期，跨天、停止或恢复后响应契约不一致时安全结束。
 
-`.env` 已加入 `.gitignore`，程序启动时主动读取，同名系统环境变量优先。Webhook 只允许官方 `https://oapi.dingtalk.com/robot/send` 地址且必须只有一个 `access_token`。
-
-首次配置后执行：
-
-```bash
-make notify-test
-```
-
-`run`、`--force`、`--dry-run` 和 Scheduler 都会在每个批次结束时发送一条 Markdown 汇总。消息不 @ 任何人，只包含来源、模式、批次 ID、耗时、任务状态、页数/条数、CSV 文件名和安全错误分类。不发送本机绝对路径、原始响应或异常原文。
-
-钉钉请求只尝试一次，不跟随重定向，不自动重试。发送失败只记入 JSONL 并在 GUI 显示，不会改变采集退出码、SQLite、CSV 或下一计划批次。只有 `make notify-test` 会在测试发送失败时返回非零状态。
-
-### OSS 私有 CSV 下载链接
-
-默认 `OSS_ENABLED=false`，不访问 OSS。启用后，只有正式 `success` 或 `partial_success` 的 CSV 在 SQLite 与本地文件都已发布成功后才上传；上传完成会生成最长 7 天有效的私有签名下载链接，并将中文 CSV 文件名作为钉钉 Markdown 链接发送。
-
-```dotenv
-OSS_ENABLED=true
-OSS_REGION=cn-hangzhou
-OSS_ENDPOINT=https://oss-cn-hangzhou.aliyuncs.com
-OSS_BUCKET=<目标 Bucket 名称>
-OSS_ACCESS_KEY_ID=<专用 RAM 用户 AccessKey ID>
-OSS_ACCESS_KEY_SECRET=<专用 RAM 用户 AccessKey Secret>
-OSS_OBJECT_PREFIX=compass
-OSS_DOWNLOAD_URL_EXPIRES_SECONDS=604800
-```
-
-RAM 用户至少需要该 Bucket 的 `oss:PutObject` 和 `oss:GetObject`。对象保持私有；签名链接本身是短期 bearer 凭证，只在本次进程中进入钉钉正文，不写入 JSONL、SQLite、Manifest 或日志。OSS 上传失败不会回滚正式 CSV 或改变采集结果，钉钉结果列会标记 `OSS 上传失败`；第一版不自动重试。
-
-### 公开榜单网站与 Vercel
-
-网站源码位于 `web/`，使用 React + Vite 读取 OSS 上的最新公开榜单。每次正式发布后，程序先发送采集完成钉钉汇总，再生成只含 CSV 七列的 gzip JSON，上传到 `WEB_PUBLIC_PREFIX`（默认 `compass/web/`）：版本化 `batches/<batch_id>.json.gz`、同批次公开 CSV，以及不缓存的 `latest.json` 索引。网页始终先读取索引，因此刷新即可看到新批次，无需把数据提交 Git。
-
-网页对象前缀需要在 OSS 控制台单独配置为公开读，并允许 Vercel 网站域名对该前缀发起 `GET` 跨域请求；不要公开 `runtime/`、原始响应或私有 CSV 前缀。Vercel 项目连接当前 GitHub 仓库后，将 Root Directory 设置为 `web`，并设置构建环境变量：
-
-```text
-VITE_DATA_INDEX_URL=https://<bucket>.oss-<region>.aliyuncs.com/compass/web/latest.json
-```
-
-本机 `.env` 需要额外配置：
-
-```text
-WEB_ENABLED=true
-WEB_PUBLIC_PREFIX=compass/web
-WEB_SITE_URL=
-VERCEL_ENABLED=true
-VERCEL_DEPLOY_HOOK_URL=<Vercel Deploy Hook>
-VERCEL_API_TOKEN=<只读部署查询 Token>
-VERCEL_PROJECT_ID=<Vercel Project ID>
-VERCEL_TEAM_ID=<可选，团队项目才填写>
-VERCEL_SITE_URL=https://<project>.vercel.app
-```
-
-网页数据上传失败不会回滚 CSV 或采集结果：首条钉钉仍说明采集完成，第二条说明网页未更新。上传成功后会触发 Vercel Deploy Hook，并最多轮询五分钟；部署 `READY` 才发送第二条网站链接通知，失败或超时会发送安全错误分类。部署 Hook、API Token 和钉钉密钥都只能保存在 `.env`。
-
-### GitHub Pages 根域名发布
-
-仓库内的 `.github/workflows/publish-github-pages.yml` 会构建 `web/` 并发布到 `linshengcong/linshengcong.github.io` 的 `master` 分支，因此网页地址为 `https://linshengcong.github.io/`。首次启用前需要：
-
-1. 在当前仓库 Settings → Secrets and variables → Actions → Variables 新建 `VITE_DATA_INDEX_URL`，值为公开 OSS 的 `latest.json` 地址；该值会进入浏览器代码，不要填私有地址或密钥。
-2. 新建 `PAGES_DEPLOY_TOKEN` Secret：使用一个仅授予 `linshengcong/linshengcong.github.io` 内容读写权限的 fine-grained personal access token。
-3. 在 `linshengcong/linshengcong.github.io` 仓库 Settings → Pages 中选择从 `master` 分支的根目录发布。
-
-工作流会覆盖用户主页仓库中除 `.git` 外的发布文件；该仓库应只存放此公开网站的构建产物。
-
-本机采集器的 `.env` 同时设置 `WEB_ENABLED=true`、`WEB_SITE_URL=https://linshengcong.github.io` 与 `VERCEL_ENABLED=false`。这样每次新数据上传 OSS 后，钉钉会直接发送 GitHub Pages 链接，不再触发或等待 Vercel。
-
-本地前端开发使用 `make web-dev`，打开 `http://127.0.0.1:5175/`；保存前端文件后由 Vite 自动热更新。静态构建使用 `make web-build`。如需替换公开数据源，可用 `make web-dev WEB_DATA_INDEX_URL=https://.../latest.json` 覆盖默认值。当前界面按桌面优先设计，移动端自动改为商品卡片；支持三级类目、商品/店铺关键词、支付金额/成交件数下限、首次上榜、排序、分页和 CSV 下载。
+当前 cron 只支持每日固定时间，例如 `0 14 * * *`；调度保留同日宽限与跨天不补实时榜单规则。
 
 ## 4. 首次登录
 
@@ -218,7 +138,7 @@ make app
 
 `make run` 默认打开 GUI 并正式采集；`MODE=dry-run` 或 `MODE=force` 切换模式，`GUI=no` 显式回退终端。`force` 开始前仍会二次确认。
 
-GUI 关闭时不会留下自己启动的 Scheduler 或 Chrome。运行中的采集会先确认，再等待当前 HTTP 请求完成或超时后协作式中止。
+GUI 关闭时不会留下自己启动的 Scheduler 或 Chrome。运行中的采集会先确认，再在页面动作和响应等待的短检查点协作式中止。
 
 ## 6. 终端手动运行
 
@@ -226,7 +146,7 @@ GUI 关闭时不会留下自己启动的 Scheduler 或 Chrome。运行中的采�
 
 ```bash
 uv run --frozen python -m compass_collector run \
-  --task product_hot_sale_all_level3 \
+  --task compass_household_cleaning_realtime \
   --no-gui
 ```
 
@@ -234,16 +154,16 @@ uv run --frozen python -m compass_collector run \
 
 ```bash
 uv run --frozen python -m compass_collector run \
-  --task product_hot_sale_all_level3 \
+  --task compass_household_cleaning_realtime \
   --force \
   --no-gui
 ```
 
-试运行同样请求分类树并采集全部动态三级分类，保留 `collection_batches`、`category_runs`、`raw_responses`、Manifest 和 gzip 原始响应；它不写正式商品记录或 CSV，也不分配版本，`published_at` 始终为空：
+试运行同样保存分类树快照并采集配置范围内的动态分类，保留 `collection_batches`、`category_runs`、`raw_responses`、Manifest 和 gzip 原始响应；它不写正式商品记录或 CSV，也不分配版本，`published_at` 始终为空：
 
 ```bash
 uv run --frozen python -m compass_collector run \
-  --task product_hot_sale_all_level3 \
+  --task compass_household_cleaning_realtime \
   --dry-run \
   --no-gui
 ```
@@ -335,7 +255,7 @@ runtime/
 
 `runtime/` 已整体加入 `.gitignore`。完整响应只保存在本机 `runtime/raw/`，仓库中的 Fixture 只是脱敏契约样本。
 
-正式 CSV 路径为 `runtime/exports/<YYYY-MM-DD>/<task_id>/<中文文件名>.csv`。即使两个任务使用相同展示名和计划时间，也不会互相覆盖；通知仍只展示中文文件名。
+正式 CSV 路径为 `runtime/exports/<platform>/<YYYY-MM-DD>/<task_id>/<中文文件名>.csv`。即使两个任务使用相同展示名和计划时间，也不会互相覆盖；通知仍只展示中文文件名。
 
 CSV 固定为 8 列：`分类、排名、商品缩略图、商品、店铺名称、用户支付金额、成交件数、首次上榜`。先按分类接口发现顺序输出，再按分类内排名输出；只包含成功完成的三级分类。
 
@@ -368,7 +288,7 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 5. 从 `.env.example` 创建 `.env`，填入当前有效凭证并执行 `make notify-test`；
 6. 执行 `make app`，检查单窗口、最近日志、通知和 Scheduler 状态；
 7. 执行一次 GUI `dry-run`，核对动态三级分类数量、完整分页、SQLite/raw 审计和批次汇总；
-8. 执行 GUI 正式 `run`，核对 `published_at`、中文 7 列 CSV、打开文件和关闭 Chrome；
+8. 执行 GUI 正式 `run`，核对 `published_at`、中文 8 列 CSV、打开文件和关闭 Chrome；
 9. 前台启动 Scheduler 并用 Ctrl-C 停止；
 10. 先执行 launchd `--dry-run`；
 11. 获得明确授权后再安装 LaunchAgent；
@@ -379,6 +299,18 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 - 云主机和 systemd；
 - 重试策略与 Scheduler 逻辑后续重新梳理；
 - 以 SQLite 权威状态重建 Manifest 和 raw 索引的崩溃恢复；
-- 继续裁剪分类接口的 `level/scene/default_cate_to_level` 业务参数；
-- 多账号、多主机和基于真实限流证据的更高分类级并发；
+- 以更多平台的页面和字段契约验证适配器扩展；
+- 多主机独立运行与监控；
 - 其他榜单 Adapter。
+
+## 浏览器改造与历史兼容
+
+调用链为 CLI / GUI / Scheduler → 任务配置及幂等锁 → 平台适配器 → 分类发现与校验 → 页面响应采集 → 分页审计与完整性校验 → SQLite / CSV 协调发布 → OSS、网站及通知。
+
+`platforms/contracts.py` 规定 `open_session`、`discover_scopes`、`collect_scope`、`close`。共享编排不持有页面对象、不解析罗盘响应和请求参数；罗盘导航、选择器、日期匹配、错误码及原始指标换算集中在适配器。共享金额为实际人民币元 `CNY`、件数为实际件 `count`，导出器只负责展示。
+
+Alembic `0005_platform_capture` 增加平台标识、任务配置快照、通用分类路径、平台元数据和安全请求参数，迁移旧金额/件数单位。升级已有数据库前使用 SQLite backup 保存完整已提交状态，包括 WAL。旧记录归属罗盘，无法还原的请求范围标记为未知，不套用新配置。历史 raw、CSV、Manifest 保持原路径可读；新 raw、artifacts、exports 按平台和任务隔离，保留策略同时兼容旧日期目录和新平台目录。
+
+网站不可变快照与 `latest.json` 位于 `<public_prefix>/<platform>/<task_id>/`。只有配置主任务更新兼容根 `<public_prefix>/latest.json`，其他任务不覆盖当前网页。现有网页字段和展示保持兼容。
+
+真实 Chrome 的可控页面回归单独运行：`RUN_BROWSER_TESTS=1 uv run --frozen python -m pytest tests/test_compass_browser.py`。普通自动化测试、可控浏览器测试和真实平台验收分别记录，见 `docs/浏览器改造验收.md`。

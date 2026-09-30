@@ -36,16 +36,22 @@ SAFE_DETAIL_FIELDS = {
     "status_code",
     "target_pages",
     "version",
+    # 发布完成事件只记录布尔结果。
+    "uploaded",
+    # 网站状态和通知错误仅包含布尔值或受控分类，不包含外部凭证。
+    "site_ready",
+    "website_status",
+    "notification_error_category",
 }
 # 日志正文和详情出现这些认证标记时直接拒绝写入。
 FORBIDDEN_TEXT_MARKERS = (
-    # "authorization",
-    # "cookie",
-    # "sessionid",
-    # "mstoken",
-    # "a_bogus",
-    # "verifyfp",
-    # "verify_fp",
+    "authorization",
+    "cookie",
+    "sessionid",
+    "mstoken",
+    "a_bogus",
+    "verifyfp",
+    "verify_fp",
 )
 # GUI Scheduler 子进程使用固定前缀传输同一份安全事件。
 EVENT_STREAM_PREFIX = "@@COMPASS_EVENT@@"
@@ -150,7 +156,9 @@ class RuntimeLogger:
         # 每次完整追加一行并立即关闭句柄，便于崩溃后排查。
         log_path = self._log_path(captured_at)
         with log_path.open("a", encoding="utf-8") as file_handle:
-            file_handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            file_handle.write(
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            )
             file_handle.write("\n")
         if self.event_sink is not None:
             # GUI 回调仅用于实时展示，失效时不能改变已成功落盘的采集语义。
@@ -185,7 +193,9 @@ class RuntimeLogger:
             pass
 
 
-def read_latest_batch_events(log_directory: Path, limit: int = 500) -> list[dict[str, Any]]:
+def read_latest_batch_events(
+    log_directory: Path, limit: int = 500
+) -> list[dict[str, Any]]:
     """Read the latest execution or legacy business batch from safe JSONL."""
 
     if limit <= 0 or not log_directory.exists():

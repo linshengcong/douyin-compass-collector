@@ -16,7 +16,7 @@ from compass_collector.errors import (
     AuthRequiredError,
     CategoryBatchPreparationError,
 )
-from compass_collector.http_client import HttpJsonResponse
+from adapter_fixtures import FixtureResponse as HttpJsonResponse, FixtureAdapter
 from compass_collector.persistence import (
     CategoryRun,
     CollectionBatch,
@@ -54,7 +54,7 @@ def create_database(tmp_path: Path) -> Database:
     return Database(database_path)
 
 
-class SuccessfulCategoryClient:
+class SuccessfulCategoryClient(FixtureAdapter):
     """Return one prepared category response and reject ranking calls."""
 
     def __init__(self, payload: dict[str, Any]) -> None:
@@ -81,7 +81,7 @@ class SuccessfulCategoryClient:
         raise AssertionError("stage two must not request ranking pages")
 
 
-class AuthFailureCategoryClient:
+class AuthFailureCategoryClient(FixtureAdapter):
     """Raise one authentication error at the category-tree boundary."""
 
     def __init__(self) -> None:
@@ -102,7 +102,7 @@ class AuthFailureCategoryClient:
         )
 
 
-class InterruptedCategoryClient:
+class InterruptedCategoryClient(FixtureAdapter):
     """Raise one process-level interruption at the category-tree boundary."""
 
     def __init__(self, interruption: BaseException) -> None:
