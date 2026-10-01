@@ -64,6 +64,8 @@ class _CategoryRunSnapshotLike(Protocol):
     level2_category_name: str
     category_id: str
     category_name: str
+    scope_path: tuple[str, ...]
+    platform_metadata: dict
     status: str
     api_total: int | None
     target_page_count: int | None
@@ -103,6 +105,8 @@ class _BatchCollectionSnapshotLike(Protocol):
     finished_at: datetime | None
     published_at: datetime | None
     categories: Sequence[_CategoryRunSnapshotLike]
+    platform: str
+    config_snapshot: dict | None
 
 
 def current_time_iso() -> str:
@@ -192,12 +196,15 @@ class BatchStorage:
         planned_at: datetime,
         mode: Literal["normal", "dry_run", "force"],
         started_at: datetime,
+        platform: str = "compass",
+        config_snapshot: dict | None = None,
     ) -> None:
         """Create the accepted batch directory and its initial running Manifest."""
 
         # 内部生成的批次 ID 和配置任务 ID 都必须是安全目录段。
         _validate_path_segment(batch_id, "batch_id")
         _validate_path_segment(task_id, "task_id")
+        _validate_path_segment(platform, "platform")
         if mode not in BATCH_MODES:
             raise ValueError(f"unsupported batch mode: {mode}")
         # 批次身份由 runner 预先生成，确保文件、数据库与日志完全一致。
@@ -206,7 +213,12 @@ class BatchStorage:
         self.business_date = business_date
         # 批次 raw 目录按日期、任务和 batch_id 隔离。
         self.batch_dir = (
-            runtime_root / "raw" / business_date.isoformat() / task_id / batch_id
+            runtime_root
+            / "raw"
+            / platform
+            / business_date.isoformat()
+            / task_id
+            / batch_id
         )
         self.batch_dir.mkdir(parents=True, exist_ok=False)
         # 分类分页目录在阶段二先建立边界，但不会写入任何榜单分页。
@@ -216,6 +228,7 @@ class BatchStorage:
         self.artifact_dir = (
             runtime_root
             / "artifacts"
+            / platform
             / business_date.isoformat()
             / task_id
             / batch_id
@@ -227,6 +240,8 @@ class BatchStorage:
         self.manifest: dict[str, Any] = {
             "batch_id": batch_id,
             "task_id": task_id,
+            "platform": platform,
+            "config_snapshot": config_snapshot,
             "business_date": business_date.isoformat(),
             "planned_at": planned_at.isoformat(),
             "mode": mode,
@@ -274,7 +289,9 @@ class BatchStorage:
         """Persist the complete category response exactly once."""
 
         if self.category_tree_path.exists():
-            raise FileExistsError(f"category tree already exists: {self.category_tree_path}")
+            raise FileExistsError(
+                f"category tree already exists: {self.category_tree_path}"
+            )
         # 本方法只发布 gzip，数据库和 Manifest 索引由编排层按顺序更新。
         _write_gzip_json_atomic(self.category_tree_path, payload)
         return self.category_tree_path
@@ -293,9 +310,7 @@ class BatchStorage:
         self._category_manifest(category_run_id)
         # 三位页码让文件字典序与真实请求顺序保持一致。
         category_page_path = (
-            self.categories_dir
-            / category_run_id
-            / f"page-{page_no:03d}.json.gz"
+            self.categories_dir / category_run_id / f"page-{page_no:03d}.json.gz"
         )
         if category_page_path.exists():
             raise FileExistsError(f"category page already exists: {category_page_path}")
@@ -347,7 +362,9 @@ class BatchStorage:
         if (discovery.root_category_id is None) != (
             discovery.root_category_name is None
         ):
-            raise ValueError("category discovery root fields must be both set or both null")
+            raise ValueError(
+                "category discovery root fields must be both set or both null"
+            )
         # 批次内分类 ID 与 category_run_id 都必须唯一。
         category_ids: set[str] = set()
         category_run_ids: set[str] = set()
@@ -379,6 +396,8 @@ class BatchStorage:
                     "category_run_id": plan.category_run_id,
                     "discovery_order": category.discovery_order,
                     "level1_category_id": category.level1_category_id,
+                    "scope_path": list(category.path),
+                    "platform_metadata": category.platform_metadata,
                     "level1_category_name": category.level1_category_name,
                     "level2_category_id": category.level2_category_id,
                     "level2_category_name": category.level2_category_name,
@@ -412,6 +431,8 @@ class BatchStorage:
         """Atomically replace collection state from one authoritative SQLite snapshot."""
 
         # 存储实例与数据库快照必须描述同一个顶层批次。
+        if snapshot.platform != self.manifest["platform"]:
+            raise ValueError("snapshot platform does not match storage")
         if snapshot.batch_id != self.batch_id:
             raise ValueError("snapshot batch id does not match storage")
         if snapshot.task_id != self.task_id:
@@ -427,9 +448,7 @@ class BatchStorage:
             and snapshot.category_tree_raw_path != str(self.category_tree_path)
         ):
             raise ValueError("snapshot category-tree path does not match storage")
-        if (snapshot.root_category_id is None) != (
-            snapshot.root_category_name is None
-        ):
+        if (snapshot.root_category_id is None) != (snapshot.root_category_name is None):
             raise ValueError("snapshot root category id and name must appear together")
         # 元组冻结调用方序列，确保一次同步过程读取稳定分类集合。
         category_snapshots = tuple(snapshot.categories)
@@ -482,11 +501,23 @@ class BatchStorage:
                     category_snapshot.category_id,
                     category_snapshot.category_name,
                 )
+                if category_snapshot.scope_path and existing_category.get(
+                    "scope_path"
+                ) != list(category_snapshot.scope_path):
+                    raise ValueError("snapshot generic scope path changed")
+                if (
+                    category_snapshot.platform_metadata
+                    and existing_category.get("platform_metadata")
+                    != category_snapshot.platform_metadata
+                ):
+                    raise ValueError("snapshot platform metadata changed")
                 if existing_signature != snapshot_signature:
                     raise ValueError("snapshot category identity changed")
             # 分类运行字段与 CategoryRunSnapshot 一一对应。
             category_manifests.append(
                 {
+                    "scope_path": list(category_snapshot.scope_path),
+                    "platform_metadata": category_snapshot.platform_metadata,
                     "category_run_id": category_snapshot.category_run_id,
                     "discovery_order": category_snapshot.discovery_order,
                     "level1_category_id": category_snapshot.level1_category_id,
@@ -522,6 +553,8 @@ class BatchStorage:
         category_tree_captured_at = self.manifest["category_tree_captured_at"]
         # 其余状态全部由 SQLite 快照重新投影，不进行增量合并。
         updated_manifest: dict[str, Any] = {
+            "platform": snapshot.platform,
+            "config_snapshot": snapshot.config_snapshot,
             "batch_id": snapshot.batch_id,
             "task_id": snapshot.task_id,
             "business_date": snapshot.business_date.isoformat(),
@@ -586,7 +619,10 @@ class BatchStorage:
         if root_category_id is not None and root_category_name is not None:
             existing_root_id = updated_manifest["root_category_id"]
             existing_root_name = updated_manifest["root_category_name"]
-            if existing_root_id not in {None, root_category_id} or existing_root_name not in {
+            if existing_root_id not in {
+                None,
+                root_category_id,
+            } or existing_root_name not in {
                 None,
                 root_category_name,
             }:

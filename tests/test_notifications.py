@@ -22,10 +22,12 @@ from compass_collector.notifier import (
     CategoryNotificationIssue,
     DingTalkNotifier,
     NotificationDeliveryStatus,
+    NotificationDeliveryResult,
     TaskNotificationResult,
     TaskNotificationStatus,
     create_signature,
     deliver_batch_notification,
+    deliver_website_notification,
     load_dingtalk_settings,
     load_project_environment,
     render_batch_markdown,
@@ -207,7 +209,10 @@ def test_summary_renders_signed_csv_url_only_as_a_dingtalk_link() -> None:
         )
     )
 
-    assert "[safe.csv](https://oss.example.invalid/exports/safe.csv?signature=fake)" in markdown
+    assert (
+        "[safe.csv](https://oss.example.invalid/exports/safe.csv?signature=fake)"
+        in markdown
+    )
     assert "/Users/" not in markdown
 
 
@@ -448,9 +453,7 @@ def test_delivery_failure_never_raises_or_changes_batch_result(
     assert result.status is NotificationDeliveryStatus.FAILED
     assert result.error_category == "notification_timeout"
     assert request_count == 1
-    assert {event["execution_batch_id"] for event in log_events} == {
-        summary.batch_id
-    }
+    assert {event["execution_batch_id"] for event in log_events} == {summary.batch_id}
     assert {event["batch_id"] for event in log_events} == {None}
     # 持久事件只能包含安全分类，不得落盘假凭证。
     log_text = next((tmp_path / "logs").glob("*.jsonl")).read_text(encoding="utf-8")
@@ -458,10 +461,62 @@ def test_delivery_failure_never_raises_or_changes_batch_result(
     assert FAKE_SECRET not in log_text
 
 
-def test_notify_test_returns_nonzero_when_notification_is_disabled(tmp_path: Path) -> None:
+def test_notify_test_returns_nonzero_when_notification_is_disabled(
+    tmp_path: Path,
+) -> None:
     """Make the explicit connectivity test fail clearly without network access."""
 
     # 自动清理 fixture 使通知保持默认关闭。
     exit_code = run_notification_test(RuntimeLogger(tmp_path / "logs"))
 
     assert exit_code == 1
+
+
+@pytest.mark.parametrize(
+    "site_url,delivery_status",
+    [
+        ("https://example.com", NotificationDeliveryStatus.SUCCEEDED),
+        (None, NotificationDeliveryStatus.SUCCEEDED),
+        ("https://example.com", NotificationDeliveryStatus.FAILED),
+    ],
+)
+def test_website_notification_result_is_persisted(
+    tmp_path, monkeypatch, site_url, delivery_status
+):
+    """Website delivery results must survive the safe logger field allow-list."""
+    monkeypatch.setenv("DINGTALK_ENABLED", "true")
+    monkeypatch.setenv("DINGTALK_WEBHOOK_URL", FAKE_WEBHOOK)
+    monkeypatch.setenv("DINGTALK_SECRET", FAKE_SECRET)
+    # 模拟已验证的发送结果，禁止测试真实发送消息。
+    result = NotificationDeliveryResult(
+        status=delivery_status,
+        status_code=200,
+        error_category="notification_timeout"
+        if delivery_status is NotificationDeliveryStatus.FAILED
+        else None,
+    )
+    monkeypatch.setattr(DingTalkNotifier, "send_markdown", lambda *args: result)
+    # 订阅持久化后的事件，捕捉此前被安全字段校验静默丢弃的问题。
+    events = []
+    logger = RuntimeLogger(tmp_path / "logs", event_sink=events.append)
+    assert (
+        deliver_website_notification(
+            execution_batch_id="external-acceptance",
+            runtime_logger=logger,
+            site_url=site_url,
+            error_category="oss_account_disabled" if site_url is None else None,
+        )
+        is result
+    )
+    assert len(events) == 1
+    assert events[0]["website_status"] == ("ready" if site_url else "failed")
+    assert events[0]["notification_error_category"] == result.error_category
+    assert events[0]["event"] == (
+        "website_notification_succeeded"
+        if delivery_status is NotificationDeliveryStatus.SUCCEEDED
+        else "website_notification_failed"
+    )
+    # 公开网站通知也不能让机器人凭证进入日志。
+    log_text = next((tmp_path / "logs").glob("*.jsonl")).read_text()
+    assert FAKE_SECRET not in log_text
+    assert "fake_test_value" not in log_text

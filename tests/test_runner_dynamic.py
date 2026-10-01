@@ -18,7 +18,7 @@ from compass_collector.errors import (
     PublicationError,
 )
 from compass_collector.exporter import StagedCsvExport
-from compass_collector.http_client import HttpJsonResponse
+from adapter_fixtures import FixtureResponse as HttpJsonResponse, FixtureAdapter
 from compass_collector.notifier import (
     BatchNotificationSummary,
     TaskNotificationStatus,
@@ -112,25 +112,6 @@ class FakeBrowserSession:
         # wait_count 验证 manual=False 永不等待键盘输入。
         self.wait_count = 0
 
-    def whitelisted_cookies(self, cookie_names: list[str]) -> list[dict[str, str]]:
-        """Return one synthetic cookie without exposing real authentication."""
-
-        if not self.has_cookies:
-            return []
-        return [
-            {
-                "name": "synthetic_session",
-                "value": "test-only",
-                "domain": ".jinritemai.com",
-                "path": "/",
-            }
-        ]
-
-    def user_agent(self) -> str:
-        """Return one deterministic browser user agent."""
-
-        return "runner-dynamic-test"
-
     def wait_for_manual_exit(self, message: str) -> None:
         """Record an unexpected manual wait instead of blocking pytest."""
 
@@ -142,7 +123,7 @@ class FakeBrowserSession:
         self.close_count += 1
 
 
-class FakeCompassClient:
+class FakeCompassClient(FixtureAdapter):
     """Serve one category tree and deterministic category ranking pages."""
 
     def __init__(self, *, failed_category_ids: set[str] | None = None) -> None:
@@ -181,7 +162,9 @@ class FakeCompassClient:
         # category_path_parts 让 Runner 集成测试拒绝退化成单个叶子 ID。
         category_path_parts = category_path.split(",")
         if len(category_path_parts) != 2 or not all(category_path_parts):
-            raise AssertionError("category_id must contain level-two and level-three IDs")
+            raise AssertionError(
+                "category_id must contain level-two and level-three IDs"
+            )
         # 假响应和失败注入继续使用级联路径末段的三级叶子 ID。
         category_id = category_path_parts[-1]
         # page_no 经请求构造保证为正整数。
@@ -214,14 +197,18 @@ def install_runner_fakes(
     monkeypatch.setattr("compass_collector.runner.RUNTIME_ROOT", tmp_path / "runtime")
     # 同一个浏览器对象用于生命周期断言。
     browser = FakeBrowserSession()
+    # 共享 runner 只创建平台适配器，不创建 HTTP 客户端。
+    client.session = browser
+    original_close = client.close
+
+    def close_adapter():
+        """Release both observable adapter and its browser session."""
+        original_close()
+        browser.close()
+
+    client.close = close_adapter
     monkeypatch.setattr(
-        "compass_collector.runner.open_browser",
-        lambda browser_config: browser,
-    )
-    # Runner 构造 HTTP 客户端时直接复用传入的可观察实例。
-    monkeypatch.setattr(
-        "compass_collector.runner.CompassHttpClient",
-        lambda *args, **kwargs: client,
+        "compass_collector.runner.create_adapter", lambda *args, **kwargs: client
     )
     # 通知只捕获安全 summary，不访问真实 Webhook。
     notifications: list[BatchNotificationSummary] = []
@@ -249,6 +236,58 @@ def run_fake_collection(
         manual=False,
         planned_at_overrides={task.id: PLANNED_AT},
     )
+
+
+def test_same_day_skip_and_force_publish_distinct_versions(tmp_path, monkeypatch):
+    """A skip performs no collection; force publishes a new immutable CSV version."""
+    # 所有重复执行共享同一隔离数据库及固定计划时间。
+    config = temporary_config(tmp_path)
+    # 适配器调用计数区分幂等跳过与实际重新采集。
+    client = FakeCompassClient()
+    # 浏览器和通知均使用可观察的本地替身。
+    browser, notifications = install_runner_fakes(
+        monkeypatch=monkeypatch, tmp_path=tmp_path, client=client
+    )
+    assert run_fake_collection(config=config, dry_run=False) == 0
+    assert run_fake_collection(config=config, dry_run=False) == 0
+    assert client.category_tree_calls == 1
+    assert len(client.ranking_calls) == 4
+    assert browser.close_count == 1
+    # 定时任务幂等跳过保持静默，不重复发送已有成功通知。
+    assert len(notifications) == 1
+    # 显式 force 复用计划时间，必须分配第二个发布版本。
+    task = config.tasks[0]
+    assert (
+        run_collection(
+            config,
+            selected_task_id=task.id,
+            force=True,
+            dry_run=False,
+            manual=True,
+            planned_at_overrides={task.id: PLANNED_AT},
+        )
+        == 0
+    )
+    # 读取最终数据库状态，核对两个版本及各自的 CSV 仍然存在。
+    database = Database(config.database.path)
+    try:
+        # 发布快照按执行时间倒序返回，版本号负责稳定身份。
+        rows = database.recent_status(limit=5)
+        with database.session_factory() as session:
+            # 两次正式发布均保留各自的商品行。
+            product_count = session.scalar(
+                select(func.count()).select_from(ProductRankEntryModel)
+            )
+    finally:
+        database.close()
+    assert sorted(row.version for row in rows) == [1, 2]
+    assert all(row.published_at is not None for row in rows)
+    assert len({row.csv_path for row in rows}) == 2
+    assert all(Path(row.csv_path).is_file() for row in rows)
+    assert product_count == 8
+    assert client.category_tree_calls == 2
+    assert len(client.ranking_calls) == 8
+    assert browser.close_count == 2
 
 
 def test_official_runner_publishes_dynamic_categories_and_chinese_csv(
@@ -289,8 +328,7 @@ def test_official_runner_publishes_dynamic_categories_and_chinese_csv(
     # runtime_events 验证 runner 把任务日志归入通知使用的同一执行批次。
     log_path = next((tmp_path / "runtime" / "logs").glob("*.jsonl"))
     runtime_events = [
-        json.loads(line)
-        for line in log_path.read_text(encoding="utf-8").splitlines()
+        json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
     ]
     # business_events 仅包含可定位到真实 task batch_id 的日志。
     business_events = [event for event in runtime_events if event.get("batch_id")]
@@ -314,7 +352,7 @@ def test_official_runner_publishes_dynamic_categories_and_chinese_csv(
     assert product_count == 4
     assert csv_path.parent.name == config.tasks[0].id
     assert csv_path.parent.parent.name == "2026-07-17"
-    assert csv_path.name.startswith("全行业三级分类商品实时榜_1400")
+    assert csv_path.name.startswith("个护家清实时榜_1400")
     assert len(csv_lines) == 5
     assert notifications[0].tasks[0].status is TaskNotificationStatus.SUCCESS
     assert notifications[0].tasks[0].saved_items == 4
@@ -337,12 +375,8 @@ def test_same_display_name_and_planned_time_use_task_isolated_csv_directories(
 
     # 两个任务只改变稳定 ID，中文展示名和计划时间故意完全相同。
     base_config = temporary_config(tmp_path)
-    first_task = base_config.tasks[0].model_copy(
-        update={"id": "food_rank_primary"}
-    )
-    second_task = base_config.tasks[0].model_copy(
-        update={"id": "food_rank_secondary"}
-    )
+    first_task = base_config.tasks[0].model_copy(update={"id": "food_rank_primary"})
+    second_task = base_config.tasks[0].model_copy(update={"id": "food_rank_secondary"})
     # AppConfig 保留同一个数据库并按配置顺序运行两个启用任务。
     config = base_config.model_copy(update={"tasks": [first_task, second_task]})
     # 同一个假客户端用于验证每个顶层任务分别请求一次分类树。
@@ -370,18 +404,14 @@ def test_same_display_name_and_planned_time_use_task_isolated_csv_directories(
     # SQLite 中的完整 csv_path 用于核对两个正式文件的任务目录边界。
     database = Database(config.database.path)
     try:
-        status_by_task = {
-            row.task_id: row for row in database.recent_status(limit=10)
-        }
+        status_by_task = {row.task_id: row for row in database.recent_status(limit=10)}
     finally:
         database.close()
     # 两个正式路径只允许任务目录不同，basename 必须保持中文展示契约。
     first_csv_path = Path(status_by_task[first_task.id].csv_path or "")
     second_csv_path = Path(status_by_task[second_task.id].csv_path or "")
     # 通知继续只携带 basename，不能泄漏本机目录结构。
-    notification_by_task = {
-        task.task_id: task for task in notifications[0].tasks
-    }
+    notification_by_task = {task.task_id: task for task in notifications[0].tasks}
 
     assert exit_code == 0
     assert client.category_tree_calls == 2
@@ -670,9 +700,7 @@ def test_committed_result_survives_notification_assignment_interrupt(
         database.close()
     # official_csv_exists 只在正式发布模式核对已提交文件仍存在。
     official_csv_exists = (
-        Path(status_row.csv_path).exists()
-        if status_row.csv_path is not None
-        else False
+        Path(status_row.csv_path).exists() if status_row.csv_path is not None else False
     )
 
     assert exit_code == 1
@@ -894,9 +922,7 @@ def test_publication_keyboard_interrupt_closes_batch_and_removes_csv(
         database.close()
     # 中止不得留下正式或临时 CSV 文件。
     export_files = [
-        path
-        for path in (tmp_path / "runtime" / "exports").rglob("*")
-        if path.is_file()
+        path for path in (tmp_path / "runtime" / "exports").rglob("*") if path.is_file()
     ]
 
     assert exit_code == 1
@@ -962,7 +988,10 @@ def test_browser_failure_persists_safe_page_diagnostics_in_new_batch_storage(
             screenshot=screenshot,
         )
 
-    monkeypatch.setattr("compass_collector.runner.open_browser", fail_browser_start)
+    monkeypatch.setattr(
+        "compass_collector.runner.create_adapter",
+        lambda *args, **kwargs: fail_browser_start(None),
+    )
     # 通知只收集内存摘要，禁止测试访问真实 Webhook。
     notifications: list[BatchNotificationSummary] = []
     monkeypatch.setattr(
@@ -983,6 +1012,7 @@ def test_browser_failure_persists_safe_page_diagnostics_in_new_batch_storage(
         tmp_path
         / "runtime"
         / "artifacts"
+        / "compass"
         / PLANNED_AT.date().isoformat()
         / config.tasks[0].id
         / status_row.batch_id

@@ -106,6 +106,7 @@ def test_batch_storage_creates_the_accepted_directory_and_initial_manifest(
     expected_batch_dir = (
         tmp_path
         / "raw"
+        / "compass"
         / "2026-07-17"
         / "product_hot_sale_food_level3"
         / ("a" * 32)

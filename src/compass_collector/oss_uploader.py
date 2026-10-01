@@ -163,6 +163,7 @@ class OssUploader:
         business_date: date,
         task_id: str,
         batch_id: str,
+        platform: str = "compass",
     ) -> OssUploadResult | None:
         """Upload one official CSV and generate its short-lived private download URL."""
 
@@ -171,7 +172,8 @@ class OssUploader:
         if not self.settings.valid:
             raise OssUploadError(self.settings.error_category or "oss_config_invalid")
         if (
-            not csv_path.is_file()
+            re.fullmatch(r"[a-z][a-z0-9_-]*", platform) is None
+            or not csv_path.is_file()
             or csv_path.suffix.lower() != ".csv"
             or TASK_ID_PATTERN.fullmatch(task_id) is None
             or not re.fullmatch(r"[0-9a-f]{32}", batch_id)
@@ -179,7 +181,7 @@ class OssUploader:
             raise OssUploadError("oss_upload_input_invalid")
         # 每个真实发布批次使用独立对象键，避免强制采集覆盖历史 CSV。
         object_key = (
-            f"{self.settings.object_prefix}/{business_date.isoformat()}/"
+            f"{self.settings.object_prefix}/{platform}/{business_date.isoformat()}/"
             f"{task_id}/{batch_id}/{csv_path.name}"
         )
         try:
@@ -198,9 +200,7 @@ class OssUploader:
                         f'attachment; filename="{csv_path.name}"'
                     ),
                 ),
-                expires=timedelta(
-                    seconds=self.settings.download_url_expires_seconds
-                ),
+                expires=timedelta(seconds=self.settings.download_url_expires_seconds),
             )
             if not isinstance(signed_result.url, str) or not signed_result.url:
                 raise OssUploadError("oss_presign_failed")

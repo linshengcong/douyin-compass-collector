@@ -1,10 +1,9 @@
 """Stage-three serial category ranking orchestration tests."""
 
 import json
-import time
 from datetime import date, datetime
 from pathlib import Path
-from threading import Lock, get_ident
+from threading import get_ident
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -20,7 +19,7 @@ from compass_collector.errors import (
     HttpRequestError,
     ResponseContractError,
 )
-from compass_collector.http_client import HttpJsonResponse
+from adapter_fixtures import FixtureResponse as HttpJsonResponse, FixtureAdapter
 from compass_collector.models import (
     CategoryDiscoveryResult,
     CategoryRunPlan,
@@ -315,103 +314,42 @@ class FakeRuntimeLogger:
         self.events.append(dict(event_fields))
 
 
-class FakeRankingClient:
-    """Serve category-specific totals or safe request failures without retries."""
+class FakeRankingClient(FixtureAdapter):
+    """Serve serial fixture pages and inject explicit boundary failures."""
 
     def __init__(
         self,
-        behavior_by_category: dict[str, int | Exception],
+        behavior_by_category,
         *,
-        page_fetch_workers: int = 1,
-        level1_fetch_workers: int = 1,
-        page_fetch_wait_timeout_seconds: float = 45,
-        delay_by_page: dict[int, float] | None = None,
-        delay_by_category_page: dict[tuple[str, int], float] | None = None,
-        failure_by_page: dict[int, Exception] | None = None,
-        stop_after_response_for: str | None = None,
-        control: CollectionControl | None = None,
-    ) -> None:
-        """Store deterministic category behavior and optional stop injection."""
-
-        # behavior_by_category 使用动态 category_id 选择结果。
+        failure_by_page=None,
+        stop_after_response_for=None,
+        control=None,
+    ):
+        """Keep deterministic per-category behavior and stop signals."""
+        # 调用顺序用于确认分类和分页都没有并发预取。
         self.behavior_by_category = behavior_by_category
-        # page_fetch_workers 模拟真实客户端暴露给编排层的分页 worker 数。
-        self.page_fetch_workers = page_fetch_workers
-        # level1_fetch_workers 模拟一级分类组的最大并发调度数。
-        self.level1_fetch_workers = level1_fetch_workers
-        # 分页绝对等待上限用于模拟底层 HTTP 无进度的看门狗边界。
-        self.page_fetch_wait_timeout_seconds = page_fetch_wait_timeout_seconds
-        # delay_by_page 用于制造乱序响应，验证主线程顺序持久化。
-        self.delay_by_page = dict(delay_by_page or {})
-        # delay_by_category_page 覆盖通用页延迟，用于稳定构造一级分类调度竞态。
-        self.delay_by_category_page = dict(delay_by_category_page or {})
-        # failure_by_page 用于模拟单个并发分页失败。
         self.failure_by_page = dict(failure_by_page or {})
-        # calls 保留请求启动记录，并发分页不依赖它断言落盘顺序。
-        self.calls: list[tuple[str, int]] = []
-        # _lock 保护并发测试中的调用、active 和 max_active 统计。
-        self._lock = Lock()
-        # active_requests 是当前仍未返回的模拟 HTTP 请求数。
-        self.active_requests = 0
-        # max_active_requests 用于断言分页预取确实发生且未超过上限。
-        self.max_active_requests = 0
-        # stop_after_response_for 模拟响应期间用户点击停止。
         self.stop_after_response_for = stop_after_response_for
-        # control 与编排层共享同一个中止信号。
         self.control = control
+        self.calls = []
 
-    def get_product_rank_page(
-        self,
-        task: Any,
-        params: dict[str, str | int],
-    ) -> HttpJsonResponse:
-        """Return one generated page or raise the configured error once requested."""
-
-        # 请求参数必须携带二级、三级分类组成的完整级联路径。
-        category_path = str(params["category_id"])
-        # category_path_parts 强制集成链路保持真实的两段格式。
-        category_path_parts = category_path.split(",")
-        if len(category_path_parts) != 2 or not all(category_path_parts):
-            raise AssertionError("category_id must contain level-two and level-three IDs")
-        # 行为映射继续使用级联路径末段的三级叶子 ID。
-        category_id = category_path_parts[-1]
-        # page_no 的配置契约保证为整数。
+    def get_product_rank_page(self, task, params):
+        """Return one complete fixture or fail at the selected serial page."""
+        # 二级/三级级联只在测试适配器中解释，共享编排不读取这些参数。
+        category_id = str(params["category_id"]).split(",")[-1]
         page_no = int(params["page_no"])
-        with self._lock:
-            self.calls.append((category_id, page_no))
-            self.active_requests += 1
-            self.max_active_requests = max(
-                self.max_active_requests,
-                self.active_requests,
-            )
-        try:
-            # delay_by_page 在请求已登记后等待，制造稳定的并发重叠。
-            delay_seconds = self.delay_by_category_page.get(
-                (category_id, page_no),
-                self.delay_by_page.get(page_no, 0),
-            )
-            if delay_seconds > 0:
-                time.sleep(delay_seconds)
-            # 单页失败优先于分类级行为，用于测试并发分页失败定位。
-            if page_no in self.failure_by_page:
-                raise self.failure_by_page[page_no]
-            # 当前分类行为在测试开始前完整配置。
-            behavior = self.behavior_by_category[category_id]
-            if isinstance(behavior, Exception):
-                raise behavior
-            # total 驱动真实分页契约生成每一页条数。
-            payload = build_page_payload(
-                category_id=category_id,
-                page_no=page_no,
-                total=behavior,
-            )
-            if category_id == self.stop_after_response_for and self.control is not None:
-                self.control.request_stop()
-            # body 仅用于失败路径，本测试使用同一脱敏 JSON 占位内容。
-            return HttpJsonResponse(payload=payload, body=b"sanitized", status_code=200)
-        finally:
-            with self._lock:
-                self.active_requests -= 1
+        self.calls.append((category_id, page_no))
+        if page_no in self.failure_by_page:
+            raise self.failure_by_page[page_no]
+        behavior = self.behavior_by_category[category_id]
+        if isinstance(behavior, Exception):
+            raise behavior
+        payload = build_page_payload(
+            category_id=category_id, page_no=page_no, total=behavior
+        )
+        if category_id == self.stop_after_response_for and self.control is not None:
+            self.control.request_stop()
+        return HttpJsonResponse(payload=payload, body=b"sanitized", status_code=200)
 
 
 def build_prepared_batch(
@@ -431,7 +369,9 @@ def build_prepared_batch(
     )
     # 每个分类运行 ID 在批次准备阶段已经固定。
     plans = tuple(
-        CategoryRunPlan(category_run_id=f"run-{category.discovery_order}", category=category)
+        CategoryRunPlan(
+            category_run_id=f"run-{category.discovery_order}", category=category
+        )
         for category in categories
     )
     # discovery 只提供阶段三不再请求的根与分类快照。
@@ -442,7 +382,7 @@ def build_prepared_batch(
     )
     return PreparedCategoryBatch(
         batch_id="batch-stage-three",
-        task_id="product_hot_sale_all_level3",
+        task_id="compass_household_cleaning_realtime",
         business_date=BUSINESS_DATE,
         planned_at=PLANNED_AT,
         mode="normal",
@@ -491,9 +431,12 @@ def test_collects_more_than_two_hundred_items_in_strict_page_order() -> None:
     assert database.success_calls == ["run-1"]
     assert database.terminate_calls == []
     # 每页三层操作必须连续保持 raw -> SQLite -> Manifest。
-    page_events = [event for event in events if event[0] in {"raw", "sqlite_page"} or (
-        event[0] == "manifest" and event[1] == "page"
-    )]
+    page_events = [
+        event
+        for event in events
+        if event[0] in {"raw", "sqlite_page"}
+        or (event[0] == "manifest" and event[1] == "page")
+    ]
     assert page_events[:3] == [
         ("raw", "run-1", 1),
         ("sqlite_page", "run-1", 1),
@@ -501,138 +444,7 @@ def test_collects_more_than_two_hundred_items_in_strict_page_order() -> None:
     ]
 
 
-def test_prefetched_pages_persist_in_page_order_after_out_of_order_responses() -> None:
-    """Fetch later pages concurrently while committing raw and SQLite in order."""
-
-    # 延迟让第 5 页先于第 2 页返回，验证主线程按页码缓冲落盘。
-    events: list[tuple[Any, ...]] = []
-    storage = FakeBatchStorage(events)
-    database = FakeDatabase(events)
-    client = FakeRankingClient(
-        {"category-1": 51},
-        page_fetch_workers=4,
-        delay_by_page={2: 0.08, 3: 0.06, 4: 0.04, 5: 0.02, 6: 0.01},
-    )
-    prepared_batch = build_prepared_batch(category_count=1, storage=storage)
-
-    result = collect_category_batch(
-        prepared_batch=prepared_batch,
-        task=load_task(),
-        client=client,  # type: ignore[arg-type]
-        database=database,  # type: ignore[arg-type]
-        runtime_logger=FakeRuntimeLogger(),  # type: ignore[arg-type]
-    )
-
-    page_events = [
-        event
-        for event in events
-        if event[0] in {"raw", "sqlite_page"}
-        or (event[0] == "manifest" and event[1] == "page")
-    ]
-    assert result.category_runs[0].target_page_count == 6
-    assert client.max_active_requests > 1
-    assert client.max_active_requests <= 4
-    assert page_events == [
-        ("raw", "run-1", 1),
-        ("sqlite_page", "run-1", 1),
-        ("manifest", "page", "run-1", 1),
-        ("raw", "run-1", 2),
-        ("sqlite_page", "run-1", 2),
-        ("manifest", "page", "run-1", 2),
-        ("raw", "run-1", 3),
-        ("sqlite_page", "run-1", 3),
-        ("manifest", "page", "run-1", 3),
-        ("raw", "run-1", 4),
-        ("sqlite_page", "run-1", 4),
-        ("manifest", "page", "run-1", 4),
-        ("raw", "run-1", 5),
-        ("sqlite_page", "run-1", 5),
-        ("manifest", "page", "run-1", 5),
-        ("raw", "run-1", 6),
-        ("sqlite_page", "run-1", 6),
-        ("manifest", "page", "run-1", 6),
-    ]
-
-
-def test_level_one_groups_fetch_concurrently_but_persist_on_owner_thread() -> None:
-    """Run two top-level groups together without moving storage or SQLite writes off-thread."""
-
-    # 两个一级分类各含一个空榜单，第一页延迟确保网络请求产生稳定重叠。
-    events: list[tuple[Any, ...]] = []
-    storage = FakeBatchStorage(events)
-    database = FakeDatabase(events)
-    client = FakeRankingClient(
-        {"category-1": 0, "category-2": 0},
-        level1_fetch_workers=2,
-        delay_by_page={1: 0.05},
-    )
-    prepared_batch = build_prepared_batch(
-        category_count=2,
-        storage=storage,
-        level1_category_ids=("13", "25"),
-    )
-    owner_thread_id = get_ident()
-
-    result = collect_category_batch(
-        prepared_batch=prepared_batch,
-        task=load_task(),
-        client=client,  # type: ignore[arg-type]
-        database=database,  # type: ignore[arg-type]
-        runtime_logger=FakeRuntimeLogger(),  # type: ignore[arg-type]
-    )
-
-    assert client.max_active_requests == 2
-    assert [run.plan.category_run_id for run in result.category_runs] == [
-        "run-1",
-        "run-2",
-    ]
-    assert set(database.write_thread_ids) == {owner_thread_id}
-    assert set(storage.write_thread_ids) == {owner_thread_id}
-
-
-def test_parallel_group_completion_immediately_refills_a_free_slot_before_auth_failure() -> None:
-    """Refill a free group slot, then stop the batch once a later auth failure arrives."""
-
-    # 第二组先完成后，空闲槽位应立即启动第三组；第一组随后报告认证失效。
-    events: list[tuple[Any, ...]] = []
-    storage = FakeBatchStorage(events)
-    database = FakeDatabase(events)
-    client = FakeRankingClient(
-        {
-            "category-1": AuthRequiredError(
-                "Compass authentication is required",
-                category="auth_required",
-                status_code=401,
-                response_body=b"sanitized-auth-response",
-            ),
-            "category-2": 0,
-            "category-3": 0,
-        },
-        level1_fetch_workers=2,
-        # category-2 先完成并释放一个 worker 槽位；category-1 随后才报告认证失效。
-        delay_by_category_page={("category-1", 1): 0.03},
-    )
-    prepared_batch = build_prepared_batch(
-        category_count=3,
-        storage=storage,
-        level1_category_ids=("13", "25", "37"),
-    )
-
-    with pytest.raises(CategoryBatchCollectionError) as error_info:
-        collect_category_batch(
-            prepared_batch=prepared_batch,
-            task=load_task(),
-            client=client,  # type: ignore[arg-type]
-            database=database,  # type: ignore[arg-type]
-            runtime_logger=FakeRuntimeLogger(),  # type: ignore[arg-type]
-        )
-
-    assert error_info.value.cause.category == "auth_required"
-    assert any(category_id == "category-3" for category_id, _page_no in client.calls)
-    assert database.terminate_calls[0]["status"] == "auth_required"
-
-
-def test_concurrent_page_failure_records_the_failed_page() -> None:
+def test_serial_page_failure_retains_prior_pages() -> None:
     """Report the failing concurrent page without publishing later buffered pages."""
 
     # 第 3 页在并发预取中失败，分类按普通失败收口并继续批次语义。
@@ -641,8 +453,6 @@ def test_concurrent_page_failure_records_the_failed_page() -> None:
     database = FakeDatabase(events)
     client = FakeRankingClient(
         {"category-1": 41, "category-2": 0},
-        page_fetch_workers=4,
-        delay_by_page={2: 0.05, 3: 0.01, 4: 0.05, 5: 0.05},
         failure_by_page={
             3: HttpRequestError(
                 "HTTP request timed out",
@@ -672,41 +482,7 @@ def test_concurrent_page_failure_records_the_failed_page() -> None:
             "error_category": "timeout",
         }
     ]
-    assert persisted_pages == [("run-1", 1), ("run-2", 1)]
-
-
-def test_stalled_prefetch_times_out_and_allows_later_category_to_continue() -> None:
-    """Fail one no-progress prefetch without blocking later category collection."""
-
-    # 第一个分类的预取页故意慢于绝对上限；第二个分类仍必须被完整采集。
-    events: list[tuple[Any, ...]] = []
-    storage = FakeBatchStorage(events)
-    database = FakeDatabase(events)
-    client = FakeRankingClient(
-        {"category-1": 21, "category-2": 0},
-        page_fetch_workers=2,
-        page_fetch_wait_timeout_seconds=0.01,
-        delay_by_page={2: 0.08, 3: 0.08},
-    )
-    prepared_batch = build_prepared_batch(category_count=2, storage=storage)
-
-    result = collect_category_batch(
-        prepared_batch=prepared_batch,
-        task=load_task(),
-        client=client,  # type: ignore[arg-type]
-        database=database,  # type: ignore[arg-type]
-        runtime_logger=FakeRuntimeLogger(),  # type: ignore[arg-type]
-    )
-
-    assert [run.plan.category_run_id for run in result.category_runs] == ["run-2"]
-    assert result.failed_category_count == 1
-    # 第 2、3 页同时预取：当 runner 线程恰好在第 2 页完成后才恢复，
-    # 下一次无进度超时会自然落在第 3 页。两者都是同一“预取停滞”语义。
-    assert len(database.failure_calls) == 1
-    failure_call = database.failure_calls[0]
-    assert failure_call["category_run_id"] == "run-1"
-    assert failure_call["error_category"] == "timeout"
-    assert failure_call["failed_page"] in {2, 3}
+    assert persisted_pages == [("run-1", 1), ("run-1", 2), ("run-2", 1)]
 
 
 def test_total_zero_still_saves_one_empty_page() -> None:
@@ -805,7 +581,9 @@ def test_one_ordinary_failure_continues_without_retry() -> None:
     assert database.terminate_calls == []
 
 
-def test_all_ordinary_failures_terminate_only_after_every_category_is_attempted() -> None:
+def test_all_ordinary_failures_terminate_only_after_every_category_is_attempted() -> (
+    None
+):
     """Keep skipping ordinary failures, then fail the batch only when none succeeded."""
 
     # 四个分类都配置失败；每个分类都应保留失败材料后才收口空结果批次。
@@ -909,7 +687,10 @@ def test_three_consecutive_platform_unavailable_failures_open_circuit_breaker() 
         "run-3",
     ]
     assert database.terminate_calls[0]["status"] == "failed"
-    assert database.terminate_calls[0]["error_category"] == "platform_temporarily_unavailable"
+    assert (
+        database.terminate_calls[0]["error_category"]
+        == "platform_temporarily_unavailable"
+    )
     assert any(
         event["event"] == "platform_unavailable_circuit_opened"
         and event["details"]["consecutive_failure_count"] == 3
@@ -1014,7 +795,7 @@ def test_real_sqlite_and_manifest_finish_collection_without_publication(
     storage = BatchStorage(
         runtime_root=tmp_path / "runtime",
         batch_id="real-stage-three-batch",
-        task_id="product_hot_sale_all_level3",
+        task_id="compass_household_cleaning_realtime",
         business_date=BUSINESS_DATE,
         planned_at=PLANNED_AT,
         mode="normal",
@@ -1023,7 +804,7 @@ def test_real_sqlite_and_manifest_finish_collection_without_publication(
     try:
         database.create_batch(
             batch_id="real-stage-three-batch",
-            task_id="product_hot_sale_all_level3",
+            task_id="compass_household_cleaning_realtime",
             business_date=BUSINESS_DATE,
             planned_at=PLANNED_AT,
             mode="normal",
@@ -1051,7 +832,7 @@ def test_real_sqlite_and_manifest_finish_collection_without_publication(
         # PreparedCategoryBatch 直接复用真实 storage 进入阶段三。
         prepared_batch = PreparedCategoryBatch(
             batch_id="real-stage-three-batch",
-                task_id="product_hot_sale_all_level3",
+            task_id="compass_household_cleaning_realtime",
             business_date=BUSINESS_DATE,
             planned_at=PLANNED_AT,
             mode="normal",

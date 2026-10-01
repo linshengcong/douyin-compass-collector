@@ -1,7 +1,9 @@
 # 默认任务 ID 可在命令行通过 TASK=... 覆盖。
-TASK ?= product_hot_sale_all_level3
+TASK ?= compass_household_cleaning_realtime
 # uv 命令可在不同安装环境中通过 UV=/absolute/path/uv 覆盖。
 UV ?= uv
+# 登录和清除认证按平台选择独立 Profile。
+PLATFORM ?= compass
 # 采集模式统一通过 MODE 选择：normal、dry-run 或 force。
 MODE ?= normal
 # GUI 统一通过 GUI 选择：yes 为桌面窗口，no 为终端模式。
@@ -44,7 +46,7 @@ install: ## 按 uv.lock 安装依赖
 	$(UV) sync --frozen
 
 login: ## 打开独立 Chrome，人工登录
-	$(PYTHON) -m compass_collector login
+	$(PYTHON) -m compass_collector login --platform $(PLATFORM)
 
 app: ## 打开空闲 PySide6 采集控制台
 	$(PYTHON) -m compass_collector app --task $(TASK)
@@ -59,7 +61,7 @@ clear-data: ## 清除本地采集数据，保留 Chrome 登录态
 	$(PYTHON) -m compass_collector clear-data --yes
 
 clear-login: ## 清除 Chrome 登录态，保留本地采集数据
-	$(PYTHON) -m compass_collector clear-auth --yes
+	$(PYTHON) -m compass_collector clear-auth --platform $(PLATFORM) --yes
 
 status: ## 查看最近运行状态
 	$(PYTHON) -m compass_collector status

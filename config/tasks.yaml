@@ -6,52 +6,26 @@ scheduler:
 browser:
   channel: chrome
   headless: false
-  profile_dir: runtime/browser-profile
   locale: zh-CN
   timezone_id: Asia/Shanghai
   keep_open_after_manual_run: true
 
-auth:
-  # 白名单只包含 Cookie 名称，永远不要在此文件写入 Cookie 值。
-  # 下列名称来自已失效的真实会话样本，运行时只传递当前 Profile 中实际存在的项。
-  cookie_names:
-    - s_v_web_id
-    - passport_csrf_token
-    - passport_csrf_token_default
-    - ttwid
-    - odin_tt
-    - passport_auth_status
-    - passport_auth_status_ss
-    - uid_tt
-    - uid_tt_ss
-    - sid_tt
-    - sessionid
-    - sessionid_ss
-    - ucas_c0_compass
-    - ucas_c0_ss_compass
-    - sid_guard
-    - session_tlb_tag
-    - sid_ucp_v1
-    - ssid_ucp_v1
-    - LUOPAN_DT
-    - COMPASS_LUOPAN_DT
-    - ecom_us_lt_compass
-    - ecom_us_lt_ss_compass
-    - x-web-secsdk-uid
-    - csrf_session_id
+platforms:
+  compass:
+    profile_dir: runtime/browser-profile
 
-http:
-  # 两个一级分类并行；每个三级分类最多四页预取；全局请求不超过八个。
-  level1_concurrency: 2
-  page_concurrency: 4
-  max_in_flight_requests: 8
-  # 网络断连最多额外重试两次，按 1 秒、2 秒退避。
-  network_retry_attempts: 2
+collection:
   request_interval_seconds:
-    min: 0.067
-    max: 0.1
-  connect_timeout_seconds: 10
-  read_timeout_seconds: 30
+    min: 0.5
+    max: 1
+  action_timeout_seconds: 30
+  response_timeout_seconds: 45
+  scroll_settle_seconds: 1.5
+  manual_auth_wait_seconds: 180
+  network_retry_attempts: 2
+
+publication:
+  web_primary_task_id: compass_household_cleaning_realtime
 
 database:
   path: runtime/data/collector.db
@@ -64,9 +38,10 @@ retention:
   delete_exports: false
 
 tasks:
-  - id: product_hot_sale_all_level3
+  - id: compass_household_cleaning_realtime
+    platform: compass
     enabled: true
-    display_name: 全行业三级分类商品实时榜
+    display_name: 个护家清实时榜
     schedule: "0 14 * * *"
     rank:
       type: product_hot_sale
@@ -75,11 +50,13 @@ tasks:
       activity_id: ""
     category_scope:
       mode: all_level1
+      # 只循环个护家清行业下的全部三级分类。
+      industry_id: "5"
       target_level: 3
       exclude_all: true
     filters:
-      # 已验证：0 表示非知名品牌 1 表示知名品牌。
-      brand_type: 0
+      # 已验证：-1 表示不限，0 表示非知名品牌。
+      brand_type: -1
       # 已验证：不限表示不限制商品价格带。
       price_bin: "不限"
       search_info: ""

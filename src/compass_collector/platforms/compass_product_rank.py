@@ -1,6 +1,7 @@
 """Verified request and response contract for the product hot-sale ranking."""
 
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import date, datetime
 from math import ceil
 from typing import Any
@@ -126,7 +127,9 @@ def validate_page_payload(
     # 响应 data 节点承载分页元数据和榜单数组。
     data = payload.get("data")
     if not isinstance(data, dict):
-        raise ResponseContractError("response data is missing", category="invalid_contract")
+        raise ResponseContractError(
+            "response data is missing", category="invalid_contract"
+        )
     # 真实榜单数组位于 data.data_result。
     data_result = data.get("data_result")
     if not isinstance(data_result, list):
@@ -239,9 +242,9 @@ def parse_metric_range(
             category="invalid_product",
         )
     return MetricRange(
-        min_value=parsed_values[0],
-        max_value=parsed_values[1],
-        unit=expected_unit,
+        min_value=Decimal(parsed_values[0]) / (100 if expected_unit == "price" else 10),
+        max_value=Decimal(parsed_values[1]) / (100 if expected_unit == "price" else 10),
+        unit="CNY" if expected_unit == "price" else "count",
     )
 
 
@@ -344,7 +347,7 @@ def parse_page_entries(
             shops.append(
                 ProductShop(position=position, shop_id=shop_id, shop_name=shop_name)
             )
-        # 金额和成交件数分别按已验证单位保存原值。
+        # 在平台边界将金额和成交件数换算为实际单位。
         pay_amount = parse_metric_range(
             item.get("new_pay_amt"),
             expected_unit="price",

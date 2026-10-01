@@ -240,7 +240,7 @@ def _reduce_gui_progress_legacy(
         return replace(
             state,
             stage_text="阶段：请求分类树",
-            progress_text="正在发现全部一级分类下的三级分类",
+            progress_text="正在发现配置范围内的三级分类",
             category_index=0,
             category_total=0,
             page_no=0,
@@ -265,7 +265,7 @@ def _reduce_gui_progress_legacy(
             page_no=0,
             target_pages=0,
             category_path=None,
-            result_text="分类发现完成，准备并发采集",
+            result_text="分类发现完成，准备串行采集",
             indeterminate=False,
         )
     if event_name == "category_collection_started":
@@ -553,10 +553,7 @@ def _replace_category_progress(
 ) -> tuple[CategoryProgress, ...]:
     """Upsert one category progress row while keeping discovery order stable."""
 
-    rows = {
-        item.category_run_id: item
-        for item in state.category_progress
-    }
+    rows = {item.category_run_id: item for item in state.category_progress}
     rows[category_progress.category_run_id] = category_progress
     return tuple(
         sorted(
@@ -599,7 +596,11 @@ def _reduce_concurrent_category_progress(
     if category_run_id is None:
         return state
     existing = next(
-        (item for item in state.category_progress if item.category_run_id == category_run_id),
+        (
+            item
+            for item in state.category_progress
+            if item.category_run_id == category_run_id
+        ),
         None,
     )
     discovery_order = _event_non_negative_int(
@@ -611,7 +612,9 @@ def _reduce_concurrent_category_progress(
     category_path = (
         raw_path.strip()
         if isinstance(raw_path, str) and raw_path.strip()
-        else existing.category_path if existing is not None else state.category_path
+        else existing.category_path
+        if existing is not None
+        else state.category_path
     )
     page_no = _event_non_negative_int(
         event,
@@ -628,7 +631,7 @@ def _reduce_concurrent_category_progress(
         status = "succeeded"
         page_no = target_pages if target_pages > 0 else page_no
     elif event_name in {"category_collection_failed", "category_unavailable"}:
-        # 平台越权分类已完成跳过，不能继续占用并发槽位显示为等待首页。
+        # 平台越权分类已完成跳过，不能继续占用采集槽位显示为等待首页。
         status = "failed"
     category_progress = _replace_category_progress(
         state,
@@ -804,7 +807,9 @@ class CollectorWindow(QMainWindow):
         # Scheduler 子进程由 Qt 管理生命周期和输出读取。
         self.scheduler_process = QProcess(self)
         self.scheduler_process.setProcessChannelMode(QProcess.MergedChannels)
-        self.scheduler_process.readyReadStandardOutput.connect(self._read_scheduler_output)
+        self.scheduler_process.readyReadStandardOutput.connect(
+            self._read_scheduler_output
+        )
         self.scheduler_process.finished.connect(self._scheduler_finished)
         # 状态计时器检测终端或 launchd 启动的外部 Scheduler。
         self.scheduler_timer = QTimer(self)
@@ -854,14 +859,25 @@ class CollectorWindow(QMainWindow):
         if selected_task is None:
             raise ValueError("no enabled tasks are configured")
         self.task_label = QLabel(f"{selected_task.display_name} ({selected_task.id})")
-        self.account_label = QLabel(f"当前 Profile：{self.config.browser.profile_dir}")
-        self.host_label = QLabel("compass.jinritemai.com")
+        self.account_label = QLabel(
+            f"当前 Profile：{self.config.browser_for(selected_task.platform).profile_dir}"
+        )
+        self.host_label = QLabel(selected_task.platform)
         self.interval_label = QLabel(
-            f"{self.config.http.request_interval_seconds.min:g}–"
-            f"{self.config.http.request_interval_seconds.max:g} 秒 / "
-            f"一级分类 {self.config.http.level1_concurrency} 线程、"
-            f"分页 {self.config.http.page_concurrency} 线程、"
-            f"全局 {self.config.http.max_in_flight_requests} 请求"
+            f"{self.config.collection.request_interval_seconds.min:g}–"
+            f"{self.config.collection.request_interval_seconds.max:g} 秒 / "
+            f"页面串行采集 / {selected_task.category_scope.mode} / "
+            + (
+                ", ".join(
+                    f"{target.industry_id}:{target.category_id}"
+                    for target in selected_task.category_scope.targets
+                )
+                or (
+                    f"industry_id={selected_task.category_scope.industry_id} 下全部三级分类"
+                    if selected_task.category_scope.industry_id is not None
+                    else "自动发现全部三级分类"
+                )
+            )
         )
         self.schedule_label = QLabel(selected_task.schedule)
         self.run_status_label = QLabel("空闲")
@@ -898,15 +914,15 @@ class CollectorWindow(QMainWindow):
         category_progress_layout.addWidget(self.progress_text)
         progress_layout.addLayout(category_progress_layout)
         self.active_category_progress_layout = QVBoxLayout()
-        # 槽位数量与一级分类并发数一致，后续更新内容而不增删行以避免窗口跳动。
+        # 串行运行保留一个分类进度槽位，后续更新内容而不增删行以避免窗口跳动。
         self.active_category_progress_rows: list[
             tuple[QLabel, QProgressBar, QLabel]
         ] = []
-        for slot_index in range(max(1, self.config.http.level1_concurrency)):
+        for slot_index in range(1):
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
-            category_label = QLabel(f"并发槽位 {slot_index + 1} · 等待分类")
+            category_label = QLabel(f"采集槽位 {slot_index + 1} · 等待分类")
             category_bar = QProgressBar()
             category_bar.setRange(0, 1)
             category_bar.setValue(0)
@@ -947,7 +963,9 @@ class CollectorWindow(QMainWindow):
         self.batch_label = QLabel("-")
         self.result_label = QLabel("尚未运行")
         self.notification_label = QLabel("未知")
-        self.csv_label = QLabel(str(self.current_csv_path) if self.current_csv_path else "-")
+        self.csv_label = QLabel(
+            str(self.current_csv_path) if self.current_csv_path else "-"
+        )
         self.csv_label.setTextInteractionFlags(self.csv_label.textInteractionFlags())
         result_layout.addWidget(QLabel("批次 ID"), 0, 0)
         result_layout.addWidget(self.batch_label, 0, 1)
@@ -1123,7 +1141,9 @@ class CollectorWindow(QMainWindow):
         self._render_active_category_progress()
         # current_csv_path 与纯状态保持一致，禁止从普通成功文案推断 CSV。
         self.current_csv_path = self.progress_state.csv_path
-        self.csv_label.setText(str(self.current_csv_path) if self.current_csv_path else "-")
+        self.csv_label.setText(
+            str(self.current_csv_path) if self.current_csv_path else "-"
+        )
         self.open_csv_button.setEnabled(
             self.current_csv_path is not None and self.current_csv_path.exists()
         )
@@ -1144,14 +1164,12 @@ class CollectorWindow(QMainWindow):
                 else None
             )
             if category is None:
-                category_label.setText(f"并发槽位 {slot_index + 1} · 等待分类")
+                category_label.setText(f"采集槽位 {slot_index + 1} · 等待分类")
                 category_bar.setRange(0, 1)
                 category_bar.setValue(0)
                 page_label.setText("空闲")
                 continue
-            category_label.setText(
-                f"进行中 · {category.category_path or '三级分类'}"
-            )
+            category_label.setText(f"进行中 · {category.category_path or '三级分类'}")
             if category.target_pages > 0:
                 category_bar.setRange(0, category.target_pages)
                 category_bar.setValue(min(category.page_no, category.target_pages))
@@ -1221,7 +1239,9 @@ class CollectorWindow(QMainWindow):
         """Copy only visible selected safe rows to the system clipboard."""
 
         # selected_rows 去重后保持表格自然顺序。
-        selected_rows = sorted({index.row() for index in self.log_table.selectedIndexes()})
+        selected_rows = sorted(
+            {index.row() for index in self.log_table.selectedIndexes()}
+        )
         # 每行使用制表符拼接当前四个安全展示列。
         copied_lines: list[str] = []
         for row_index in selected_rows:
@@ -1244,7 +1264,9 @@ class CollectorWindow(QMainWindow):
         self.run_status_label.setText("完成" if exit_code == 0 else "未成功")
         if exit_code != 0 and self.result_label.text() == "采集中":
             # error_type 只包含稳定 Python 类型名。
-            self.result_label.setText(f"运行未成功：{error_type or 'collection_failed'}")
+            self.result_label.setText(
+                f"运行未成功：{error_type or 'collection_failed'}"
+            )
         self.collection_worker = None
         self.collection_thread = None
         self.collection_control = None
@@ -1264,8 +1286,7 @@ class CollectorWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "确认中止",
-            "当前请求会在完成或超时后停止，不完整数据不会发布。"
-            "是否继续？",
+            "当前请求会在完成或超时后停止，不完整数据不会发布。是否继续？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1392,7 +1413,9 @@ class CollectorWindow(QMainWindow):
             self.scheduler_status_label.setText("GUI Scheduler 运行中")
 
     @Slot(int, QProcess.ExitStatus)
-    def _scheduler_finished(self, exit_code: int, exit_status: QProcess.ExitStatus) -> None:
+    def _scheduler_finished(
+        self, exit_code: int, exit_status: QProcess.ExitStatus
+    ) -> None:
         """Clear owned Scheduler state after graceful or abnormal process exit."""
 
         # 进程退出后再读一次，避免漏掉缓冲区中的最后一条完成事件。
@@ -1438,11 +1461,15 @@ class CollectorWindow(QMainWindow):
             external_scheduler = (
                 False
                 if self.owned_scheduler
-                else lock_is_held(RUNTIME_ROOT / "locks" / "scheduler.lock", "scheduler")
+                else lock_is_held(
+                    RUNTIME_ROOT / "locks" / "scheduler.lock", "scheduler"
+                )
             )
         self.start_button.setEnabled(not self.collecting)
         self.mode_combo.setEnabled(not self.collecting and not self.request.lock_mode)
-        self.force_checkbox.setEnabled(not self.collecting and not self.request.lock_mode)
+        self.force_checkbox.setEnabled(
+            not self.collecting and not self.request.lock_mode
+        )
         self.abort_button.setEnabled(
             (self.collecting and not self.inspection_ready)
             or (self.scheduler_job_active and self.owned_scheduler)
@@ -1474,7 +1501,9 @@ class CollectorWindow(QMainWindow):
             )
             self.open_csv_button.setText("打开最近已发布 CSV")
         self.open_csv_button.setEnabled(self.current_csv_path is not None)
-        self.csv_label.setText(str(self.current_csv_path) if self.current_csv_path else "-")
+        self.csv_label.setText(
+            str(self.current_csv_path) if self.current_csv_path else "-"
+        )
 
     @Slot()
     def open_csv(self) -> None:
@@ -1483,7 +1512,9 @@ class CollectorWindow(QMainWindow):
         if self.current_csv_path is None or not self.current_csv_path.exists():
             self._refresh_csv_controls()
             return
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.current_csv_path.resolve())))
+        QDesktopServices.openUrl(
+            QUrl.fromLocalFile(str(self.current_csv_path.resolve()))
+        )
 
     @Slot()
     def open_output_directory(self) -> None:
@@ -1579,8 +1610,7 @@ class CollectorWindow(QMainWindow):
             answer = QMessageBox.question(
                 self,
                 "采集仍在运行",
-                "退出会中止本次采集、关闭 Chrome 并等待资源清理，"
-                "是否继续？",
+                "退出会中止本次采集、关闭 Chrome 并等待资源清理，是否继续？",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )

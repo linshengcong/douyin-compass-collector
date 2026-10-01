@@ -1,7 +1,8 @@
 """Immutable domain records shared by parsing, persistence, and CSV export."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 from compass_collector.raw_storage import BatchStorage
@@ -11,8 +12,8 @@ from compass_collector.raw_storage import BatchStorage
 class MetricRange:
     """Preserve one platform value range without persistence-layer conversion."""
 
-    min_value: int
-    max_value: int
+    min_value: Decimal
+    max_value: Decimal
     unit: str
 
 
@@ -50,6 +51,8 @@ class RawPageRecord:
     path: Path
     item_count: int
     captured_at: datetime
+    # 只保存适配器提供的安全业务参数，不保存签名或认证。
+    safe_params: dict[str, str | int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +81,75 @@ class DiscoveredCategory:
             f"{self.category_name}"
         )
 
+    @property
+    def key(self) -> str:
+        """Expose the legacy category identity for migration compatibility."""
+        return self.category_id
+
+    @property
+    def path(self) -> tuple[str, ...]:
+        """Read legacy three-level paths through the shared scope contract."""
+        return (
+            self.level1_category_name,
+            self.level2_category_name,
+            self.category_name,
+        )
+
+    @property
+    def platform_metadata(self) -> dict[str, str]:
+        """Keep legacy Compass IDs available during historical migration."""
+        return {
+            "industry_id": self.level1_category_id,
+            "level2_id": self.level2_category_id,
+            "category_id": self.category_id,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveredScope:
+    """Generic scope identity, ordered path and adapter-owned metadata."""
+
+    # 任意平台可以提供一层或多层路径，不要求三级类目。
+    discovery_order: int
+    key: str
+    path: tuple[str, ...]
+    platform_metadata: dict[str, str]
+
+    @property
+    def display_path(self) -> str:
+        """Format the complete generic path without dropping deeper levels."""
+        return " > ".join(self.path)
+
+    @property
+    def category_id(self) -> str:
+        """Expose the persisted identity used by existing category-run indexes."""
+        return self.key
+
+    @property
+    def category_name(self) -> str:
+        """Provide the last path segment for historical readers."""
+        return self.path[-1]
+
+    @property
+    def level1_category_id(self) -> str:
+        """Read optional Compass metadata for legacy database columns."""
+        return self.platform_metadata.get("industry_id", "")
+
+    @property
+    def level2_category_id(self) -> str:
+        """Read optional Compass metadata without requiring it on other platforms."""
+        return self.platform_metadata.get("level2_id", "")
+
+    @property
+    def level1_category_name(self) -> str:
+        """Retain existing website projection for Compass snapshots."""
+        return self.path[0]
+
+    @property
+    def level2_category_name(self) -> str:
+        """Retain an optional second segment for historical readers."""
+        return self.path[1] if len(self.path) > 1 else ""
+
 
 @dataclass(frozen=True, slots=True)
 class CategoryDiscoveryResult:
@@ -87,7 +159,7 @@ class CategoryDiscoveryResult:
     root_category_id: str | None
     root_category_name: str | None
     # categories 已排除“全部”并忽略四级及更深节点。
-    categories: tuple[DiscoveredCategory, ...]
+    categories: tuple[DiscoveredScope | DiscoveredCategory, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,7 +168,7 @@ class CategoryRunPlan:
 
     # category_run_id 用于连接分页 raw、运行状态和正式排名。
     category_run_id: str
-    category: DiscoveredCategory
+    category: DiscoveredScope | DiscoveredCategory
 
 
 @dataclass(frozen=True, slots=True)

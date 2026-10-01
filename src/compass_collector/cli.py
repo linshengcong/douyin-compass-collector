@@ -7,7 +7,10 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from compass_collector.config import AppConfig, load_config
-from compass_collector.local_data import clear_auth_data_with_locks, clear_local_data_with_locks
+from compass_collector.local_data import (
+    clear_auth_data_with_locks,
+    clear_local_data_with_locks,
+)
 from compass_collector.notifier import load_project_environment, run_notification_test
 from compass_collector.runner import run_collection, run_login, run_status
 from compass_collector.runtime_locks import RuntimeLockBusy
@@ -37,8 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # login 命令用于人工维护持久化登录态。
-    login_parser = subparsers.add_parser("login", help="open the persistent Chrome profile")
+    login_parser = subparsers.add_parser(
+        "login", help="open the persistent Chrome profile"
+    )
     login_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    # 默认罗盘，可显式选择已注册的平台 Profile。
+    login_parser.add_argument("--platform", default="compass")
 
     # app 命令只打开空闲 GUI 控制台，不自动启动采集。
     app_parser = subparsers.add_parser("app", help="open the idle desktop console")
@@ -63,6 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clear_auth_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     clear_auth_parser.add_argument("--yes", action="store_true")
+    clear_auth_parser.add_argument("--platform", default="compass")
 
     # run 命令默认使用 GUI，--no-gui 显式回退终端模式。
     run_parser = subparsers.add_parser(
@@ -153,7 +161,7 @@ def _dispatch_configured_command(
     ):
         return _show_packaged_console_command_notice()
     if arguments.command == "login":
-        exit_code = run_login(config)
+        exit_code = run_login(config, arguments.platform)
     elif arguments.command == "app":
         # PySide6 延迟导入，status、login 和后台 Scheduler 不初始化 Qt。
         from compass_collector.gui import GuiLaunchRequest, run_gui
@@ -208,7 +216,9 @@ def _dispatch_configured_command(
         if not arguments.yes:
             raise ValueError("clear-auth requires --yes")
         # 获取采集锁后删除 Chrome Profile 目录，保留原始 runtime 结构。
-        cleared = clear_auth_data_with_locks(runtime_root(), config.browser.profile_dir)
+        cleared = clear_auth_data_with_locks(
+            runtime_root(), config.browser_for(arguments.platform).profile_dir
+        )
         if cleared:
             print("登录态已清除：Chrome 浏览器 Profile 已重置")
         else:
