@@ -528,6 +528,27 @@ def test_notify_test_returns_nonzero_when_notification_is_disabled(
     assert exit_code == 1
 
 
+@pytest.mark.parametrize("platform,title", [("compass", "罗盘采集器通知测试"), ("taobao", "淘宝采集器通知测试")])
+def test_notification_test_keeps_requested_platform(tmp_path, monkeypatch, platform, title):
+    """The compact notify entrypoint must identify the chosen platform in its real payload."""
+    # 只发送到MockTransport，禁止使用本机配置触发外部消息。
+    monkeypatch.setenv("DINGTALK_ENABLED", "true")
+    monkeypatch.setenv("DINGTALK_WEBHOOK_URL", FAKE_WEBHOOK)
+    monkeypatch.setenv("DINGTALK_SECRET", FAKE_SECRET)
+    # 保留实际HTTP正文，验证CLI新增平台参数到消息标题的传递。
+    requests = []
+
+    def accept(request):
+        """Capture the signed POST and return the success contract locally."""
+        requests.append(request)
+        return httpx.Response(200, json={"errcode": 0})
+
+    assert run_notification_test(RuntimeLogger(tmp_path / "logs"), platform=platform,
+                                 transport=httpx.MockTransport(accept)) == 0
+    assert len(requests) == 1
+    assert title in json.loads(requests[0].content)["markdown"]["title"]
+
+
 @pytest.mark.parametrize(
     "site_url,delivery_status",
     [

@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from compass_collector.config import RetentionConfig
+from compass_collector.platform_runtime import PlatformRuntime
 
 
 # 保留窗口以北京时间的自然日计算。
@@ -114,6 +115,8 @@ def cleanup_runtime(
     config: RetentionConfig,
     *,
     now: datetime | None = None,
+    platform: str | None = None,
+    task_ids: tuple[str, ...] = (),
 ) -> CleanupSummary:
     """Apply configured cleanup without touching SQLite, CSV, or Chrome Profile."""
 
@@ -125,39 +128,56 @@ def cleanup_runtime(
         current_time.date(), config.failure_artifact_days
     )
     log_cutoff = oldest_retained_date(current_time.date(), config.log_days)
-    # 同时处理历史日期目录和新平台下日期目录，不遍历任意子目录。
-    raw_deleted, raw_failures = cleanup_dated_directories(
-        runtime_root / "raw", raw_cutoff
-    )
-    # 失败材料只删除 artifacts 下的日期一级目录。
-    artifact_deleted, artifact_failures = cleanup_dated_directories(
-        runtime_root / "artifacts", artifact_cutoff
-    )
-    for directory, cutoff in (("raw", raw_cutoff), ("artifacts", artifact_cutoff)):
-        # 平台目录只接受安全名称，符号链接永远不参与自动清理。
-        root = runtime_root / directory
-        if not root.is_dir() or root.is_symlink():
-            continue
-        for platform in root.iterdir():
-            if (
-                not platform.is_dir()
-                or platform.is_symlink()
-                or re.fullmatch(r"[a-z][a-z0-9_-]*", platform.name) is None
-                or parse_date_name(platform.name) is not None
-            ):
+    if platform is not None:
+        # 平台参数来自配置边界，不能遍历或删除其他平台材料。
+        if platform not in {"compass", "taobao"}:
+            raise ValueError("unsupported cleanup platform")
+        raw_deleted, raw_failures = cleanup_dated_directories(runtime_root / "raw" / platform, raw_cutoff)
+        artifact_deleted, artifact_failures = cleanup_dated_directories(runtime_root / "artifacts" / platform, artifact_cutoff)
+        # 历史目录只含日期/task，不删除整日目录，避免影响另一平台。
+        for directory, cutoff in (("artifacts", artifact_cutoff), ("raw", raw_cutoff)):
+            root = runtime_root / directory
+            if root.is_symlink():
                 continue
-            deleted, failures = cleanup_dated_directories(platform, cutoff)
-            if directory == "raw":
-                raw_deleted += deleted
-                raw_failures += failures
-            else:
-                artifact_deleted += deleted
-                artifact_failures += failures
-    # 日志只删除 logs 下的按日 JSONL 文件。
-    log_deleted, log_failures = cleanup_log_files(runtime_root / "logs", log_cutoff)
-    return CleanupSummary(
-        raw_directories=raw_deleted,
-        artifact_directories=artifact_deleted,
-        log_files=log_deleted,
-        failures=raw_failures + artifact_failures + log_failures,
-    )
+            for day in root.glob("????-??-??"):
+                dated = parse_date_name(day.name)
+                if dated is None or dated >= cutoff or not day.is_dir() or day.is_symlink():
+                    continue
+                for task_id in task_ids:
+                    if not task_id or Path(task_id).name != task_id or task_id in {".", ".."}:
+                        continue
+                    if not PlatformRuntime(runtime_root, platform).owns_legacy_task(day.name, task_id):
+                        continue
+                    candidate = day / task_id
+                    if candidate.is_dir() and not candidate.is_symlink():
+                        try:
+                            shutil.rmtree(candidate)
+                            if directory == "raw":
+                                raw_deleted += 1
+                            else:
+                                artifact_deleted += 1
+                        except OSError:
+                            if directory == "raw":
+                                raw_failures += 1
+                            else:
+                                artifact_failures += 1
+        log_deleted, log_failures = cleanup_log_files(runtime_root / "logs" / platform, log_cutoff)
+    else:
+        # 底层无平台调用兼容历史测试，生产入口必须传入明确平台。
+        raw_deleted, raw_failures = cleanup_dated_directories(runtime_root / "raw", raw_cutoff)
+        artifact_deleted, artifact_failures = cleanup_dated_directories(runtime_root / "artifacts", artifact_cutoff)
+        for directory, cutoff in (("raw", raw_cutoff), ("artifacts", artifact_cutoff)):
+            root = runtime_root / directory
+            if not root.is_dir() or root.is_symlink():
+                continue
+            for child in root.iterdir():
+                if child.is_dir() and not child.is_symlink() and re.fullmatch(r"[a-z][a-z0-9_-]*", child.name):
+                    deleted, failures = cleanup_dated_directories(child, cutoff)
+                    if directory == "raw":
+                        raw_deleted += deleted
+                        raw_failures += failures
+                    else:
+                        artifact_deleted += deleted
+                        artifact_failures += failures
+        log_deleted, log_failures = cleanup_log_files(runtime_root / "logs", log_cutoff)
+    return CleanupSummary(raw_deleted, artifact_deleted, log_deleted, raw_failures + artifact_failures + log_failures)

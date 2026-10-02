@@ -22,35 +22,71 @@
 
 ## 快捷命令
 
-```bash
-make help              # 查看全部命令
-make install           # 安装锁定依赖
-make login             # 人工登录
-make login                         # 打开独立 Chrome，人工登录
-make app                           # 打开空闲 GUI 控制台
-make run                           # GUI 正式采集
-make run MODE=dry-run              # GUI 试运行
-make run MODE=force                # GUI 强制创建新版本
-make run GUI=no                    # 终端正式采集
-make run MODE=dry-run GUI=no       # 终端试运行
-make notify-test                   # 真实发送一条钉钉测试消息
-make clear-data                    # 清除采集数据，保留 Chrome 登录态
-make status                        # 查看最近运行状态
-make scheduler                     # 前台启动 Scheduler
-make test                          # 运行全部自动化测试
-make check                         # 测试与 LaunchAgent 无副作用检查
-make service ACTION=install        # 安装 LaunchAgent
-make service ACTION=status         # 查看 LaunchAgent 状态
-make service ACTION=uninstall      # 卸载 LaunchAgent
-```
-
-默认任务为 `compass_household_cleaning_realtime`，可按需覆盖：
+仅保留11个入口：help、install、start、run、login、status、clean、schedule、notify、web、check。除 `make`、`make help`、`make install`、`make start` 外必须指定 `PLATFORM=tt|tb`；tt为抖音，tb为淘宝。缺少平台、未知平台和无效动作在执行前拒绝。
 
 ```bash
-make run TASK=another_task_id
+make                              # 帮助
+make help                         # 帮助
+make install                      # 安装锁定依赖
+make start                        # 同时启动两平台独立GUI，立即强制采集并通知
+make run PLATFORM=tt              # 抖音：GUI立即强制采集，结束后通知
+make run PLATFORM=tb              # 淘宝：GUI立即强制采集，结束后通知
+make login PLATFORM=tb            # 与采集相同Profile登录
+make status PLATFORM=tb           # 只查看淘宝批次
+make clean PLATFORM=tb ACTION=data   # 仅清理淘宝本地数据
+make clean PLATFORM=tb ACTION=login  # 仅清理淘宝登录态
+make schedule PLATFORM=tb         # 前台调度，Ctrl-C停止
+make schedule PLATFORM=tb ACTION=check     # 服务配置无副作用检查
+make schedule PLATFORM=tb ACTION=install   # 安装并启动所选平台服务
+make schedule PLATFORM=tb ACTION=status    # 查看所选平台服务
+make schedule PLATFORM=tb ACTION=uninstall # 卸载所选平台服务
+make notify PLATFORM=tb           # 真实发送淘宝钉钉测试消息
+make web PLATFORM=tb              # 本地网站开发，首屏淘宝
+make web PLATFORM=tb ACTION=build # 构建首屏为淘宝的网站
+make check PLATFORM=tb            # 后端/前端测试及所选平台服务检查
+make check PLATFORM=tb ACTION=test # 仅完整后端测试
 ```
 
-下面仍保留完整 CLI，方便理解每个快捷命令实际执行的内容。
+`run` 默认 `GUI=yes START=yes MODE=force NOTIFY=yes`。可选参数保持明确语义：
+
+```bash
+make run PLATFORM=tb START=no       # 打开GUI，等待手动开始
+make run PLATFORM=tb GUI=no         # 终端立即采集
+make run PLATFORM=tb MODE=normal    # 已有正式发布就跳过，否则新批次完整重采
+make run PLATFORM=tb MODE=dry-run NOTIFY=no # 试采，不发布正式商品/CSV，不通知
+make start START=no NOTIFY=no       # 同时打开两个GUI，等待手动开始
+```
+
+`normal` 不是补录，已发布的部分成功结果也会跳过；分类级补录见TODO。`force` 每次创建新批次，新排名属于新版本，旧版本保留。`START=no` 只允许与 `GUI=yes` 一起使用。显式模式在GUI中锁定，避免普通采集被改成强制采集。
+
+`start` 并行执行两个独立的 `run`，各自使用 `TT_CONFIG`、`TB_CONFIG` 和平台默认任务，公共运行参数同时传给两边。终端等待两个窗口各自结束；关闭或启动失败一个平台不会停止另一个，两边结束后返回失败状态（如有）。
+
+运行中关闭GUI只需确认一次：本窗口的采集、Chrome及自有Scheduler收尾后自动退出，另一平台继续运行。正在执行的请求会在完成或超时后响应中止；退出保留登录Profile，不发布本次未完成数据。
+
+登录、采集、状态、清理及调度共用所选平台配置。tt默认 `config/tasks.yaml`；tb在本机验收配置存在时使用 `runtime/acceptance/taobao/2026-10-01/full-root-config.yaml`，保持已登录Profile和数据库，否则使用可分发的 `config/taobao.yaml` 全量配置。可通过 `CONFIG=...` 覆盖，但平台及TASK归属仍校验。运行解释器统一为 `.venv/bin/python`，可通过 `PYTHON=...` 覆盖。
+
+`NOTIFY=yes|no` 控制本次采集/调度/通知测试，不修改.env；Webhooks及加签密钥继续从本机.env读取。后台服务仅存布尔开关，不保存凭证。网页分别使用 `TT_WEB_DATA_INDEX_URL`、`TB_WEB_DATA_INDEX_URL`，可显式覆盖公开索引；公开站未设置初始平台时仍默认抖音。
+
+`clean ACTION=data` 删除所选平台的数据库批次及级联分类/商品/店铺/raw索引，并清理对应的本地raw、CSV、失败材料和网页暂存。数据库文件、另一平台数据、共享JSONL、Profile、配置、凭证和备份保留；CLI清理必须显式提供 --platform。清理需要同时获得本平台采集和Scheduler锁，本次调整不会实际清理已有数据。
+
+`schedule` 默认前台调度，只处理所选平台配置中启用的任务；人工 `run` 的force默认不改变Scheduler的幂等规则。服务标签分别为 `com.zhuanz1.douyin-compass-collector.compass` 和 `com.zhuanz1.douyin-compass-collector.taobao`。运行锁已按平台拆分，同一runtime可同时运行两平台的GUI、采集和Scheduler；同平台仍只允许一个实例。不自动迁移或卸载旧服务。`check` 默认运行完整后端和前端测试，再渲染所选平台服务配置，不安装服务。
+
+两平台可以在两个终端同时启动：
+
+```bash
+make run PLATFORM=tb
+make run PLATFORM=tt
+```
+
+每个平台内部仍串行采集。GUI、采集和调度分别使用 `runtime/locks/<platform>/` 下的锁；日志和控制文件分别写入 `runtime/logs/<platform>/`、`runtime/controls/<platform>/`。停止或关闭一个窗口不操作另一个平台。Chrome保留检查期仍持有本平台采集锁。
+
+多平台配置必须在 `platforms.<id>.database_path` 声明独立数据库，单平台旧配置可继续使用顶层 `database.path`。规范化后的数据库或Profile路径重复会拒绝启动；数据库通过 `runtime_platform` 元数据登记唯一归属，跨平台复用及混合历史数据库均拒绝，不自动拆分或清理。迁移只在升级前备份，原数据库、CSV和登录态路径保留。
+
+升级前关闭旧版本GUI、采集和Scheduler。检测到旧全局锁仍被占用时，新版本提示 `legacy_gui`、`legacy_collection` 或 `legacy_scheduler` 并拒绝启动，不终止旧进程。旧CLI按明确平台、任务所属平台或唯一启用平台解析；多平台歧义需要 `--platform`，清理始终必填该参数。
+
+实际回归、并行试采、发布通知结果及GUI验收限制见[双平台独立运行验收](docs/双平台独立运行验收.md)。
+
+下面仍保留完整CLI，方便排查具体执行链路。
 
 ## 2. 环境要求
 
@@ -78,6 +114,7 @@ uv run --frozen python -m compass_collector --help
 主配置位于 `config/tasks.yaml`，GUI 只读展示平台、Profile、任务范围及执行状态，不提供配置编辑器。未知平台、缺失主任务、重复任务 ID、重复分类组合和无效配置在启动 Chrome 前报错；行业归属错误或不存在的分类，在当次分类发现阶段使整个任务失败。
 
 - `browser`：共享 Chrome 参数；
+- `platforms.<id>.database_path`：多平台独立数据库；
 - `platforms.<id>.profile_dir`：每个平台独立 Profile；罗盘复用 `runtime/browser-profile`；
 - `collection`：页面动作超时、响应超时、采集间隔、有限重试及人工等待；
 - `tasks`：任务 ID、平台、启停、名称、每日时间、分类、筛选与日期；
@@ -121,7 +158,7 @@ uv run --frozen python -m compass_collector login
 日常调试推荐直接打开空闲控制台：
 
 ```bash
-make app
+make run PLATFORM=tt START=no
 ```
 
 控制台支持：
@@ -136,7 +173,7 @@ make app
 - 查看当前或最近批次的钉钉发送状态。
 - 在采集和 Scheduler 均停止时清除本地采集数据。
 
-`make run` 默认打开 GUI 并正式采集；`MODE=dry-run` 或 `MODE=force` 切换模式，`GUI=no` 显式回退终端。`force` 开始前仍会二次确认。
+`make run PLATFORM=tt` 默认打开GUI立即强制采集并通知；`MODE=normal`、`MODE=dry-run`显式切换模式，`GUI=no`回退终端，`START=no`打开空闲GUI。
 
 GUI 关闭时不会留下自己启动的 Scheduler 或 Chrome。运行中的采集会先确认，再在页面动作和响应等待的短检查点协作式中止。
 
@@ -178,21 +215,21 @@ uv run --frozen python -m compass_collector status
 
 ## 7. 开发期清除本地数据
 
-GUI 底部的“清除本地采集数据”会先显示不可恢复确认。按钮只在当前采集、保留的 Chrome 和所有 Scheduler 都停止时可用。
+GUI 底部的“清除本地采集数据”会先显示不可恢复确认。按钮只在本平台采集、保留的 Chrome 和 Scheduler 都停止时可用。
 
 终端调试可执行：
 
 ```bash
-make clear-data
+make clean PLATFORM=tt ACTION=data
 ```
 
 或使用带显式确认参数的完整命令：
 
 ```bash
-uv run --frozen python -m compass_collector clear-data --yes
+uv run --frozen python -m compass_collector clear-data --platform compass --yes
 ```
 
-会删除 SQLite 主库及 sidecar、CSV、原始响应、失败材料和 JSONL 日志。会保留 `runtime/browser-profile/`、`runtime/locks/`、`.env`、`config/`、备份和 runtime 中其他未知文件。删除目标被严格限制在当前工程 `runtime/` 内；如果数据库配置到该边界之外，清理会在删除任何文件前拒绝执行。
+会删除所选平台的数据库批次及级联数据、CSV、原始响应、失败材料和网页暂存；保留数据库文件、平台归属元数据、另一平台数据及日志。也会保留 `runtime/browser-profile/`、`runtime/locks/`、`.env`、`config/`、备份和 runtime 中其他未知文件。删除目标被严格限制在当前工程 `runtime/` 内；如果数据库配置到该边界之外，清理会在删除任何文件前拒绝执行。
 
 ## 8. 前台 Scheduler
 
@@ -285,8 +322,8 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 2. 克隆仓库并运行 `uv sync --frozen`；
 3. 检查 `config/tasks.yaml`；
 4. 执行 `login` 并人工登录；
-5. 从 `.env.example` 创建 `.env`，填入当前有效凭证并执行 `make notify-test`；
-6. 执行 `make app`，检查单窗口、最近日志、通知和 Scheduler 状态；
+5. 从 `.env.example` 创建 `.env`，填入当前有效凭证并执行 `make notify PLATFORM=tt`；
+6. 执行 `make run PLATFORM=tt START=no`，检查单窗口、最近日志、通知和 Scheduler 状态；
 7. 执行一次 GUI `dry-run`，核对动态三级分类数量、完整分页、SQLite/raw 审计和批次汇总；
 8. 执行 GUI 正式 `run`，核对 `published_at`、中文 8 列 CSV、打开文件和关闭 Chrome；
 9. 前台启动 Scheduler 并用 Ctrl-C 停止；
@@ -298,10 +335,13 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 
 - 云主机和 systemd；
 - 重试策略与 Scheduler 逻辑后续重新梳理；
+- [ ] 分类级补录：针对失败或缺失分类，从第一页完整重采，按本次接口排名生成新版本；保留原版本及分类来源、采集时间，不按商品或缺失页插入旧榜单。版本合并与发布规则、排名变化验收待设计；
 - 以 SQLite 权威状态重建 Manifest 和 raw 索引的崩溃恢复；
 - 以更多平台的页面和字段契约验证适配器扩展；
 - 多主机独立运行与监控；
 - 其他榜单 Adapter。
+
+当前 `normal` 模式仍为：同一任务、同一计划时间已有正式发布结果（含部分成功）则跳过；否则创建新批次完整重采。分类级补录尚未实现，不作为 `normal` 的现有行为。
 
 ## 浏览器改造与历史兼容
 
@@ -323,21 +363,9 @@ Alembic `0005_platform_capture` 增加平台标识、任务配置快照、通用
 
 淘宝独立 Profile 登录和两个目标分类的手动试采：
 
-当前机器的全量验收快捷命令：
+淘宝全量采集统一使用 `make run PLATFORM=tb`，登录使用 `make login PLATFORM=tb`，状态使用 `make status PLATFORM=tb`。本机优先使用已认证的验收配置；其他机器使用 `config/taobao.yaml` 并在该独立Profile重新登录。两分类PoC可用 `make run PLATFORM=tb CONFIG=config/taobao-poc.yaml MODE=dry-run NOTIFY=no`，此时范围和Profile都由PoC配置决定。
 
-```bash
-make taobao-run                    # 终端强制创建新批次，默认启用钉钉通知
-make taobao-run MODE=dry-run       # 终端试采，不发布正式商品和 CSV
-make taobao-run MODE=normal        # 普通采集，当天已有正式结果时跳过
-make taobao-run GUI=yes            # 使用 GUI 执行强制采集
-make taobao-run GUI=yes TAOBAO_DINGTALK_ENABLED=false  # 本次采集关闭通知
-make taobao-login                  # 登录到与全量采集相同的 Profile
-make taobao-status                 # 读取相同验收数据库的最近批次
-```
-
-这些入口默认使用当前本机已存在的 `runtime/acceptance/taobao/2026-10-01/full-root-config.yaml` 和 `.venv/bin/python`；配置中的 Profile 指向已登录成功的工作树目录。该验收配置不随 Git 分发，其他机器需提供自己的配置路径，例如 `make taobao-run TAOBAO_CONFIG=config/taobao-poc.yaml MODE=dry-run TAOBAO_DINGTALK_ENABLED=false`，此时采集范围是 PoC 配置指定的两个分类，Profile 也切为该配置的独立目录。`CONFIG=...` 可直接覆盖最终配置，`PYTHON=...` 可覆盖解释器。淘宝入口默认启用批次钉钉汇总，读取本机 `.env` 的 `DINGTALK_WEBHOOK_URL` 和 `DINGTALK_SECRET`；本次关闭使用 `TAOBAO_DINGTALK_ENABLED=false`，不会修改 `.env`。消息展示淘宝平台、任务状态、开始/结束时间、耗时、页数、条数、结果文件及失败分类；通知失败不改变采集结果，GUI 显示发送状态。
-
-默认配置中也已声明 `taobao_household_cleaning_realtime` 全根任务，根为 `50025705`，实时、20条、全部三级分类，目前 `enabled: false`。两个目标分类及全根真实验收通过前，该任务不加入默认采集或定时调度；本地 PoC 使用下方独立配置。
+主配置 `config/tasks.yaml` 中的淘宝任务仍为 `enabled: false`，不自动加入抖音调度。独立全量配置声明根 `50025705`、实时、20条和全部三级分类；通过显式tb入口启动，新增入口不代表全根真实验收已通过。
 
 淘宝平台配置启用 `webdriver_compatibility: true`，在第一次导航及子 frame 页面脚本之前覆盖 `Navigator.prototype.webdriver` 的 getter，与已成功人工登录的工作树方式一致，不新增 `navigator` 实例属性。抖音默认关闭此兼容方式。该设置不保证其他自动化信号不可见，也不迁移另一工作树的登录态；相同相对 Profile 路径在不同工作树中实际是两个目录。
 

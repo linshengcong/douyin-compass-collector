@@ -29,6 +29,7 @@ from compass_collector.persistence import Database, upgrade_database
 from compass_collector.runner import planned_at_for_task, run_scheduled_collection
 from compass_collector.run_control import CollectionControl
 from compass_collector.runtime_locks import ProcessLock
+from compass_collector.platform_runtime import PlatformRuntime
 from compass_collector.runtime_logging import LogContext, RuntimeLogger
 from compass_collector.app_paths import runtime_root
 from compass_collector.scheduler_control import (
@@ -195,6 +196,9 @@ def handle_occurrence(
 ) -> None:
     """Apply terminal idempotence, grace, and cross-day rules to one occurrence."""
 
+    # 调度批次与数据库必须归属同一平台，禁止旧共享任务组绕过入口。
+    if tasks and len({task.platform for task in tasks}) != 1:
+        raise ValueError("scheduled occurrence must select one platform")
     # 已有任意终态的任务不会被 Scheduler 自动重跑。
     pending_tasks = [
         task
@@ -240,12 +244,12 @@ def reconcile_scheduler_once(
 
     # 测试可注入时间，真实运行固定使用北京时间。
     current_time = now or datetime.now(SHANGHAI_TIMEZONE)
-    upgrade_database(config.database.path)
+    upgrade_database(config.database.path, platform=config.execution_platform())
     # 一次 reconcile 使用短生命周期数据库连接。
     database = Database(config.database.path)
     # missed 事件写入与采集一致的安全 JSONL。
     # GUI 子进程可复用同一个日志器，默认路径保持既有终端行为。
-    active_logger = runtime_logger or RuntimeLogger(RUNTIME_ROOT / "logs")
+    active_logger = runtime_logger or RuntimeLogger(PlatformRuntime(RUNTIME_ROOT, config.execution_platform()).logs, platform=config.execution_platform())
     try:
         # 计划时刻映射让相同时间的任务共享串行采集批次。
         occurrence_tasks: dict[datetime, list[TaskConfig]] = defaultdict(list)
@@ -286,7 +290,7 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
     """Run a foreground APScheduler with serial cron jobs and startup reconciliation."""
 
     # Scheduler 生命周期事件写入现有按日 JSONL，而不是另建固定守护日志。
-    runtime_logger = RuntimeLogger(RUNTIME_ROOT / "logs")
+    runtime_logger = RuntimeLogger(PlatformRuntime(RUNTIME_ROOT, config.execution_platform()).logs, platform=config.execution_platform())
     # 终止信号只停止未来调度，正在运行的批次允许安全完成。
     shutdown_requested = Event()
     # 当前批次控制器用于 GUI 显式“中止当前采集”。
@@ -295,7 +299,7 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
     scheduler_control_id = os.environ.get(SCHEDULER_CONTROL_ID_ENV) or uuid4().hex
     # 控制文件位于与进程锁相同的持久运行根目录。
     scheduler_control = SchedulerControlFiles(
-        RUNTIME_ROOT / "controls",
+        PlatformRuntime(RUNTIME_ROOT, config.execution_platform()).controls,
         scheduler_control_id,
     )
     # 独立停止标记只负责结束控制轮询线程。
@@ -407,14 +411,14 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
                 planned_at = planned_at_for_task(
                     grouped_tasks[0], actual_at.date() - timedelta(days=1)
                 )
-            upgrade_database(config.database.path)
+            upgrade_database(config.database.path, platform=config.execution_platform())
             # cron 回调使用独立数据库处理终态和宽限规则。
             callback_database = Database(config.database.path)
             try:
                 handle_occurrence(
                     config,
                     callback_database,
-                    RuntimeLogger(RUNTIME_ROOT / "logs"),
+                    RuntimeLogger(PlatformRuntime(RUNTIME_ROOT, config.execution_platform()).logs, platform=config.execution_platform()),
                     grouped_tasks,
                     planned_at,
                     actual_at,
@@ -447,13 +451,13 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
             return
         # APScheduler 提供的 scheduled_run_time 是准确计划时刻。
         recorded_at = datetime.now(SHANGHAI_TIMEZONE)
-        upgrade_database(config.database.path)
+        upgrade_database(config.database.path, platform=config.execution_platform())
         # missed listener 使用独立短事务数据库。
         missed_database = Database(config.database.path)
         try:
             mark_missed_tasks(
                 missed_database,
-                RuntimeLogger(RUNTIME_ROOT / "logs"),
+                RuntimeLogger(PlatformRuntime(RUNTIME_ROOT, config.execution_platform()).logs, platform=config.execution_platform()),
                 tasks,
                 event.scheduled_run_time.astimezone(SHANGHAI_TIMEZONE),
                 recorded_at,
@@ -512,10 +516,9 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
 def run_scheduler(config: AppConfig) -> int:
     """Run exactly one Scheduler process for this runtime directory."""
 
-    # Scheduler 锁在空闲期持续持有，用于阻止终端、launchd 和 GUI 重复启动。
-    scheduler_lock = ProcessLock(
-        RUNTIME_ROOT / "locks" / SCHEDULER_LOCK_NAME,
-        "scheduler",
-    )
-    with scheduler_lock:
+    # 平台锁覆盖Scheduler整个生命周期，后台服务之间可并行运行。
+    platform = config.execution_platform()
+    config = config.for_platform(platform)
+    scope = PlatformRuntime(RUNTIME_ROOT, platform)
+    with scope.operation("scheduler"):
         return _run_scheduler_unlocked(config)

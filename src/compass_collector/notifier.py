@@ -714,6 +714,7 @@ def run_notification_test(
     runtime_logger: RuntimeLogger,
     *,
     transport: httpx.BaseTransport | None = None,
+    platform: str = "compass",
 ) -> int:
     """Send one explicit real-or-mocked test message and return delivery status."""
 
@@ -734,7 +735,7 @@ def run_notification_test(
         return 1
     # 测试消息只包含固定标题和北京时间，不暴露运行环境。
     current_time = datetime.now(SHANGHAI_TIMEZONE)
-    title = _batch_title(BatchNotificationStatus.SUCCESS, test=True)
+    title = "🧪 淘宝采集器通知测试" if platform == "taobao" else _batch_title(BatchNotificationStatus.SUCCESS, test=True)
     markdown = (
         f"### {title}\n\n"
         f"- 时间：{current_time:%Y-%m-%d %H:%M:%S}\n"

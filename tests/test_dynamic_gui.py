@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from compass_collector import gui as gui_module
+from compass_collector.config import load_config
 from compass_collector.gui import (
     GuiProgressState,
     _business_batch_id,
@@ -395,7 +396,7 @@ def test_latest_published_csv_uses_published_at_and_skips_missing_files(
             # database_path 仅用于证明 GUI 传入配置中的路径。
             self.database_path = database_path
 
-        def recent_status(self, limit: int) -> list[SimpleNamespace]:
+        def recent_status(self, limit: int, *, platform: str | None = None) -> list[SimpleNamespace]:
             """Return the prepared newest-first batch summaries."""
 
             assert limit == 100
@@ -407,9 +408,9 @@ def test_latest_published_csv_uses_published_at_and_skips_missing_files(
             database_closed.append(True)
 
     # config 只提供 latest_published_csv 所需的数据库路径边界。
-    config = SimpleNamespace(database=SimpleNamespace(path=tmp_path / "collector.db"))
+    config = load_config(Path("config/tasks.yaml")).for_platform("compass")
     # 测试不执行 Alembic，只验证 GUI 的发布筛选规则。
-    monkeypatch.setattr(gui_module, "upgrade_database", lambda database_path: None)
+    monkeypatch.setattr(gui_module, "upgrade_database", lambda database_path, **kwargs: None)
     monkeypatch.setattr(gui_module, "Database", FakeDatabase)
 
     assert latest_published_csv(config) == partial_csv  # type: ignore[arg-type]

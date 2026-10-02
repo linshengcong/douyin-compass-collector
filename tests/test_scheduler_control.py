@@ -76,7 +76,7 @@ def test_scheduler_start_and_stop_does_not_require_sigusr1(
     monkeypatch.setattr(scheduler_module, "RUNTIME_ROOT", tmp_path)
     monkeypatch.setenv(SCHEDULER_CONTROL_ID_ENV, control_id)
     # 预先请求停止，Scheduler 完成启动协调后应直接安全退出。
-    control_files = SchedulerControlFiles(tmp_path / "controls", control_id)
+    control_files = SchedulerControlFiles(tmp_path / "controls" / "compass", control_id)
     control_files.request_shutdown()
     # Windows 症状由移除当前平台的 SIGUSR1 属性精确模拟。
     monkeypatch.delattr(signal, "SIGUSR1", raising=False)
@@ -84,7 +84,7 @@ def test_scheduler_start_and_stop_does_not_require_sigusr1(
     class FakeRuntimeLogger:
         """Accept lifecycle events without writing test logs."""
 
-        def __init__(self, log_directory: Path) -> None:
+        def __init__(self, log_directory: Path, **kwargs) -> None:
             """Keep the production constructor boundary."""
 
             # 日志目录只用于验证构造调用，不需要创建。
@@ -129,7 +129,7 @@ def test_scheduler_start_and_stop_does_not_require_sigusr1(
     )
 
     # 停止请求在创建 APScheduler 前生效，因此配置替身无需业务字段。
-    assert scheduler_module._run_scheduler_unlocked(SimpleNamespace()) == 0
+    assert scheduler_module._run_scheduler_unlocked(SimpleNamespace(execution_platform=lambda: "compass")) == 0
 
 
 def test_gui_interrupts_owned_scheduler_through_control_file(

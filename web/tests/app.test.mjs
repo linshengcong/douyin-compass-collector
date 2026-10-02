@@ -55,6 +55,31 @@ function fixtureFetch(compass, taobao) {
   };
 }
 
+test("显式本地淘宝入口首屏只请求淘宝数据，仍能切回抖音", async () => {
+  // React真实组件使用独立DOM，网络由合成快照替代。
+  const environment = setup();
+  const originalFetch = globalThis.fetch;
+  // 请求顺序确认淘宝入口没有先展示或读取抖音快照。
+  const requests = [];
+  const respond = fixtureFetch(bundle(RankingPlatform.抖音), bundle(RankingPlatform.淘宝));
+  globalThis.fetch = async (url) => { requests.push(url); return respond(url); };
+  try {
+    await act(async () => {
+      environment.root.render(createElement(RankingApp, {
+        dataIndexUrl: "https://example.invalid/compass/latest.json",
+        taobaoDataIndexUrl: "https://example.invalid/taobao/latest.json", initialPlatform: RankingPlatform.淘宝,
+      }));
+      await new Promise((resolve) => setImmediate(resolve));
+    });
+    assert.ok(requests.length > 0 && requests.every((url) => url.includes("/taobao/")));
+    assert.equal(environment.dom.window.document.title, "淘宝商品实时榜");
+    assert.ok(environment.dom.window.document.body.textContent.includes("支付买家数"));
+    await click(environment.dom, "抖音");
+    assert.ok(requests.some((url) => url.includes("/compass/")));
+    assert.equal(environment.dom.window.document.title, "抖音商品实时榜");
+  } finally { globalThis.fetch = originalFetch; await environment.cleanup(); }
+});
+
 test("切换平台重置筛选、桌面分页、移动展示和首次上榜控件", async () => {
   // 六十条确保真实移动组件超过首批，而不是只测一个无状态商品。
   const environment = setup();

@@ -47,6 +47,7 @@ from compass_collector.raw_storage import BatchStorage
 from compass_collector.retention import cleanup_runtime
 from compass_collector.run_control import CollectionControl
 from compass_collector.runtime_locks import ProcessLock, RuntimeLockBusy
+from compass_collector.platform_runtime import PlatformRuntime
 from compass_collector.runtime_logging import LogContext, RuntimeLogger
 from compass_collector.vercel_deployer import VercelDeployer, VercelDeploymentError
 from compass_collector.web_publisher import WebPublicationError, WebPublisher
@@ -290,10 +291,9 @@ def run_login(config: AppConfig, platform: str = "compass") -> int:
     """Open the persistent profile for manual login and close on Enter."""
 
     # 登录与采集不能同时打开同一个持久化 Chrome Profile。
-    login_lock = ProcessLock(
-        RUNTIME_ROOT / "locks" / COLLECTION_LOCK_NAME, "collection"
-    )
-    with login_lock:
+    # 登录不初始化数据库，只持有平台及Profile锁。
+    scope = PlatformRuntime(RUNTIME_ROOT, platform)
+    with scope.operation("collection", config.browser_for(platform).profile_dir):
         # 登录命令仅管理 Chrome，不创建 HTTP 客户端或数据库。
         # 登录导航由平台决定，共享入口不包含平台 URL。
         adapter = create_adapter(
@@ -777,9 +777,10 @@ def _run_collection_unlocked(
     execution_batch_id = uuid4().hex
     # JSONL 日志按北京时间自然日自动选择文件。
     runtime_logger = RuntimeLogger(
-        RUNTIME_ROOT / "logs",
+        PlatformRuntime(RUNTIME_ROOT, config.execution_platform()).logs,
         event_sink=control.event_sink if control is not None else None,
         execution_batch_id=execution_batch_id,
+        platform=config.execution_platform(),
     )
     # 每个选中任务先标记 not_started，后续分支只覆盖真实结果。
     task_results = {
@@ -825,7 +826,7 @@ def _run_collection_unlocked(
         notification_sent = True
 
     # 保留清理在新运行材料创建前执行，且不触碰数据库、CSV 和 Profile。
-    cleanup_summary = cleanup_runtime(RUNTIME_ROOT, config.retention)
+    cleanup_summary = cleanup_runtime(RUNTIME_ROOT, config.retention, platform=config.execution_platform(), task_ids=tuple(task.id for task in config.tasks))
     runtime_logger.emit(
         level="WARNING" if cleanup_summary.failures else "INFO",
         event="retention_cleanup_finished",
@@ -838,7 +839,7 @@ def _run_collection_unlocked(
         details={"cleanup_counts": cleanup_summary.as_log_details()},
     )
     # dry-run 也保留 batch/category/raw 审计，因此所有模式都升级并打开数据库。
-    upgrade_database(config.database.path)
+    upgrade_database(config.database.path, platform=config.execution_platform())
     database = Database(config.database.path)
     try:
         # 幂等检查和版本分配在打开 Chrome 前完成。
@@ -1475,12 +1476,14 @@ def run_collection(
 ) -> int:
     """Run one mutually exclusive Chrome-backed collection operation."""
 
-    # 执行锁覆盖采集和手动 Chrome 检查期，避免 Profile 被第二个进程打开。
-    collection_lock = ProcessLock(
-        RUNTIME_ROOT / "locks" / COLLECTION_LOCK_NAME,
-        "collection",
-    )
-    with collection_lock:
+    # 先选择平台，避免旧多平台调用在内部共享一个数据库。
+    platform = (scheduled_tasks[0].platform if scheduled_tasks else config.execution_platform(selected_task_id))
+    if scheduled_tasks and any(task.platform != platform for task in scheduled_tasks):
+        raise ValueError("scheduled collection must select one platform")
+    config = config.for_platform(platform)
+    # 执行锁持续覆盖采集及保留Chrome检查期。
+    scope = PlatformRuntime(RUNTIME_ROOT, platform)
+    with scope.operation("collection", config.browser_for(platform).profile_dir):
         return _run_collection_unlocked(
             config,
             selected_task_id,
@@ -1502,6 +1505,10 @@ def run_scheduled_collection(
 ) -> int:
     """Execute one due task group without waiting for keyboard input."""
 
+    # 计划任务不能跨平台共享执行批次或数据库。
+    if not tasks or len({task.platform for task in tasks}) != 1:
+        raise ValueError("scheduled collection must select one platform")
+    config = config.for_platform(tasks[0].platform)
     # 同一计划时刻的任务共享覆盖时间，按平台独立 Chrome 串行执行。
     planned_at_overrides = {task.id: planned_at for task in tasks}
     try:
@@ -1518,14 +1525,15 @@ def run_scheduled_collection(
         )
     except RuntimeLockBusy:
         # 手动调试占用 Chrome 时，本次计划只记终态，不排队或自动重试。
-        upgrade_database(config.database.path)
+        upgrade_database(config.database.path, platform=config.execution_platform())
         busy_database = Database(config.database.path)
         # 同一冲突执行使用稳定 ID 串联全部任务和汇总通知。
         busy_batch_id = uuid4().hex
         busy_logger = RuntimeLogger(
-            RUNTIME_ROOT / "logs",
+            PlatformRuntime(RUNTIME_ROOT, config.execution_platform()).logs,
             event_sink=control.event_sink if control is not None else None,
             execution_batch_id=busy_batch_id,
+            platform=config.execution_platform(),
         )
         # 冲突任务汇总使用同一 recorded_at，确保消息耗时为零附近。
         busy_recorded_at = datetime.now(SHANGHAI_TIMEZONE)
@@ -1584,15 +1592,18 @@ def run_scheduled_collection(
         return 0
 
 
-def run_status(config: AppConfig, limit: int) -> int:
+def run_status(config: AppConfig, limit: int, *, platform: str | None = None) -> int:
     """Upgrade the database and print recent task-attempt status rows."""
 
-    upgrade_database(config.database.path)
+    # 直接API调用也按平台解析数据库，防止绕过CLI读取外平台。
+    platform = platform or config.execution_platform()
+    config = config.for_platform(platform)
+    upgrade_database(config.database.path, platform=config.execution_platform())
     # status 查询使用独立短生命周期数据库对象。
     database = Database(config.database.path)
     try:
         # 最近 run 列表同时包含成功发布和失败尝试。
-        rows = database.recent_status(limit=limit)
+        rows = database.recent_status(limit=limit, platform=platform) if platform else database.recent_status(limit=limit)
     finally:
         database.close()
     if not rows:

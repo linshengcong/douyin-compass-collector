@@ -1,0 +1,49 @@
+# 淘宝全量入口配置；本机Make优先使用已登录验收配置，可通过CONFIG覆盖。
+browser:
+  channel: chrome
+  headless: false
+  locale: zh-CN
+  timezone_id: Asia/Shanghai
+  # 手动验收结束或失败后保留页面，按Enter或GUI关闭后才释放Profile。
+  keep_open_after_manual_run: true
+platforms:
+  taobao:
+    profile_dir: runtime/taobao-browser-profile
+    # 与已成功人工登录的工作树使用相同原型 getter 初始化方式。
+    webdriver_compatibility: true
+    # 会话 Cookie 只备份在本机独立 Profile 内，不进入采集数据或通知。
+    persist_session_cookies: true
+scheduler:
+  timezone: Asia/Shanghai
+  misfire_grace_minutes: 600
+  cross_day_backfill: false
+collection:
+  request_interval_seconds:
+    min: 0.5
+    max: 1
+  action_timeout_seconds: 30
+  response_timeout_seconds: 45
+  scroll_settle_seconds: 1.5
+  manual_auth_wait_seconds: 180
+  network_retry_attempts: 2
+publication:
+  web_primary_task_id: taobao_household_cleaning_realtime
+database:
+  path: runtime/data/taobao.db
+retention:
+  raw_response_days: 30
+  failure_artifact_days: 10
+  log_days: 10
+  delete_database_records: false
+  delete_exports: false
+tasks:
+  - id: taobao_household_cleaning_realtime
+    platform: taobao
+    enabled: true
+    display_name: 淘宝洗护清洁实时榜
+    schedule: "0 14 * * *"
+    category_scope:
+      mode: all_level1
+      root_category_id: "50025705"
+      target_level: 3
+      exclude_all: true

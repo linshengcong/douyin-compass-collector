@@ -1,10 +1,13 @@
 """Developer-only cleanup of allowlisted local collection data."""
 
 import shutil
+import sqlite3
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 from compass_collector.runtime_locks import ProcessLock
+from compass_collector.platform_runtime import PlatformRuntime
 
 
 # 只有这些 runtime 一级目录可由调试清理功能删除并重建。
@@ -26,6 +29,8 @@ class LocalDataCleanupSummary:
     runtime_directories: int
     # failures 只记录失败数量，不保留系统异常原文。
     failures: int
+    # 平台清理保留数据库文件，只统计删除的顶层批次。
+    database_batches: int = 0
 
     @property
     def succeeded(self) -> bool:
@@ -124,21 +129,73 @@ def clear_local_data(
 def clear_local_data_with_locks(
     runtime_root: Path,
     database_path: Path,
+    *,
+    platform: str | None = None,
+    task_ids: tuple[str, ...] = (),
 ) -> LocalDataCleanupSummary:
     """Clear local data only while Scheduler and collection locks are both owned."""
 
-    # 先获取 Scheduler 锁，防止新的计划批次在清理期间启动。
-    scheduler_lock = ProcessLock(
-        runtime_root / "locks" / SCHEDULER_LOCK_NAME,
-        "scheduler",
-    )
-    # 再获取采集锁，防止 GUI、login 或终端 run 同时写入。
-    collection_lock = ProcessLock(
-        runtime_root / "locks" / COLLECTION_LOCK_NAME,
-        "collection",
-    )
-    with scheduler_lock, collection_lock:
+    # 无平台的底层旧API必须同时锁住两平台；CLI已禁止这种入口。
+    names = (platform,) if platform is not None else ("compass", "taobao")
+    with ExitStack() as locks:
+        for name in names:
+            scope = PlatformRuntime(runtime_root, name)
+            locks.enter_context(scope.operation("scheduler"))
+            locks.enter_context(scope.operation("collection"))
+        if platform is not None:
+            return clear_platform_data(runtime_root, database_path, platform, task_ids)
         return clear_local_data(runtime_root, database_path)
+
+
+def clear_platform_data(runtime_root: Path, database_path: Path, platform: str,
+                        task_ids: tuple[str, ...] = ()) -> LocalDataCleanupSummary:
+    """Delete one platform's batch rows and files, preserving shared logs and login data."""
+    if platform not in {"compass", "taobao"}:
+        raise ValueError("unsupported cleanup platform")
+    # 先验证数据库和平台目录边界，不能顺着符号链接清理其他工程。
+    resolved_database = _validated_database_path(runtime_root, database_path)
+    resolved_root = runtime_root.resolve(strict=False)
+    # 新平台目录覆盖raw/CSV/失败材料及本地网站发布暂存，不触及远端文件。
+    candidates = [resolved_root / name / platform for name in ("exports", "raw", "artifacts", "web-publication")]
+    for candidate in candidates:
+        if candidate.parent.is_symlink() or not candidate.resolve().is_relative_to(resolved_root):
+            raise ValueError("platform cleanup target is outside runtime")
+    # 数据库不存在时也允许清理残留文件；不创建新数据库或删除其他平台的记录。
+    deleted_batches = 0
+    owned_task_ids = set(task_ids)
+    if resolved_database.exists():
+        from compass_collector.persistence import upgrade_database
+
+        upgrade_database(resolved_database, platform=platform)
+        with sqlite3.connect(resolved_database) as connection:
+            connection.execute("PRAGMA foreign_keys=ON")
+            owned_task_ids.update(row[0] for row in connection.execute(
+                "SELECT DISTINCT task_id FROM collection_batches WHERE platform=?", (platform,)))
+            # 旧目录只有task维度，另一平台复用了相同task时必须保留。
+            owned_task_ids.difference_update(row[0] for row in connection.execute(
+                "SELECT DISTINCT task_id FROM collection_batches WHERE platform<>?", (platform,)))
+            # 外键级联删除分类、raw索引、正式商品及店铺，保留另一平台全部记录。
+            deleted_batches = connection.execute("DELETE FROM collection_batches WHERE platform=?", (platform,)).rowcount
+            for task_id in owned_task_ids:
+                connection.execute("DELETE FROM scheduler_checkpoints WHERE task_id=?", (task_id,))
+    # 兼容原抖音日期/task目录，要求task只是一段目录名，避免配置值成为路径穿越。
+    for name in ("exports", "raw", "artifacts"):
+        for day_directory in (resolved_root / name).glob("????-??-??"):
+            if day_directory.is_symlink():
+                continue
+            for task_id in owned_task_ids:
+                if PlatformRuntime(resolved_root, platform).owns_legacy_task(day_directory.name, task_id):
+                    candidates.append(day_directory / task_id)
+    # 共享JSONL包含其他平台审计，保留整个logs目录。
+    removed_directories = 0
+    failures = 0
+    for candidate in candidates:
+        try:
+            if _remove_allowlisted_path(candidate):
+                removed_directories += 1
+        except OSError:
+            failures += 1
+    return LocalDataCleanupSummary(0, removed_directories, failures, deleted_batches)
 
 
 def clear_auth_data(profile_dir: Path) -> bool:
@@ -157,12 +214,12 @@ def clear_auth_data(profile_dir: Path) -> bool:
 def clear_auth_data_with_locks(
     runtime_root: Path,
     profile_dir: Path,
+    *,
+    platform: str = "compass",
 ) -> bool:
     """Remove the Chrome profile only while collection lock is owned."""
 
-    lock = ProcessLock(
-        runtime_root / "locks" / COLLECTION_LOCK_NAME,
-        "collection",
-    )
-    with lock:
+    # Profile资源锁防止另一份配置以不同平台名称占用相同目录。
+    scope = PlatformRuntime(runtime_root, platform)
+    with scope.operation("collection", profile_dir):
         return clear_auth_data(profile_dir)

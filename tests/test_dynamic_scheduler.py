@@ -29,7 +29,9 @@ def build_test_config(tmp_path: Path) -> AppConfig:
     database_config = config.database.model_copy(
         update={"path": tmp_path / "runtime" / "data" / "collector.db"}
     )
-    return config.model_copy(update={"database": database_config})
+    # 临时测试把两个平台路径都隔离到同一个pytest根目录。
+    platforms = {name: item.model_copy(update={"database_path": database_config.path if name == "compass" else database_config.path.with_name("taobao.db")}) for name, item in config.platforms.items()}
+    return config.model_copy(update={"database": database_config, "platforms": platforms})
 
 
 def create_test_database(config: AppConfig) -> Database:

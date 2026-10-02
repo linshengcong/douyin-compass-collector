@@ -148,6 +148,7 @@ def test_clean_migration_creates_only_the_new_baseline_tables(tmp_path: Path) ->
         "product_rank_entries",
         "product_rank_entry_shops",
         "scheduler_checkpoints",
+        "runtime_platform",
     }
     assert "collection_runs" not in table_names
     assert {

@@ -4,12 +4,24 @@ set -euo pipefail
 
 # LaunchAgent 使用稳定反向域名作为系统服务标识。
 LABEL="com.zhuanz1.douyin-compass-collector"
+# 显式平台入口使用独立服务标签；不带参数兼容旧服务维护脚本。
+SELECTED_PLATFORM="${COLLECTOR_PLATFORM:-}"
+if [[ -n "${SELECTED_PLATFORM}" ]]; then
+  case "${SELECTED_PLATFORM}" in compass|taobao) LABEL="${LABEL}.${SELECTED_PLATFORM}";; *) echo "不支持的平台" >&2; exit 2;; esac
+fi
+# Make后台入口默认启用通知，plist只写入布尔开关，凭证仍由本机.env读取。
+if [[ -n "${COLLECTOR_NOTIFY:-}" ]]; then
+  case "${COLLECTOR_NOTIFY}" in true|false) ;; *) echo "通知开关必须是true或false" >&2; exit 2;; esac
+fi
 # 脚本目录用于推导可迁移的工程绝对路径。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # launchd 必须使用绝对工作目录，不能依赖调用者当前目录。
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # 模板只保存非敏感启动结构，绝对路径在安装时写入。
-TEMPLATE_PATH="${PROJECT_ROOT}/launchd/${LABEL}.plist.template"
+TEMPLATE_PATH="${PROJECT_ROOT}/launchd/com.zhuanz1.douyin-compass-collector.plist.template"
+# 配置由Make平台映射传入，必须转成launchd可使用的绝对路径。
+CONFIG_PATH="${COLLECTOR_CONFIG:-${PROJECT_ROOT}/config/tasks.yaml}"
+if [[ "${CONFIG_PATH}" != /* ]]; then CONFIG_PATH="${PROJECT_ROOT}/${CONFIG_PATH}"; fi
 # 当前用户 LaunchAgents 是阶段五唯一允许的安装目标。
 PLIST_DIRECTORY="${HOME}/Library/LaunchAgents"
 # 最终 plist 名称与 Label 一致，便于 status 和 uninstall 定位。
@@ -31,20 +43,29 @@ if [[ -z "${UV_PATH}" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${TEMPLATE_PATH}" || ! -f "${PROJECT_ROOT}/config/tasks.yaml" ]]; then
+if [[ ! -f "${TEMPLATE_PATH}" || ! -f "${CONFIG_PATH}" ]]; then
   echo "工程文件不完整，无法生成 LaunchAgent" >&2
   exit 1
 fi
 
-# 临时 plist 在校验或安装结束后始终删除。
-TEMPORARY_PLIST="$(mktemp "${TMPDIR:-/tmp}/${LABEL}.XXXXXX.plist")"
+# 随机占位符必须在模板末尾，临时 plist 在校验或安装结束后始终删除。
+TEMPORARY_PLIST="$(mktemp "${TMPDIR:-/tmp}/${LABEL}.XXXXXX")"
 trap 'rm -f "${TEMPORARY_PLIST}"' EXIT
 cp "${TEMPLATE_PATH}" "${TEMPORARY_PLIST}"
 
 # PlistBuddy 负责字符串转义和结构化修改，避免用文本替换破坏 XML。
 /usr/libexec/PlistBuddy -c "Set :ProgramArguments:0 ${UV_PATH}" "${TEMPORARY_PLIST}"
-/usr/libexec/PlistBuddy -c "Set :ProgramArguments:8 ${PROJECT_ROOT}/config/tasks.yaml" "${TEMPORARY_PLIST}"
+/usr/libexec/PlistBuddy -c "Set :Label ${LABEL}" "${TEMPORARY_PLIST}"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:8 ${CONFIG_PATH}" "${TEMPORARY_PLIST}"
+if [[ -n "${SELECTED_PLATFORM}" ]]; then
+  /usr/libexec/PlistBuddy -c "Add :ProgramArguments:9 string --platform" "${TEMPORARY_PLIST}"
+  /usr/libexec/PlistBuddy -c "Add :ProgramArguments:10 string ${SELECTED_PLATFORM}" "${TEMPORARY_PLIST}"
+fi
 /usr/libexec/PlistBuddy -c "Set :WorkingDirectory ${PROJECT_ROOT}" "${TEMPORARY_PLIST}"
+if [[ -n "${COLLECTOR_NOTIFY:-}" ]]; then
+  /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "${TEMPORARY_PLIST}"
+  /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:DINGTALK_ENABLED string ${COLLECTOR_NOTIFY}" "${TEMPORARY_PLIST}"
+fi
 /usr/bin/plutil -lint "${TEMPORARY_PLIST}"
 
 if [[ "${MODE}" == "--dry-run" ]]; then
@@ -67,4 +88,4 @@ fi
 /bin/launchctl kickstart -k "${LAUNCH_DOMAIN}/${LABEL}"
 
 echo "LaunchAgent 已安装并启动：${LABEL}"
-echo "查看状态：${PROJECT_ROOT}/scripts/status_launchd.sh"
+echo "查看状态：COLLECTOR_PLATFORM=${SELECTED_PLATFORM} ${PROJECT_ROOT}/scripts/status_launchd.sh"

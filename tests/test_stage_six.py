@@ -51,7 +51,7 @@ def test_cli_run_defaults_to_gui_and_no_gui_is_explicit() -> None:
         ["app", "--task", "product_hot_sale_food_level3"]
     )
     # 清理命令必须由调用方显式提供 --yes。
-    clear_arguments = build_parser().parse_args(["clear-data", "--yes"])
+    clear_arguments = build_parser().parse_args(["clear-data", "--platform", "compass", "--yes"])
 
     assert default_arguments.no_gui is False
     assert terminal_arguments.no_gui is True
@@ -64,7 +64,7 @@ def test_cli_clear_data_refuses_missing_explicit_confirmation() -> None:
     """Stop the destructive CLI path before cleanup when --yes is absent."""
 
     # 未确认参数不得进入任何清理或锁操作。
-    arguments = build_parser().parse_args(["clear-data"])
+    arguments = build_parser().parse_args(["clear-data", "--platform", "compass"])
     # 只加载仓库静态配置，不访问 runtime。
     config = load_config(Path("config/tasks.yaml"))
 
@@ -398,7 +398,9 @@ def test_scheduled_lock_conflict_records_once_and_sends_one_summary(
     database_config = base_config.database.model_copy(
         update={"path": tmp_path / "runtime" / "data" / "collector.db"}
     )
-    config = base_config.model_copy(update={"database": database_config})
+    # 平台解析必须仍使用临时数据库，不能触碰真实runtime。
+    platforms = {name: item.model_copy(update={"database_path": database_config.path if name == "compass" else database_config.path.with_name("taobao.db")}) for name, item in base_config.platforms.items()}
+    config = base_config.model_copy(update={"database": database_config, "platforms": platforms})
     # Runner 日志和锁目录全部进入 pytest 临时 runtime。
     monkeypatch.setattr("compass_collector.runner.RUNTIME_ROOT", tmp_path / "runtime")
 
@@ -428,7 +430,7 @@ def test_scheduled_lock_conflict_records_once_and_sends_one_summary(
     finally:
         database.close()
     # JSONL 只读取稳定事件字段，不依赖控制台文案。
-    log_path = next((tmp_path / "runtime" / "logs").glob("*.jsonl"))
+    log_path = next((tmp_path / "runtime" / "logs" / "compass").glob("*.jsonl"))
     log_events = [
         json.loads(line)
         for line in log_path.read_text(encoding="utf-8").splitlines()
@@ -460,10 +462,10 @@ def test_makefile_exposes_one_parameterized_collection_command() -> None:
     # Makefile 是日常执行入口的公开契约。
     makefile = Path("Makefile").read_text(encoding="utf-8")
 
-    assert "app:" in makefile
+    assert "START ?= yes" in makefile
     assert "run:" in makefile
-    assert "MODE ?= normal" in makefile
+    assert "MODE ?= force" in makefile
     assert "GUI ?= yes" in makefile
-    assert "notify-test:" in makefile
-    assert "clear-data:" in makefile
+    assert "notify:" in makefile
+    assert "clean:" in makefile
     assert "--no-gui" in makefile

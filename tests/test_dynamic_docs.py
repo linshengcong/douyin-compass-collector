@@ -99,8 +99,9 @@ def test_makefile_exposes_a_compact_dynamic_delivery_surface() -> None:
     makefile = Path("Makefile").read_text(encoding="utf-8")
 
     assert "run:" in makefile
-    assert "MODE ?= normal" in makefile
+    assert "MODE ?= force" in makefile
     assert "GUI ?= yes" in makefile
-    assert "service:" in makefile
+    assert "schedule:" in makefile
+    assert "PLATFORM ?=" in makefile
     assert "test-stage2:" not in makefile
     assert "run-cli:" not in makefile

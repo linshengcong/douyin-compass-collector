@@ -4,6 +4,7 @@ import os
 import plistlib
 import subprocess
 from pathlib import Path
+import pytest
 
 
 # LaunchAgent 模板是守护行为的唯一仓库内契约。
@@ -92,6 +93,20 @@ def test_install_dry_run_never_writes_user_launchagents(tmp_path: Path) -> None:
     assert not target_path.exists()
 
 
+@pytest.mark.parametrize("platform,config_path", [("compass", "config/tasks.yaml"), ("taobao", "config/taobao.yaml")])
+def test_platform_service_dry_run_uses_separate_label_without_installing(tmp_path, platform, config_path):
+    """Render the actual platform service configuration without registering anything."""
+    # 平台参数与Make入口一致，临时HOME保证没有用户级服务文件写入。
+    environment = {**os.environ, "HOME": str(tmp_path), "COLLECTOR_PLATFORM": platform,
+                   "COLLECTOR_CONFIG": config_path, "COLLECTOR_NOTIFY": "true"}
+    # 使用真实PlistBuddy和plutil校验XML及参数，--dry-run不会调用launchctl。
+    result = subprocess.run([str(SCRIPT_PATHS[0]), "--dry-run"], capture_output=True, text=True, env=environment)
+    assert result.returncode == 0, result.stderr
+    assert f"douyin-compass-collector.{platform}.plist" in result.stdout
+    assert "未调用 launchctl" in result.stdout
+    assert not (tmp_path / "Library/LaunchAgents").exists()
+
+
 def test_delivery_documents_cover_operations_and_security() -> None:
     """Require the handoff docs needed to operate the project on another Mac."""
 
@@ -118,22 +133,20 @@ def test_makefile_exposes_compact_parameterized_commands() -> None:
         "install",
         "login",
         "run",
-        "app",
-        "notify-test",
-        "clear-data",
+        "notify",
+        "clean",
         "status",
-        "scheduler",
-        "test",
+        "schedule",
+        "web",
         "check",
-        "service",
     }
 
     assert all(f"{target}:" in makefile for target in expected_targets)
     assert "dry-run:" not in makefile
     assert "force:" not in makefile
     assert "launchd-check:" not in makefile
-    assert "MODE ?= normal" in makefile
+    assert "MODE ?= force" in makefile
     assert "GUI ?= yes" in makefile
-    assert "ACTION ?= check" in makefile
+    assert "NOTIFY ?= yes" in makefile
     assert "--frozen" in makefile
-    assert "TASK ?= compass_household_cleaning_realtime" in makefile
+    assert "PLATFORM ?=" in makefile

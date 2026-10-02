@@ -13,9 +13,13 @@ browser:
 platforms:
   compass:
     profile_dir: runtime/browser-profile
+    # 保留当前抖音历史库，并明确其唯一平台归属。
+    database_path: runtime/data/collector.db
   taobao:
     # 独立目录声明不会启动浏览器或复制其他 Profile 的凭证。
     profile_dir: runtime/taobao-browser-profile
+    # 可分发配置使用独立淘宝库，不搬迁本机PoC数据。
+    database_path: runtime/data/taobao.db
     webdriver_compatibility: true
     # 仅淘宝补充原生 Profile 未恢复的会话 Cookie，抖音保持默认关闭。
     persist_session_cookies: true

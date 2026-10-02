@@ -77,7 +77,8 @@ def test_snapshot_failure_still_closes_context_and_stops_playwright(tmp_path):
         raise RuntimeError("synthetic failure")
 
     session = BrowserSession(
-        SimpleNamespace(stop=lambda: events.append("stopped")),
+        # 自有驱动停止时会正常关闭其浏览器，不需要先等待context事件。
+        SimpleNamespace(stop=lambda: events.extend(["closed", "stopped"])),
         SimpleNamespace(cookies=unavailable_cookies, close=lambda: events.append("closed")),
         None, tmp_path / ".session-cookies.json",
     )

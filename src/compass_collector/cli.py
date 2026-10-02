@@ -14,6 +14,7 @@ from compass_collector.local_data import (
 from compass_collector.notifier import load_project_environment, run_notification_test
 from compass_collector.runner import run_collection, run_login, run_status
 from compass_collector.runtime_locks import RuntimeLockBusy
+from compass_collector.platform_runtime import PlatformRuntime
 from compass_collector.runtime_logging import RuntimeLogger
 from compass_collector.scheduler import run_scheduler
 from compass_collector.app_paths import (
@@ -44,16 +45,19 @@ def build_parser() -> argparse.ArgumentParser:
         "login", help="open the persistent Chrome profile"
     )
     login_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    # 默认罗盘，可显式选择已注册的平台 Profile。
-    login_parser.add_argument("--platform", default="compass")
+    # 未指定平台时从唯一启用平台推导，不把默认值当成用户显式选择。
+    login_parser.add_argument("--platform", choices=("compass", "taobao"))
 
     # app 命令只打开空闲 GUI 控制台，不自动启动采集。
     app_parser = subparsers.add_parser("app", help="open the idle desktop console")
     app_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     app_parser.add_argument("--task", dest="task_id")
+    app_parser.add_argument("--platform", choices=("compass", "taobao"))
 
     # notify-test 显式发送一条真实测试消息，不需要加载业务任务配置。
-    subparsers.add_parser("notify-test", help="send one DingTalk test message")
+    # 通知测试平台来自显式入口，默认值兼容原CLI调用。
+    notification_parser = subparsers.add_parser("notify-test", help="send one DingTalk test message")
+    notification_parser.add_argument("--platform", choices=("compass", "taobao"), default="compass")
 
     # clear-data 是开发期破坏性操作，必须显式提供 --yes。
     clear_data_parser = subparsers.add_parser(
@@ -62,6 +66,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clear_data_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     clear_data_parser.add_argument("--yes", action="store_true")
+    # 清理必须明确指定平台，禁止隐式全局删除。
+    clear_data_parser.add_argument("--platform", choices=("compass", "taobao"), required=True)
 
     # clear-auth 清除 Chrome 持久化登录态，不删除采集数据。
     clear_auth_parser = subparsers.add_parser(
@@ -70,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     clear_auth_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     clear_auth_parser.add_argument("--yes", action="store_true")
-    clear_auth_parser.add_argument("--platform", default="compass")
+    clear_auth_parser.add_argument("--platform", choices=("compass", "taobao"))
 
     # run 命令默认使用 GUI，--no-gui 显式回退终端模式。
     run_parser = subparsers.add_parser(
@@ -79,6 +85,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     run_parser.add_argument("--task", dest="task_id")
     run_parser.add_argument("--no-gui", action="store_true")
+    # 空闲GUI替代旧Make app入口，仍保留用户选择的模式。
+    run_parser.add_argument("--idle", action="store_true")
+    run_parser.add_argument("--platform", choices=("compass", "taobao"))
     # --force 和 --dry-run 语义冲突，同一次命令只允许选择一个。
     run_mode = run_parser.add_mutually_exclusive_group()
     run_mode.add_argument("--force", action="store_true")
@@ -88,12 +97,14 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser = subparsers.add_parser("status", help="show recent task runs")
     status_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     status_parser.add_argument("--limit", type=int, default=20)
+    status_parser.add_argument("--platform", choices=("compass", "taobao"))
 
     # scheduler 命令以前台常驻方式执行，不实现 launchd 守护。
     scheduler_parser = subparsers.add_parser(
         "scheduler", help="run the foreground APScheduler"
     )
     scheduler_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    scheduler_parser.add_argument("--platform", choices=("compass", "taobao"))
     # _smoke 只供打包 CI 验证冻结资源，不作为用户可用命令展示。
     subparsers.add_parser("_smoke", help=argparse.SUPPRESS)
     return parser
@@ -116,7 +127,7 @@ def main() -> None:
             # .env 只补充当前进程缺失值，系统环境变量保持最高优先级。
             load_project_environment()
             if arguments.command == "notify-test":
-                exit_code = run_notification_test(RuntimeLogger(RUNTIME_LOG_DIRECTORY))
+                exit_code = run_notification_test(RuntimeLogger(PlatformRuntime(runtime_root(), arguments.platform).logs, platform=arguments.platform), platform=arguments.platform)
             else:
                 # 严格业务配置在启动 Chrome 前完成全量校验。
                 config = load_config(arguments.config)
@@ -125,7 +136,7 @@ def main() -> None:
             # .env 只补充当前进程缺失值，系统环境变量保持最高优先级。
             load_project_environment()
             if arguments.command == "notify-test":
-                exit_code = run_notification_test(RuntimeLogger(RUNTIME_LOG_DIRECTORY))
+                exit_code = run_notification_test(RuntimeLogger(PlatformRuntime(runtime_root(), arguments.platform).logs, platform=arguments.platform), platform=arguments.platform)
             else:
                 # 严格业务配置在启动 Chrome 前完成全量校验。
                 config = load_config(arguments.config)
@@ -154,14 +165,24 @@ def _dispatch_configured_command(
 ) -> int:
     """Dispatch one command that already has a validated business config."""
 
-    # windowed 桌面包没有 stdin，不能进入依赖 Enter 的终端工作流。
+    # windowed 桌面包没有 stdin，先拦截终端工作流，避免进入配置或浏览器处理。
     if is_packaged_application() and (
         arguments.command == "login"
         or (arguments.command == "run" and arguments.no_gui)
     ):
         return _show_packaged_console_command_notice()
+
+    # 过滤调度及GUI重新加载的任务范围，避免单平台入口启动其他平台。
+    selected_platform = getattr(arguments, "platform", None) or config.execution_platform(getattr(arguments, "task_id", None))
+    config = config.for_platform(selected_platform)
+    if getattr(arguments, "task_id", None) is not None and arguments.task_id not in {task.id for task in config.tasks}:
+        raise ValueError("selected task does not belong to selected platform")
+    PlatformRuntime(runtime_root(), selected_platform).reject_legacy_operations()
+    if arguments.command == "run" and arguments.idle and arguments.no_gui:
+        raise ValueError("--idle requires GUI")
+
     if arguments.command == "login":
-        exit_code = run_login(config, arguments.platform)
+        exit_code = run_login(config, selected_platform)
     elif arguments.command == "app":
         # PySide6 延迟导入，status、login 和后台 Scheduler 不初始化 Qt。
         from compass_collector.gui import GuiLaunchRequest, run_gui
@@ -172,6 +193,7 @@ def _dispatch_configured_command(
                 config_path=arguments.config,
                 task_id=arguments.task_id,
                 auto_start=False,
+                platform=selected_platform,
             ),
         )
     elif arguments.command == "run":
@@ -191,10 +213,11 @@ def _dispatch_configured_command(
                 GuiLaunchRequest(
                     config_path=arguments.config,
                     task_id=arguments.task_id,
-                    auto_start=True,
+                    auto_start=not arguments.idle,
                     dry_run=arguments.dry_run,
                     force=arguments.force,
                     lock_mode=True,
+                    platform=selected_platform,
                 ),
             )
     elif arguments.command == "clear-data":
@@ -204,9 +227,12 @@ def _dispatch_configured_command(
         cleanup_summary = clear_local_data_with_locks(
             runtime_root(),
             config.database.path,
+            **({"platform": selected_platform, "task_ids": tuple(task.id for task in config.tasks)}
+               if selected_platform is not None else {}),
         )
         print(
             "本地采集数据清理完成："
+            f"批次 {cleanup_summary.database_batches}，"
             f"数据库文件 {cleanup_summary.database_files}，"
             f"数据目录 {cleanup_summary.runtime_directories}，"
             f"失败 {cleanup_summary.failures}"
@@ -217,7 +243,7 @@ def _dispatch_configured_command(
             raise ValueError("clear-auth requires --yes")
         # 获取采集锁后删除 Chrome Profile 目录，保留原始 runtime 结构。
         cleared = clear_auth_data_with_locks(
-            runtime_root(), config.browser_for(arguments.platform).profile_dir
+            runtime_root(), config.browser_for(selected_platform).profile_dir, platform=selected_platform
         )
         if cleared:
             print("登录态已清除：Chrome 浏览器 Profile 已重置")
@@ -227,7 +253,7 @@ def _dispatch_configured_command(
     elif arguments.command == "status":
         if arguments.limit <= 0:
             raise ValueError("status --limit must be positive")
-        exit_code = run_status(config, arguments.limit)
+        exit_code = run_status(config, arguments.limit, platform=selected_platform) if selected_platform else run_status(config, arguments.limit)
     else:
         exit_code = run_scheduler(config)
     return exit_code
@@ -258,9 +284,10 @@ def _show_packaged_console_command_notice() -> int:
     """Explain that the windowed desktop package cannot run stdin workflows."""
 
     # 延迟导入避免开发期非 GUI CLI 命令初始化 Qt。
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QMessageBox
+    from compass_collector.qt_application import ensure_qt_application
 
-    application = QApplication.instance() or QApplication(sys.argv)
+    application = ensure_qt_application()
     QMessageBox.information(
         None,
         "请使用图形界面",
@@ -282,9 +309,10 @@ def _validate_portable_environment() -> None:
     # PySide6 只在打包 GUI 缺配置时导入，终端开发命令不受影响。
     from PySide6.QtCore import QUrl
     from PySide6.QtGui import QDesktopServices
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QMessageBox
+    from compass_collector.qt_application import ensure_qt_application
 
-    application = QApplication.instance() or QApplication(sys.argv)
+    application = ensure_qt_application()
     message_box = QMessageBox()
     message_box.setIcon(QMessageBox.Warning)
     message_box.setWindowTitle("缺少配置文件")

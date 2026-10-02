@@ -5,6 +5,7 @@ import json
 import os
 from threading import Lock
 from datetime import datetime
+from time import monotonic, sleep
 from pathlib import Path
 from typing import IO
 from zoneinfo import ZoneInfo
@@ -103,7 +104,20 @@ class ProcessLock:
             self._handle = None
             if self._owned_path is not None:
                 _release_owned_path(self._owned_path)
-                self._owned_path = None
+            self._owned_path = None
+
+    def acquire_wait(self, timeout: float = 30) -> None:
+        """Wait briefly for coordination locks without changing normal acquire semantics."""
+        # 只有初始化和探测协调使用等待，采集重复实例仍立即失败。
+        deadline = monotonic() + timeout
+        while True:
+            try:
+                self.acquire()
+                return
+            except RuntimeLockBusy:
+                if monotonic() >= deadline:
+                    raise
+                sleep(0.01)
 
     def __enter__(self) -> "ProcessLock":
         """Acquire this lock for a context-managed operation."""

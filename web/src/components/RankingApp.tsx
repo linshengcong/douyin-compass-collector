@@ -6,9 +6,9 @@ import { useRankingFilters } from "../hooks/useRankingFilters";
 import { RankingPlatform, type RankingFilters } from "../types";
 
 /** 切换控件独立于加载结果，错误与空配置状态仍允许切回其他平台。 */
-export function RankingApp({ dataIndexUrl, taobaoDataIndexUrl }: { dataIndexUrl?: string; taobaoDataIndexUrl?: string }) {
-  // 默认抖音； keyed 子组件确保筛选、分页、弹层与移动展开全部重建。
-  const [platform, setPlatform] = useState(RankingPlatform.抖音);
+export function RankingApp({ dataIndexUrl, taobaoDataIndexUrl, initialPlatform = RankingPlatform.抖音 }: { dataIndexUrl?: string; taobaoDataIndexUrl?: string; initialPlatform?: RankingPlatform }) {
+  // Make本地入口选择初始平台；公开站无参数仍默认抖音，切换时完整重建筛选。
+  const [platform, setPlatform] = useState(initialPlatform);
   useEffect(() => {
     // 标签页标题随当前平台同步，避免淘宝榜单仍显示抖音标题。
     document.title = `${platform === RankingPlatform.淘宝 ? "淘宝" : "抖音"}商品实时榜`;

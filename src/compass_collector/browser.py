@@ -96,15 +96,13 @@ class BrowserSession:
     session_cookie_path: Path | None = None
 
     def close(self) -> None:
-        """Close the persistent context and then stop Playwright."""
+        """Checkpoint cookies and let the owning driver close its Chrome resources."""
         try:
-            try:
-                if self.session_cookie_path is not None:
-                    save_session_cookies(self.context, self.session_cookie_path)
-            finally:
-                # 备份失败也必须关闭 Chrome 并释放 Profile 锁。
-                self.context.close()
+            if self.session_cookie_path is not None:
+                save_session_cookies(self.context, self.session_cookie_path)
         finally:
+            # stop让本会话的驱动正常关闭其Chrome并等待退出；不依赖可能丢失的context关闭事件。
+            # 备份失败也必须收尾，另一个平台使用不同驱动，不受影响。
             self.playwright.stop()
 
     def wait_for_manual_exit(self, message: str) -> None:
@@ -145,11 +143,8 @@ def open_browser(config: BrowserConfig) -> BrowserSession:
         if cookie_path is not None:
             restore_session_cookies(context, cookie_path)
     except Exception as error:
-        try:
-            if context is not None:
-                context.close()
-        finally:
-            playwright.stop()
+        # 部分初始化失败也由自有驱动统一关闭，不先等待context通知。
+        playwright.stop()
         if isinstance(error, BrowserOperationError):
             raise
         raise BrowserOperationError(

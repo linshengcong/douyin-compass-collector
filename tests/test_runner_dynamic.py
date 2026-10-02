@@ -53,7 +53,9 @@ def temporary_config(tmp_path: Path) -> AppConfig:
     database_config = config.database.model_copy(
         update={"path": tmp_path / "runtime" / "data" / "collector.db"}
     )
-    return config.model_copy(update={"database": database_config})
+    # 临时测试把两个平台路径都隔离到同一个pytest根目录。
+    platforms = {name: item.model_copy(update={"database_path": database_config.path if name == "compass" else database_config.path.with_name("taobao.db")}) for name, item in config.platforms.items()}
+    return config.model_copy(update={"database": database_config, "platforms": platforms})
 
 
 def build_rank_payload(category_id: str) -> dict[str, Any]:
@@ -326,7 +328,7 @@ def test_official_runner_publishes_dynamic_categories_and_chinese_csv(
     status_exit_code = run_status(config, limit=5)
     status_output = capsys.readouterr().out
     # runtime_events 验证 runner 把任务日志归入通知使用的同一执行批次。
-    log_path = next((tmp_path / "runtime" / "logs").glob("*.jsonl"))
+    log_path = next((tmp_path / "runtime" / "logs" / "compass").glob("*.jsonl"))
     runtime_events = [
         json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
     ]

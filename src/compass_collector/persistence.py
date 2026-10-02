@@ -9,6 +9,7 @@ from uuid import uuid4
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
+from alembic.script import ScriptDirectory
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -32,6 +33,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from compass_collector.errors import PublicationError
+from compass_collector.runtime_locks import ProcessLock, RuntimeLockBusy
 from compass_collector.models import (
     CategoryDiscoveryResult,
     CategoryRunPlan,
@@ -82,6 +84,20 @@ def _rollback_staged_csv_or_raise(staged_csv: _StagedCsvExportLike) -> None:
 
 class Base(DeclarativeBase):
     """Base metadata shared by ORM models and Alembic migrations."""
+
+
+class RuntimePlatform(Base):
+    """Persist one platform owner even when all business batches are cleared."""
+
+    __tablename__ = "runtime_platform"
+    # 单行主键与迁移约束保持一致，不接受任意其他身份行。
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # 平台归属不是运行时配置值，首次认领后不可由其他平台覆写。
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_runtime_platform_singleton"),
+        CheckConstraint("platform IN ('compass', 'taobao')", name="ck_runtime_platform_name"),
+    )
 
 
 class CollectionBatch(Base):
@@ -643,42 +659,64 @@ def enable_sqlite_foreign_keys(engine: Engine) -> None:
         cursor.close()
 
 
-def upgrade_database(database_path: Path) -> None:
-    """Upgrade the configured SQLite database to the latest Alembic revision."""
+def _check_platform_identity(connection: sqlite3.Connection, platform: str) -> None:
+    """Reject mixed history or an already claimed foreign database without mutation."""
+    if platform not in {"compass", "taobao"}:
+        raise ValueError("unsupported database platform")
+    # 旧版本可能没有平台列，历史无平台列的批次归属抖音。
+    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "collection_batches" in tables:
+        # PRAGMA只读取固定表的结构，不拼接配置值。
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(collection_batches)")}
+        identities = {row[0] for row in connection.execute("SELECT DISTINCT platform FROM collection_batches")} if "platform" in columns else ({"compass"} if connection.execute("SELECT 1 FROM collection_batches LIMIT 1").fetchone() else set())
+        if identities - {platform}:
+            raise ValueError("database contains another platform or mixed platform history")
+    if "runtime_platform" in tables:
+        # 单行归属不可由另一份配置重新认领，即使数据库没有业务记录。
+        owner = connection.execute("SELECT platform FROM runtime_platform WHERE id=1").fetchone()
+        if owner is not None and owner != (platform,):
+            raise ValueError("database belongs to another platform")
 
+
+def upgrade_database(database_path: Path, *, platform: str | None = None) -> None:
+    """Serialize initialization and validate/claim an immutable platform identity."""
+    # 锁按数据库绝对路径定位，GUI和Scheduler即使配置名称不同也共用。
+    database_path = database_path.resolve()
     database_path.parent.mkdir(parents=True, exist_ok=True)
-    if database_path.is_file():
-        # sqlite backup 包含 WAL 中已提交数据，比复制主文件更可靠。
-        with sqlite3.connect(database_path) as source:
-            tables = {
-                row[0]
-                for row in source.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                )
-            }
-            revision = (
-                source.execute("SELECT version_num FROM alembic_version").fetchone()
-                if "alembic_version" in tables
-                else None
-            )
-            if revision != ("0007_taobao_repeated_items",):
-                backup_dir = database_path.parent / "backups"
-                backup_dir.mkdir(exist_ok=True)
-                backup_path = (
-                    backup_dir
-                    / f"{database_path.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.db"
-                )
-                with sqlite3.connect(backup_path) as destination:
-                    source.backup(destination)
-    # 迁移资源在开发时来自仓库，PyInstaller 中来自打包的数据目录。
-    from compass_collector.app_paths import resource_root
-
-    project_root = resource_root()
-    # Alembic 配置在运行时覆盖为当前数据库绝对 URL。
-    alembic_config = AlembicConfig(str(project_root / "alembic.ini"))
-    alembic_config.set_main_option("script_location", str(project_root / "migrations"))
-    alembic_config.set_main_option("sqlalchemy.url", database_url(database_path))
-    command.upgrade(alembic_config, "head")
+    initialization_lock = ProcessLock(database_path.with_name(database_path.name + ".init.lock"), "database_initialization")
+    # 初始化是短事务，最多等待30秒；采集互斥仍采用立即拒绝。
+    initialization_lock.acquire_wait(timeout=30)
+    try:
+        # 迁移资源同时适用于开发仓库和PyInstaller包。
+        from compass_collector.app_paths import resource_root
+        project_root = resource_root()
+        alembic_config = AlembicConfig(str(project_root / "alembic.ini"))
+        alembic_config.set_main_option("script_location", str(project_root / "migrations"))
+        alembic_config.set_main_option("sqlalchemy.url", database_url(database_path))
+        head = ScriptDirectory.from_config(alembic_config).get_current_head()
+        revision = None
+        if database_path.is_file():
+            with sqlite3.connect(database_path) as source:
+                if platform is not None:
+                    _check_platform_identity(source, platform)
+                tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                revision = source.execute("SELECT version_num FROM alembic_version").fetchone() if "alembic_version" in tables else None
+                if revision != (head,):
+                    # 只在实际迁移前备份，SQLite backup包括已提交WAL。
+                    backup_dir = database_path.parent / "backups"
+                    backup_dir.mkdir(exist_ok=True)
+                    backup_path = backup_dir / f"{database_path.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.db"
+                    with sqlite3.connect(backup_path) as destination:
+                        source.backup(destination)
+        if revision != (head,):
+            command.upgrade(alembic_config, "head")
+        if platform is not None:
+            with sqlite3.connect(database_path) as connection:
+                _check_platform_identity(connection, platform)
+                connection.execute("INSERT OR IGNORE INTO runtime_platform(id, platform) VALUES(1, ?)", (platform,))
+                _check_platform_identity(connection, platform)
+    finally:
+        initialization_lock.release()
 
 
 class Database:
@@ -702,6 +740,14 @@ class Database:
         """Dispose pooled SQLite connections."""
 
         self.engine.dispose()
+
+    @staticmethod
+    def _validate_write_platform(session: Session, platform: str) -> None:
+        """Prevent a foreign batch from contaminating an already claimed database."""
+        # 在实际写入事务中查询永久归属，不能只依赖启动时检查。
+        owner = session.get(RuntimePlatform, 1)
+        if owner is not None and owner.platform != platform:
+            raise ValueError("database belongs to another platform")
 
     @staticmethod
     def _category_run_snapshot(category_run: CategoryRun) -> CategoryRunSnapshot:
@@ -1111,6 +1157,7 @@ class Database:
         stored_started_at = normalize_datetime(started_at)
         with self.session_factory.begin() as session:
             # batch_id 由编排层提前生成，重复创建必须显式失败。
+            self._validate_write_platform(session, platform)
             if session.get(CollectionBatch, batch_id) is not None:
                 raise RuntimeError("collection batch already exists")
             session.add(
@@ -1845,6 +1892,7 @@ class Database:
         batch_id = uuid4().hex
         with self.session_factory.begin() as session:
             # 已有任意非 dry-run 尝试时不重复造 Scheduler 终态。
+            self._validate_write_platform(session, platform)
             existing_batch_id = session.scalar(
                 select(CollectionBatch.id)
                 .where(
@@ -1968,14 +2016,17 @@ class Database:
                 checkpoint.last_checked_at = stored_checked_at
                 checkpoint.updated_at = stored_checked_at
 
-    def recent_status(self, limit: int = 20) -> list[StatusRow]:
+    def recent_status(self, limit: int = 20, *, platform: str | None = None) -> list[StatusRow]:
         """Return recent batch attempts without expanding category details."""
 
         with self.session_factory() as session:
             # 顶层 status 直接按批次开始时间倒序读取。
+            # 平台过滤必须早于LIMIT，避免另一平台记录占满结果窗口。
+            query = select(CollectionBatch)
+            if platform is not None:
+                query = query.where(CollectionBatch.platform == platform)
             batches = session.scalars(
-                select(CollectionBatch)
-                .order_by(CollectionBatch.started_at.desc())
+                query.order_by(CollectionBatch.started_at.desc())
                 .limit(limit)
             ).all()
         # 查询结果转为与 ORM Session 解耦的不可变摘要。
