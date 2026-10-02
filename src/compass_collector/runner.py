@@ -177,6 +177,7 @@ def build_task_notification_result(
         oss_error_category=oss_error_category,
         error_category=error_category,
         category_issues=tuple(category_issues),
+        platform=task.platform,
     )
 
 
@@ -393,8 +394,8 @@ def _record_precollection_terminal(
         mode=mode,
         platform=plan.task.platform,
         config_snapshot=plan.task.model_dump(mode="json"),
-        brand_type=plan.task.filters.brand_type,
-        price_bin=plan.task.filters.price_bin,
+        brand_type=plan.task.filters.brand_type if plan.task.platform == "compass" else None,
+        price_bin=plan.task.filters.price_bin if plan.task.platform == "compass" else None,
         manifest_path=storage.manifest_path,
         started_at=started_at,
     )
@@ -629,10 +630,14 @@ def _publish_website_after_collection(
                 csv_path=candidate.csv_path,
                 task_id=candidate.task.id,
                 platform=candidate.task.platform,
-                update_legacy_index=candidate.task.id == primary_task_id,
+                # 独立淘宝配置可指定自己的主任务，但旧根索引始终只属于抖音。
+                update_legacy_index=(candidate.task.platform == "compass"
+                                     and candidate.task.id == primary_task_id),
                 batch_id=candidate.batch_id,
                 business_date=candidate.collected_batch.business_date,
                 published_at=candidate.published_at,
+                started_at=candidate.collected_batch.started_at,
+                finished_at=candidate.collected_batch.finished_at,
                 successful_category_count=len(candidate.collected_batch.category_runs),
                 failed_category_count=candidate.collected_batch.failed_category_count,
                 item_count=sum(
@@ -1497,7 +1502,7 @@ def run_scheduled_collection(
 ) -> int:
     """Execute one due task group without waiting for keyboard input."""
 
-    # 同一计划时刻的任务共享覆盖时间，并在一个 Chrome 批次内串行执行。
+    # 同一计划时刻的任务共享覆盖时间，按平台独立 Chrome 串行执行。
     planned_at_overrides = {task.id: planned_at for task in tasks}
     try:
         return run_collection(
@@ -1531,6 +1536,8 @@ def run_scheduled_collection(
                 # 每个任务仍拥有独立 collection batch，便于 status 明确展示。
                 skipped_batch_id = busy_database.record_skipped_busy_run(
                     task_id=task.id,
+                    platform=task.platform,
+                    config_snapshot=task.model_dump(mode="json"),
                     business_date=planned_at.date(),
                     planned_at=planned_at,
                     recorded_at=busy_recorded_at,

@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { BottomSheet } from "./BottomSheet";
-import { MetricOperator, SortDirection, SortField, type RankingFilters, type RankingRecord } from "../types";
+import { filterRankingRecords, platformSortFields } from "../lib/ranking";
+import { MetricOperator, RankingPlatform, SortDirection, SortField, type RankingFilters, type RankingRecord } from "../types";
 
 type CategoryLevel = "level1" | "level2" | "level3";
 type PickerKind = CategoryLevel | "sort" | "pay" | "count";
@@ -10,9 +11,13 @@ const sortFieldLabels: Record<SortField, string> = {
   [SortField.排名]: "排名",
   [SortField.用户支付金额]: "用户支付金额",
   [SortField.成交件数]: "成交件数",
+  [SortField.支付买家数]: "支付买家数",
+  [SortField.访客数]: "访客数",
 };
 
 interface CompositeFilterSheetProps {
+  /** 草稿与实际列表使用同一平台指标口径。 */
+  platform: RankingPlatform;
   records: RankingRecord[];
   filters: RankingFilters;
   onClose: () => void;
@@ -21,7 +26,9 @@ interface CompositeFilterSheetProps {
 }
 
 /** 集中承载移动端筛选草稿，只有应用或重置才会将状态提交给榜单。 */
-export function CompositeFilterSheet({ records, filters, onClose, onApply, onReset }: CompositeFilterSheetProps) {
+export function CompositeFilterSheet({ platform, records, filters, onClose, onApply, onReset }: CompositeFilterSheetProps) {
+  // 淘宝两项指标均为人数，首次上榜不适用。
+  const isTaobao = platform === RankingPlatform.淘宝;
   // draft 与已应用 filters 分离，避免弹层内操作触发底层列表变化。
   const [draft, setDraft] = useState<RankingFilters>(filters);
   const [pickerKind, setPickerKind] = useState<PickerKind | null>(null);
@@ -47,20 +54,20 @@ export function CompositeFilterSheet({ records, filters, onClose, onApply, onRes
           <CategoryTrigger label="三级类目" value={draft.level3} onClick={() => setPickerKind("level3")} />
         </div>
         <div className="composite-value-grid">
-          <CategoryTrigger label="支付金额" value={metricFilterLabel(draft.payOperator, draft.payMinimum, draft.payMaximum, "元")} onClick={() => setPickerKind("pay")} />
-          <CategoryTrigger label="成交件数" value={metricFilterLabel(draft.countOperator, draft.countMinimum, draft.countMaximum, "件")} onClick={() => setPickerKind("count")} />
+          <CategoryTrigger label={isTaobao ? "支付买家数" : "支付金额"} value={metricFilterLabel(draft.payOperator, draft.payMinimum, draft.payMaximum, isTaobao ? "人" : "元")} onClick={() => setPickerKind("pay")} />
+          <CategoryTrigger label={isTaobao ? "访客数" : "成交件数"} value={metricFilterLabel(draft.countOperator, draft.countMinimum, draft.countMaximum, isTaobao ? "人" : "件")} onClick={() => setPickerKind("count")} />
         </div>
         <div className="composite-bottom-grid">
           <CategoryTrigger label="排序" value={sortFieldLabel(draft.sortField)} onClick={() => setPickerKind("sort")} />
           <button type="button" className="direction-button" onClick={() => setDraft((current) => ({ ...current, sortDirection: current.sortDirection === SortDirection.升序 ? SortDirection.降序 : SortDirection.升序 }))}>{draft.sortDirection === SortDirection.升序 ? "↑ 升序" : "↓ 降序"}</button>
-          <label className="new-only-field"><span>仅首次上榜</span><input type="checkbox" checked={draft.newOnly} onChange={(event) => setDraft((current) => ({ ...current, newOnly: event.target.checked }))} /><b>{draft.newOnly ? "已选中" : "未选中"}</b><small>核心关注条件，已为您优先筛选</small></label>
+          {!isTaobao && <label className="new-only-field"><span>仅首次上榜</span><input type="checkbox" checked={draft.newOnly} onChange={(event) => setDraft((current) => ({ ...current, newOnly: event.target.checked }))} /><b>{draft.newOnly ? "已选中" : "未选中"}</b><small>核心关注条件，已为您优先筛选</small></label>}
         </div>
-        <div className="draft-summary"><span>当前已选</span>{summaryLabels(draft).map((label) => <b key={label}>{label}</b>)}</div>
-        <div className="composite-actions"><button type="button" onClick={onReset}>重置</button><button type="button" className="apply-filter" onClick={() => onApply(draft)}>应用筛选 <small>共 {filterCount(records, draft).toLocaleString()} 条结果</small></button></div>
+        <div className="draft-summary"><span>当前已选</span>{summaryLabels(draft, platform).map((label) => <b key={label}>{label}</b>)}</div>
+        <div className="composite-actions"><button type="button" onClick={onReset}>重置</button><button type="button" className="apply-filter" onClick={() => onApply(draft)}>应用筛选 <small>共 {filterRankingRecords(records, draft, platform).length.toLocaleString()} 条结果</small></button></div>
       </div>
     </BottomSheet>
-    {pickerKind === "sort" ? <SortPicker value={draft.sortField} onClose={() => setPickerKind(null)} onConfirm={(sortField) => { setDraft((current) => ({ ...current, sortField })); setPickerKind(null); }} /> : null}
-    {pickerKind === "pay" || pickerKind === "count" ? <MetricPicker title={pickerKind === "pay" ? "支付金额" : "成交件数"} unit={pickerKind === "pay" ? "元" : "件"} quickValues={pickerKind === "pay" ? ["10000", "50000", "100000"] : ["10", "50", "100"]} operator={pickerKind === "pay" ? draft.payOperator : draft.countOperator} minimum={pickerKind === "pay" ? draft.payMinimum : draft.countMinimum} maximum={pickerKind === "pay" ? draft.payMaximum : draft.countMaximum} onClose={() => setPickerKind(null)} onConfirm={(metric) => { setDraft((current) => pickerKind === "pay" ? { ...current, payOperator: metric.operator, payMinimum: metric.minimum, payMaximum: metric.maximum } : { ...current, countOperator: metric.operator, countMinimum: metric.minimum, countMaximum: metric.maximum }); setPickerKind(null); }} /> : null}
+    {pickerKind === "sort" ? <SortPicker platform={platform} value={draft.sortField} onClose={() => setPickerKind(null)} onConfirm={(sortField) => { setDraft((current) => ({ ...current, sortField })); setPickerKind(null); }} /> : null}
+    {pickerKind === "pay" || pickerKind === "count" ? <MetricPicker title={isTaobao ? pickerKind === "pay" ? "支付买家数" : "访客数" : pickerKind === "pay" ? "支付金额" : "成交件数"} unit={isTaobao ? "人" : pickerKind === "pay" ? "元" : "件"} quickValues={!isTaobao && pickerKind === "pay" ? ["10000", "50000", "100000"] : ["10", "50", "100"]} operator={pickerKind === "pay" ? draft.payOperator : draft.countOperator} minimum={pickerKind === "pay" ? draft.payMinimum : draft.countMinimum} maximum={pickerKind === "pay" ? draft.payMaximum : draft.countMaximum} onClose={() => setPickerKind(null)} onConfirm={(metric) => { setDraft((current) => pickerKind === "pay" ? { ...current, payOperator: metric.operator, payMinimum: metric.minimum, payMaximum: metric.maximum } : { ...current, countOperator: metric.operator, countMinimum: metric.minimum, countMaximum: metric.maximum }); setPickerKind(null); }} /> : null}
     {pickerKind === "level1" || pickerKind === "level2" || pickerKind === "level3" ? <CategoryPicker level={pickerKind} value={draft[pickerKind]} options={options[pickerKind]} onClose={() => setPickerKind(null)} onConfirm={(value) => selectCategory(pickerKind, value)} /> : null}
   </>;
 }
@@ -73,9 +80,9 @@ function CategoryPicker({ level, value, options, onClose, onConfirm }: { level: 
 }
 
 /** 排序字段使用与类目一致的独立选择 Popup，避免原生 select 的平台差异。 */
-function SortPicker({ value, onClose, onConfirm }: { value: SortField; onClose: () => void; onConfirm: (value: SortField) => void }) {
+function SortPicker({ platform, value, onClose, onConfirm }: { platform: RankingPlatform; value: SortField; onClose: () => void; onConfirm: (value: SortField) => void }) {
   const [selected, setSelected] = useState(value);
-  return <BottomSheet title="选择排序" nested onClose={onClose} onConfirm={() => onConfirm(selected)}><div className="sheet-options">{Object.values(SortField).map((field) => <button type="button" className={selected === field ? "selected" : ""} key={field} onClick={() => setSelected(field)}><span>{sortFieldLabel(field)}</span>{selected === field ? <b>✓</b> : null}</button>)}</div></BottomSheet>;
+  return <BottomSheet title="选择排序" nested onClose={onClose} onConfirm={() => onConfirm(selected)}><div className="sheet-options">{platformSortFields(platform).map((field) => <button type="button" className={selected === field ? "selected" : ""} key={field} onClick={() => setSelected(field)}><span>{sortFieldLabel(field)}</span>{selected === field ? <b>✓</b> : null}</button>)}</div></BottomSheet>;
 }
 
 /** 数值 Popup 支持常用阈值和自定义大于、小于、区间筛选。 */
@@ -101,7 +108,7 @@ function buildCategoryOptions(records: RankingRecord[], draft: RankingFilters) {
 }
 
 /** 生成可读筛选摘要，便于用户在应用前检查草稿。 */
-function summaryLabels(draft: RankingFilters) { return [`一级类目：${draft.level1}`, `支付金额：${metricFilterLabel(draft.payOperator, draft.payMinimum, draft.payMaximum, "元")}`, draft.newOnly ? "仅首次上榜" : "全部商品", `排序：${sortFieldLabel(draft.sortField)}（${draft.sortDirection === SortDirection.升序 ? "升序" : "降序"}）`]; }
+function summaryLabels(draft: RankingFilters, platform: RankingPlatform) { return [`一级类目：${draft.level1}`, `${platform === RankingPlatform.淘宝 ? "支付买家数" : "支付金额"}：${metricFilterLabel(draft.payOperator, draft.payMinimum, draft.payMaximum, platform === RankingPlatform.淘宝 ? "人" : "元")}`, draft.newOnly ? "仅首次上榜" : "全部商品", `排序：${sortFieldLabel(draft.sortField)}（${draft.sortDirection === SortDirection.升序 ? "升序" : "降序"}）`]; }
 
 /** 将稳定排序字段转换为用户界面使用的中文名称。 */
 function sortFieldLabel(field: SortField) { return sortFieldLabels[field]; }
@@ -117,12 +124,3 @@ function formatMetricValue(value: string) { const numeric = Number(value); retur
 
 /** 清理数值输入，只保留用于阈值计算的数字和小数点。 */
 function numericOnly(value: string) { return value.replace(/[^\d.]/g, ""); }
-
-/** 仅用于应用按钮的结果预览，实际筛选仍由共享 Hook 在提交后执行。 */
-function filterCount(records: RankingRecord[], draft: RankingFilters) { const keyword = draft.keyword.trim().toLocaleLowerCase(); return records.filter((item) => (!keyword || item.product_name.toLocaleLowerCase().includes(keyword) || item.shop_name.toLocaleLowerCase().includes(keyword)) && (draft.level1 === "全部" || item.level1 === draft.level1) && (draft.level2 === "全部" || item.level2 === draft.level2) && (draft.level3 === "全部" || item.level3 === draft.level3) && (!draft.newOnly || item.newly_on_ranking) && matchesMetricFilter(numberFloor(item.pay_amount), draft.payOperator, draft.payMinimum, draft.payMaximum) && matchesMetricFilter(numberFloor(item.pay_combo_count), draft.countOperator, draft.countMinimum, draft.countMaximum)).length; }
-
-/** 在筛选预览中复用数值比较规则，保持按钮计数与实际列表一致。 */
-function matchesMetricFilter(value: number, operator: MetricOperator, minimum: string, maximum: string) { const min = Number(minimum); const max = Number(maximum); if (operator === MetricOperator.大于等于) return !Number.isFinite(min) || value >= min; if (operator === MetricOperator.小于等于) return !Number.isFinite(max) || value <= max; if (operator === MetricOperator.区间) return (!Number.isFinite(min) || value >= min) && (!Number.isFinite(max) || value <= max); return true; }
-
-/** 解析展示区间的最低数值，使预览计数与既有筛选口径一致。 */
-function numberFloor(value: string) { const matched = value.replaceAll("¥", "").match(/([\d.]+)(亿|万)?/); if (!matched) return 0; return Number(matched[1]) * (matched[2] === "亿" ? 100_000_000 : matched[2] === "万" ? 10_000 : 1); }

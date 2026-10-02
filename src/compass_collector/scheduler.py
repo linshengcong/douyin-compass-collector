@@ -106,7 +106,7 @@ def first_start_occurrences(task: TaskConfig, now: datetime) -> list[datetime]:
 def group_enabled_tasks(config: AppConfig) -> dict[str, list[TaskConfig]]:
     """Group enabled tasks by identical cron so one Chrome batch runs serially."""
 
-    # 相同 cron 的任务共享一次浏览器启动和鉴权预检。
+    # 相同 cron 的任务共享串行批次，每个平台仍使用独立浏览器和鉴权。
     grouped_tasks: dict[str, list[TaskConfig]] = defaultdict(list)
     for task in config.tasks:
         if task.enabled:
@@ -133,6 +133,8 @@ def mark_missed_tasks(
         # 持久化返回的是顶层 CollectionBatch.id，不是分类运行 ID。
         persisted_batch_id = database.record_missed_run(
             task_id=task.id,
+            platform=task.platform,
+            config_snapshot=task.model_dump(mode="json"),
             business_date=planned_at.date(),
             planned_at=planned_at,
             error_category=error_category,
@@ -146,6 +148,7 @@ def mark_missed_tasks(
                 display_name=task.display_name,
                 status=TaskNotificationStatus.MISSED,
                 error_category=error_category,
+                platform=task.platform,
             )
         )
         runtime_logger.emit(
@@ -244,7 +247,7 @@ def reconcile_scheduler_once(
     # GUI 子进程可复用同一个日志器，默认路径保持既有终端行为。
     active_logger = runtime_logger or RuntimeLogger(RUNTIME_ROOT / "logs")
     try:
-        # 计划时刻映射让相同时间的任务共享一个浏览器批次。
+        # 计划时刻映射让相同时间的任务共享串行采集批次。
         occurrence_tasks: dict[datetime, list[TaskConfig]] = defaultdict(list)
         # 每个任务只在其所有到期时刻处理完成后推进检查点。
         enabled_tasks = [task for task in config.tasks if task.enabled]
@@ -350,6 +353,8 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
 
     # SIGTERM 继续服务终端和系统进程管理；GUI 不再依赖平台信号。
     previous_term_handler = signal.signal(signal.SIGTERM, request_graceful_shutdown)
+    # 启动前已有停止请求必须同步生效；不能依赖轮询线程删除文件后才设置 Event 的时序。
+    apply_scheduler_control_requests(scheduler_control, shutdown_requested, None)
     # 控制轮询在启动补偿前运行，因此 GUI 可以安全停止启动中的批次。
     control_thread = Thread(
         target=poll_control_requests,

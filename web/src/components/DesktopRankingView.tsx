@@ -1,10 +1,13 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { RankMark } from "./RankMark";
 import { ImagePreview, ProductThumbnail } from "./ProductThumbnail";
-import { MetricOperator, SortDirection, SortField, type RankingFilters, type RankingRecord } from "../types";
+import { MetricOperator, RankingPlatform, SortDirection, SortField, type RankingFilters, type RankingRecord } from "../types";
 import { TruncatedTooltip } from "./TruncatedTooltip";
+import { platformSortFields } from "../lib/ranking";
 
 interface DesktopRankingViewProps {
+  /** 平台决定可用筛选、指标列及首次上榜可见性。 */
+  platform: RankingPlatform;
   records: RankingRecord[];
   /** OSS latest 索引的发布时间，用于让桌面端明确展示当前榜单的新鲜度。 */
   publishedAt?: string;
@@ -24,7 +27,9 @@ interface DesktopRankingViewProps {
 
 /** 保留桌面端表格和页码分页，避免移动端改版影响大屏工作流。 */
 export function DesktopRankingView(props: DesktopRankingViewProps) {
-  const { records, publishedAt, filters, options, page, pageSize, totalPages, onSetFilters, onSelectLevel1, onSelectLevel2, onSelectLevel3, onPageChange, onPageSizeChange, onReset } = props;
+  const { platform, records, publishedAt, filters, options, page, pageSize, totalPages, onSetFilters, onSelectLevel1, onSelectLevel2, onSelectLevel3, onPageChange, onPageSizeChange, onReset } = props;
+  // 淘宝复用表格布局，但不展示不存在的抖音指标与首次上榜。
+  const isTaobao = platform === RankingPlatform.淘宝;
   const pageRecords = records.slice((page - 1) * pageSize, page * pageSize);
   const pages = totalPages <= 7 ? Array.from({ length: totalPages }, (_, index) => index + 1) : [1, Math.max(2, page - 1), page, Math.min(totalPages - 1, page + 1), totalPages].filter((item, index, values) => values.indexOf(item) === index);
   const formattedPublishedAt = formatPublishedAt(publishedAt);
@@ -33,17 +38,17 @@ export function DesktopRankingView(props: DesktopRankingViewProps) {
 
   return <div className="desktop-view">
     <section className="filter-card" aria-label="榜单筛选">
-      <div className="search-row"><label className="search-field"><span>⌕</span><input value={filters.keyword} onChange={(event) => onSetFilters((current) => ({ ...current, keyword: event.target.value }))} placeholder="搜索商品名称或店铺名" /></label><label className="check-field check-field-prominent"><input type="checkbox" checked={filters.newOnly} onChange={(event) => onSetFilters((current) => ({ ...current, newOnly: event.target.checked }))} /><span>仅首次上榜</span></label></div>
+      <div className="search-row"><label className="search-field"><span>⌕</span><input value={filters.keyword} onChange={(event) => onSetFilters((current) => ({ ...current, keyword: event.target.value }))} placeholder="搜索商品名称或店铺名" /></label>{!isTaobao && <label className="check-field check-field-prominent"><input type="checkbox" checked={filters.newOnly} onChange={(event) => onSetFilters((current) => ({ ...current, newOnly: event.target.checked }))} /><span>仅首次上榜</span></label>}</div>
       <div className="filter-grid">
         <DesktopChoiceMenu label="一级类目" value={filters.level1} options={options.level1} onChange={onSelectLevel1} />
         <DesktopChoiceMenu label="二级类目" value={filters.level2} options={options.level2} onChange={onSelectLevel2} />
         <DesktopChoiceMenu label="三级类目" value={filters.level3} options={options.level3} onChange={onSelectLevel3} />
-        <DesktopMetricMenu label="支付金额" unit="元" quickValues={["10000", "50000", "100000"]} operator={filters.payOperator} minimum={filters.payMinimum} maximum={filters.payMaximum} onChange={(value) => onSetFilters((current) => ({ ...current, payOperator: value.operator, payMinimum: value.minimum, payMaximum: value.maximum }))} />
-        <DesktopMetricMenu label="成交件数" unit="件" quickValues={["10", "50", "100"]} operator={filters.countOperator} minimum={filters.countMinimum} maximum={filters.countMaximum} onChange={(value) => onSetFilters((current) => ({ ...current, countOperator: value.operator, countMinimum: value.minimum, countMaximum: value.maximum }))} />
+        <DesktopMetricMenu label={isTaobao ? "支付买家数" : "支付金额"} unit={isTaobao ? "人" : "元"} quickValues={isTaobao ? ["10", "50", "100"] : ["10000", "50000", "100000"]} operator={filters.payOperator} minimum={filters.payMinimum} maximum={filters.payMaximum} onChange={(value) => onSetFilters((current) => ({ ...current, payOperator: value.operator, payMinimum: value.minimum, payMaximum: value.maximum }))} />
+        <DesktopMetricMenu label={isTaobao ? "访客数" : "成交件数"} unit={isTaobao ? "人" : "件"} quickValues={["10", "50", "100"]} operator={filters.countOperator} minimum={filters.countMinimum} maximum={filters.countMaximum} onChange={(value) => onSetFilters((current) => ({ ...current, countOperator: value.operator, countMinimum: value.minimum, countMaximum: value.maximum }))} />
       </div>
-      <div className="toolbar"><DesktopChoiceMenu label="排序" value={filters.sortField} options={Object.values(SortField)} onChange={(value) => onSetFilters((current) => ({ ...current, sortField: value as SortField }))} compact /><button type="button" className="sort-button" onClick={() => onSetFilters((current) => ({ ...current, sortDirection: current.sortDirection === SortDirection.升序 ? SortDirection.降序 : SortDirection.升序 }))}>{filters.sortDirection === SortDirection.升序 ? "↑ 升序" : "↓ 降序"}</button><button type="button" className="reset-button" onClick={onReset}>↻ 重置筛选</button></div>
+      <div className="toolbar"><DesktopChoiceMenu label="排序" value={filters.sortField} options={platformSortFields(platform)} onChange={(value) => onSetFilters((current) => ({ ...current, sortField: value as SortField }))} compact /><button type="button" className="sort-button" onClick={() => onSetFilters((current) => ({ ...current, sortDirection: current.sortDirection === SortDirection.升序 ? SortDirection.降序 : SortDirection.升序 }))}>{filters.sortDirection === SortDirection.升序 ? "↑ 升序" : "↓ 降序"}</button><button type="button" className="reset-button" onClick={onReset}>↻ 重置筛选</button></div>
     </section>
-    <section className="result-card"><div className="result-heading"><strong>♛ 共 {records.length.toLocaleString()} 条结果</strong>{formattedPublishedAt && <time className="published-at" dateTime={publishedAt}>最新更新：{formattedPublishedAt}</time>}</div>{pageRecords.length ? <div className="desktop-table"><table><thead><tr><th>排名</th><th>分类</th><th>商品</th><th>店铺名称</th><th>用户支付金额</th><th>成交件数</th><th>首次上榜</th></tr></thead><tbody>{pageRecords.map((item, index) => <tr key={`${item.category}-${item.rank}-${item.product_name}`}><td><RankMark rank={(page - 1) * pageSize + index + 1} /></td><td className="category-cell"><TruncatedTooltip text={item.category} /></td><td><div className="desktop-product"><ProductThumbnail imageUrl={item.thumbnail_url} productName={item.product_name} size="desktop" onPreview={(imageUrl, productName) => setPreview({ imageUrl, productName })} /><TruncatedTooltip text={item.product_name} className="desktop-product-name" /></div></td><td>{item.shop_name}</td><td>{item.pay_amount}</td><td>{item.pay_combo_count}</td><td>{item.newly_on_ranking ? <em>首次上榜</em> : "−"}</td></tr>)}</tbody></table></div> : <div className="empty-state">没有符合当前筛选条件的商品</div>}<nav className="pagination"><span className="total-count">共 {records.length.toLocaleString()} 条</span><div className="page-actions"><button type="button" disabled={page === 1} onClick={() => onPageChange(page - 1)}>‹</button>{pages.map((item) => <button type="button" className={item === page ? "active-page" : ""} key={item} onClick={() => onPageChange(item)}>{item}</button>)}<button type="button" disabled={page === totalPages} onClick={() => onPageChange(page + 1)}>›</button></div><label className="page-size"><select value={pageSize} onChange={(event) => onPageSizeChange(Number(event.target.value))}>{[10, 20, 50].map((item) => <option key={item} value={item}>{item} 条 / 页</option>)}</select></label></nav></section><ImagePreview imageUrl={preview.imageUrl} productName={preview.productName} onClose={() => setPreview({ imageUrl: null, productName: "" })} />
+    <section className="result-card"><div className="result-heading"><strong>♛ 共 {records.length.toLocaleString()} 条结果</strong>{formattedPublishedAt && <time className="published-at" dateTime={publishedAt}>最新更新：{formattedPublishedAt}</time>}</div>{pageRecords.length ? <div className="desktop-table"><table><thead><tr><th>排名</th><th>分类</th><th>商品</th><th>店铺名称</th><th>{isTaobao ? "支付买家数" : "用户支付金额"}</th><th>{isTaobao ? "访客数" : "成交件数"}</th>{!isTaobao && <th>首次上榜</th>}</tr></thead><tbody>{pageRecords.map((item, index) => <tr key={`${item.category}-${item.rank}-${item.product_name}`}><td><RankMark rank={isTaobao ? item.rank : (page - 1) * pageSize + index + 1} /></td><td className="category-cell"><TruncatedTooltip text={item.category} /></td><td><div className="desktop-product"><ProductThumbnail imageUrl={item.thumbnail_url} productName={item.product_name} size="desktop" onPreview={(imageUrl, productName) => setPreview({ imageUrl, productName })} />{isTaobao && item.product_url ? <a className="product-link" href={item.product_url} target="_blank" rel="noopener noreferrer"><TruncatedTooltip text={item.product_name} className="desktop-product-name" /></a> : <TruncatedTooltip text={item.product_name} className="desktop-product-name" />}</div></td><td>{item.shop_name}</td><td>{isTaobao ? item.pay_buyer_count ?? "-" : item.pay_amount}</td><td>{isTaobao ? item.visitor_count ?? "-" : item.pay_combo_count}</td>{!isTaobao && <td>{item.newly_on_ranking ? <em>首次上榜</em> : "−"}</td>}</tr>)}</tbody></table></div> : <div className="empty-state">没有符合当前筛选条件的商品</div>}<nav className="pagination"><span className="total-count">共 {records.length.toLocaleString()} 条</span><div className="page-actions"><button type="button" disabled={page === 1} onClick={() => onPageChange(page - 1)}>‹</button>{pages.map((item) => <button type="button" className={item === page ? "active-page" : ""} key={item} onClick={() => onPageChange(item)}>{item}</button>)}<button type="button" disabled={page === totalPages} onClick={() => onPageChange(page + 1)}>›</button></div><label className="page-size"><select value={pageSize} onChange={(event) => onPageSizeChange(Number(event.target.value))}>{[10, 20, 50].map((item) => <option key={item} value={item}>{item} 条 / 页</option>)}</select></label></nav></section><ImagePreview imageUrl={preview.imageUrl} productName={preview.productName} onClose={() => setPreview({ imageUrl: null, productName: "" })} />
   </div>;
 }
 
@@ -127,7 +132,7 @@ function metricOperatorLabel(operator: MetricOperator) { if (operator === Metric
 function desktopMenuOptionLabel(label: string, value: string) { return label === "排序" ? sortFieldLabel(value as SortField) : value; }
 
 /** 保持排序枚举稳定值不变，仅为界面提供中文文案。 */
-function sortFieldLabel(field: SortField) { if (field === SortField.排名) return "排名"; if (field === SortField.用户支付金额) return "用户支付金额"; return "成交件数"; }
+function sortFieldLabel(field: SortField) { if (field === SortField.排名) return "排名"; if (field === SortField.用户支付金额) return "用户支付金额"; if (field === SortField.支付买家数) return "支付买家数"; if (field === SortField.访客数) return "访客数"; return "成交件数"; }
 
 /** 使用中文万单位缩短大额指标，避免桌面触发器出现长数字。 */
 function formatMetricValue(value: string) { const numeric = Number(value); return Number.isFinite(numeric) && numeric >= 10_000 ? `${numeric / 10_000}万` : value || "不限"; }

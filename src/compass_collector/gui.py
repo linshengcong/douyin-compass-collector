@@ -62,6 +62,18 @@ RUNTIME_ROOT = runtime_root()
 MAX_VISIBLE_EVENTS = 2000
 
 
+def category_scope_summary(task) -> str:
+    """Display the selected platform's category contract without foreign fields."""
+    if task.platform == "taobao":
+        return (", ".join(task.category_scope.targets)
+                or f"cateId={task.category_scope.root_category_id} 下全部三级分类")
+    return (", ".join(f"{target.industry_id}:{target.category_id}"
+                      for target in task.category_scope.targets)
+            or (f"industry_id={task.category_scope.industry_id} 下全部三级分类"
+                if task.category_scope.industry_id is not None
+                else "自动发现全部三级分类"))
+
+
 def read_scheduler_event_file(
     event_path: Path,
     offset: int,
@@ -863,21 +875,13 @@ class CollectorWindow(QMainWindow):
             f"当前 Profile：{self.config.browser_for(selected_task.platform).profile_dir}"
         )
         self.host_label = QLabel(selected_task.platform)
+        # 淘宝的目标是单分类 ID，不能读取抖音专用的行业/组合字段。
+        scope_summary = category_scope_summary(selected_task)
         self.interval_label = QLabel(
             f"{self.config.collection.request_interval_seconds.min:g}–"
             f"{self.config.collection.request_interval_seconds.max:g} 秒 / "
             f"页面串行采集 / {selected_task.category_scope.mode} / "
-            + (
-                ", ".join(
-                    f"{target.industry_id}:{target.category_id}"
-                    for target in selected_task.category_scope.targets
-                )
-                or (
-                    f"industry_id={selected_task.category_scope.industry_id} 下全部三级分类"
-                    if selected_task.category_scope.industry_id is not None
-                    else "自动发现全部三级分类"
-                )
-            )
+            + scope_summary
         )
         self.schedule_label = QLabel(selected_task.schedule)
         self.run_status_label = QLabel("空闲")

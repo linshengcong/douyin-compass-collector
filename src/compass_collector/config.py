@@ -15,6 +15,10 @@ from compass_collector.platforms.compass_config import (
     DateConfig,
 )
 
+from compass_collector.platforms.taobao_config import (
+    TaobaoCategoryScopeConfig, TaobaoFiltersConfig, TaobaoRankConfig, TaobaoDateConfig,
+)
+
 
 class StrictModel(BaseModel):
     """Reject unknown configuration fields instead of silently ignoring typos."""
@@ -38,6 +42,10 @@ class BrowserConfig(BrowserSettings):
 
     # 每个会话使用已解析的平台 Profile，不共享账号目录。
     profile_dir: Path
+    # 仅选定平台可启用已验证的 webdriver 原型兼容方式。
+    webdriver_compatibility: bool = False
+    # 仅平台显式开启时，在独立 Profile 内补充会话 Cookie 的跨重启恢复。
+    persist_session_cookies: bool = False
 
 
 class PlatformConfig(StrictModel):
@@ -45,6 +53,10 @@ class PlatformConfig(StrictModel):
 
     # 罗盘继续复用旧目录，未来平台必须声明自己的独立目录。
     profile_dir: Path
+    # 默认关闭，避免为淘宝排查改变抖音浏览器环境。
+    webdriver_compatibility: bool = False
+    # 默认关闭，防止改变已有罗盘登录生命周期。
+    persist_session_cookies: bool = False
 
 
 class IntervalConfig(StrictModel):
@@ -129,11 +141,36 @@ class TaskConfig(StrictModel):
     enabled: bool = True
     display_name: str = Field(min_length=1)
     schedule: str = Field(min_length=1)
-    rank: RankConfig = Field(default_factory=RankConfig)
+    rank: RankConfig | TaobaoRankConfig = Field(default_factory=RankConfig)
     # 分类范围每次任务从平台分类树动态发现。
-    category_scope: CategoryScopeConfig
-    filters: FiltersConfig
-    date: DateConfig
+    category_scope: CategoryScopeConfig | TaobaoCategoryScopeConfig
+    filters: FiltersConfig | TaobaoFiltersConfig
+    date: DateConfig | TaobaoDateConfig
+
+    @model_validator(mode="before")
+    @classmethod
+    def select_platform_models(cls, value):
+        """Parse business fields with the declared platform, never union guessing."""
+        if not isinstance(value, dict):
+            return value
+        # 拷贝配置，不在验证期间改变 YAML 或调用方传入的字典。
+        selected = dict(value)
+        # 显式选择四个业务类型，阻止抖音和淘宝字段组合被联合模型接受。
+        platform = selected.get("platform", "compass")
+        if platform not in {"compass", "taobao"}:
+            raise ValueError("platform adapter is not registered")
+        # 罗盘维持必填的历史契约；淘宝字段可使用已确认的默认条件。
+        business_models = (
+            {"rank": RankConfig, "category_scope": CategoryScopeConfig, "filters": FiltersConfig, "date": DateConfig}
+            if platform == "compass" else
+            {"rank": TaobaoRankConfig, "category_scope": TaobaoCategoryScopeConfig, "filters": TaobaoFiltersConfig, "date": TaobaoDateConfig}
+        )
+        for field_name, business_model in business_models.items():
+            if field_name in selected:
+                selected[field_name] = business_model.model_validate(selected[field_name])
+            elif platform == "taobao":
+                selected[field_name] = business_model()
+        return selected
 
     @field_validator("schedule")
     @classmethod
@@ -175,12 +212,14 @@ class AppConfig(StrictModel):
         return BrowserConfig(
             **self.browser.model_dump(),
             profile_dir=self.platforms[platform].profile_dir,
+            webdriver_compatibility=self.platforms[platform].webdriver_compatibility,
+            persist_session_cookies=self.platforms[platform].persist_session_cookies,
         )
 
     @model_validator(mode="after")
     def validate_platforms(self):
         """Reject unsupported platforms and profile aliasing before Chrome starts."""
-        # 目前仅有经过真实验收的罗盘适配器。
+        # 只接受显式注册的实现；注册并不代表真实平台验收已经完成。
         from compass_collector.platforms.registry import registered_platforms
 
         if set(self.platforms) - registered_platforms():

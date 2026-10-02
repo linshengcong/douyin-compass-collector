@@ -22,8 +22,12 @@ class ProductShop:
     """Preserve a product-shop relationship and its source order."""
 
     position: int
-    shop_id: str
+    # 淘宝只确认卖家用户标识；未知的真实店铺 ID 保留为空。
+    shop_id: str | None
     shop_name: str
+    # 店铺链接和卖家用户标识分别保存，不能混作店铺 ID。
+    shop_url: str | None = None
+    seller_user_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,12 +39,20 @@ class ProductRankEntry:
     rank: int
     product_id: str
     product_name: str
-    newly_on_ranking: bool
-    pay_amount: MetricRange
-    pay_combo_count: MetricRange
+    # 平台专属字段允许不适用；各平台解析器仍验证自己必需的指标。
+    newly_on_ranking: bool | None
+    pay_amount: MetricRange | None
+    pay_combo_count: MetricRange | None
     shops: tuple[ProductShop, ...]
     # image_url 是平台商品图片地址；旧响应缺失时保留空值以兼容历史快照。
     image_url: str | None = None
+    # 淘宝返回的商品跳转链接保持原始语义，不由商品 ID 猜测。
+    product_url: str | None = None
+    # 淘宝人数指标同时保存原文和可空范围，缺失不能转成零。
+    pay_buyer_count_raw: str | None = None
+    pay_buyer_count: MetricRange | None = None
+    visitor_count_raw: str | None = None
+    visitor_count: MetricRange | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,13 +144,13 @@ class DiscoveredScope:
 
     @property
     def level1_category_id(self) -> str:
-        """Read optional Compass metadata for legacy database columns."""
-        return self.platform_metadata.get("industry_id", "")
+        """Project each platform's actual root ID into the shared category columns."""
+        return self.platform_metadata.get("industry_id", self.platform_metadata.get("root_category_id", ""))
 
     @property
     def level2_category_id(self) -> str:
-        """Read optional Compass metadata without requiring it on other platforms."""
-        return self.platform_metadata.get("level2_id", "")
+        """Project the actual second-level ID without altering platform request keys."""
+        return self.platform_metadata.get("level2_id", self.platform_metadata.get("parent_cate_id", ""))
 
     @property
     def level1_category_name(self) -> str:

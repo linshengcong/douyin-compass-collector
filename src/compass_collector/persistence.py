@@ -17,6 +17,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    Index,
     JSON,
     Numeric,
     String,
@@ -25,6 +26,7 @@ from sqlalchemy import (
     event,
     func,
     select,
+    text,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
@@ -379,11 +381,31 @@ class ProductRankEntryModel(Base):
             "AND pay_combo_count_min_value <= pay_combo_count_max_value",
             name="ck_product_rank_entries_pay_combo_count",
         ),
-        UniqueConstraint(
+        # 人数区间只能完整缺失或完整非负，禁止部分边界落库。
+        CheckConstraint(
+            "(pay_buyer_count_min_value IS NULL AND pay_buyer_count_max_value IS NULL AND pay_buyer_count_unit IS NULL) OR "
+            "(pay_buyer_count_min_value IS NOT NULL AND pay_buyer_count_max_value IS NOT NULL AND pay_buyer_count_unit IS NOT NULL "
+            "AND pay_buyer_count_unit = 'count' AND pay_buyer_count_min_value >= 0 "
+            "AND pay_buyer_count_min_value <= pay_buyer_count_max_value)",
+            name="ck_product_rank_entries_pay_buyer_count",
+        ),
+        # 人数区间只能完整缺失或完整非负，禁止部分边界落库。
+        CheckConstraint(
+            "(visitor_count_min_value IS NULL AND visitor_count_max_value IS NULL AND visitor_count_unit IS NULL) OR "
+            "(visitor_count_min_value IS NOT NULL AND visitor_count_max_value IS NOT NULL AND visitor_count_unit IS NOT NULL "
+            "AND visitor_count_unit = 'count' AND visitor_count_min_value >= 0 "
+            "AND visitor_count_min_value <= visitor_count_max_value)",
+            name="ck_product_rank_entries_visitor_count",
+        ),
+        # 只有罗盘继续要求分类内商品唯一；淘宝以排名位置保留重复商品。
+        Index(
+            "uq_category_run_compass_product",
             "category_run_id",
             "product_id",
-            name="uq_category_run_product",
+            unique=True,
+            sqlite_where=text("platform = 'compass'"),
         ),
+        CheckConstraint("platform IN ('compass', 'taobao')", name="ck_product_rank_entries_platform"),
         UniqueConstraint(
             "category_run_id",
             "rank",
@@ -393,6 +415,8 @@ class ProductRankEntryModel(Base):
 
     # 商品排名通过 category_run_id 间接归属批次。
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 平台从父批次赋值，用于数据库层只放开淘宝商品重复。
+    platform: Mapped[str] = mapped_column(String(32), nullable=False, default="compass", server_default="compass")
     category_run_id: Mapped[str] = mapped_column(
         String(32),
         ForeignKey("category_runs.id", ondelete="CASCADE"),
@@ -407,18 +431,30 @@ class ProductRankEntryModel(Base):
     product_name: Mapped[str] = mapped_column(String(2048), nullable=False)
     # 图片 URL 允许为空，保证已存在的历史排名可平滑迁移。
     image_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)
-    newly_on_ranking: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    # 淘宝没有首次上榜字段，未知状态与 false 分开保存。
+    newly_on_ranking: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # 金额和成交件数保留平台原始区间与单位。
-    pay_amount_min_value: Mapped[object] = mapped_column(Numeric(24, 4), nullable=False)
-    pay_amount_max_value: Mapped[object] = mapped_column(Numeric(24, 4), nullable=False)
-    pay_amount_unit: Mapped[str] = mapped_column(String(32), nullable=False)
-    pay_combo_count_min_value: Mapped[object] = mapped_column(
-        Numeric(24, 4), nullable=False
+    pay_amount_min_value: Mapped[object] = mapped_column(Numeric(24, 4), nullable=True)
+    pay_amount_max_value: Mapped[object] = mapped_column(Numeric(24, 4), nullable=True)
+    pay_amount_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    pay_combo_count_min_value: Mapped[object | None] = mapped_column(
+        Numeric(24, 4), nullable=True
     )
-    pay_combo_count_max_value: Mapped[object] = mapped_column(
-        Numeric(24, 4), nullable=False
+    pay_combo_count_max_value: Mapped[object | None] = mapped_column(
+        Numeric(24, 4), nullable=True
     )
-    pay_combo_count_unit: Mapped[str] = mapped_column(String(32), nullable=False)
+    pay_combo_count_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # 淘宝商品跳转和原始区间独立保存，数值边界用于网站过滤与排序。
+    product_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    pay_buyer_count_raw: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    pay_buyer_count_min_value: Mapped[object | None] = mapped_column(Numeric(24, 4), nullable=True)
+    pay_buyer_count_max_value: Mapped[object | None] = mapped_column(Numeric(24, 4), nullable=True)
+    pay_buyer_count_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    visitor_count_raw: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    visitor_count_min_value: Mapped[object | None] = mapped_column(Numeric(24, 4), nullable=True)
+    visitor_count_max_value: Mapped[object | None] = mapped_column(Numeric(24, 4), nullable=True)
+    visitor_count_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
 class ProductRankEntryShopModel(Base):
@@ -442,7 +478,10 @@ class ProductRankEntryShopModel(Base):
         index=True,
     )
     position: Mapped[int] = mapped_column(Integer, nullable=False)
-    shop_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # seller_user_id 与真实 shop_id 是不同标识，不能互相替代。
+    shop_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    shop_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    seller_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     shop_name: Mapped[str] = mapped_column(String(1024), nullable=False)
 
 
@@ -622,7 +661,7 @@ def upgrade_database(database_path: Path) -> None:
                 if "alembic_version" in tables
                 else None
             )
-            if revision != ("0005_platform_capture",):
+            if revision != ("0007_taobao_repeated_items",):
                 backup_dir = database_path.parent / "backups"
                 backup_dir.mkdir(exist_ok=True)
                 backup_path = (
@@ -988,12 +1027,15 @@ class Database:
     ) -> None:
         """Insert every successful category product and its ordered shops."""
 
+        # 正式行平台由已经验证的父批次确定，不从商品字段猜测。
+        platform = session.get(CollectionBatch, collected_batch.batch_id).platform
         for collected_category_run in collected_batch.category_runs:
             # category_run_id 让相同商品或排名可合法出现在不同分类。
             category_run_id = collected_category_run.plan.category_run_id
             for entry in collected_category_run.entries:
                 # 商品主记录先 flush 获取 shop 外键所需的自增 ID。
                 entry_model = ProductRankEntryModel(
+                    platform=platform,
                     category_run_id=category_run_id,
                     captured_at=normalize_datetime(entry.captured_at),
                     page_no=entry.page_no,
@@ -1002,12 +1044,22 @@ class Database:
                     product_name=entry.product_name,
                     image_url=entry.image_url,
                     newly_on_ranking=entry.newly_on_ranking,
-                    pay_amount_min_value=entry.pay_amount.min_value,
-                    pay_amount_max_value=entry.pay_amount.max_value,
-                    pay_amount_unit=entry.pay_amount.unit,
-                    pay_combo_count_min_value=entry.pay_combo_count.min_value,
-                    pay_combo_count_max_value=entry.pay_combo_count.max_value,
-                    pay_combo_count_unit=entry.pay_combo_count.unit,
+                    # 淘宝原始文本和规范化边界保留空值语义。
+                    product_url=entry.product_url,
+                    pay_buyer_count_raw=entry.pay_buyer_count_raw,
+                    pay_buyer_count_min_value=entry.pay_buyer_count.min_value if entry.pay_buyer_count is not None else None,
+                    pay_buyer_count_max_value=entry.pay_buyer_count.max_value if entry.pay_buyer_count is not None else None,
+                    pay_buyer_count_unit=entry.pay_buyer_count.unit if entry.pay_buyer_count is not None else None,
+                    visitor_count_raw=entry.visitor_count_raw,
+                    visitor_count_min_value=entry.visitor_count.min_value if entry.visitor_count is not None else None,
+                    visitor_count_max_value=entry.visitor_count.max_value if entry.visitor_count is not None else None,
+                    visitor_count_unit=entry.visitor_count.unit if entry.visitor_count is not None else None,
+                    pay_amount_min_value=entry.pay_amount.min_value if entry.pay_amount is not None else None,
+                    pay_amount_max_value=entry.pay_amount.max_value if entry.pay_amount is not None else None,
+                    pay_amount_unit=entry.pay_amount.unit if entry.pay_amount is not None else None,
+                    pay_combo_count_min_value=entry.pay_combo_count.min_value if entry.pay_combo_count is not None else None,
+                    pay_combo_count_max_value=entry.pay_combo_count.max_value if entry.pay_combo_count is not None else None,
+                    pay_combo_count_unit=entry.pay_combo_count.unit if entry.pay_combo_count is not None else None,
                 )
                 session.add(entry_model)
                 session.flush()
@@ -1019,6 +1071,8 @@ class Database:
                             position=shop.position,
                             shop_id=shop.shop_id,
                             shop_name=shop.shop_name,
+                            shop_url=shop.shop_url,
+                            seller_user_id=shop.seller_user_id,
                         )
                     )
 
@@ -1042,8 +1096,8 @@ class Database:
         business_date: date,
         planned_at: datetime,
         mode: str,
-        brand_type: int,
-        price_bin: str,
+        brand_type: int | None,
+        price_bin: str | None,
         manifest_path: Path,
         started_at: datetime,
         platform: str = "compass",
@@ -1385,13 +1439,13 @@ class Database:
     def finish_category_failure(
         self,
         category_run_id: str,
-        failed_page: int,
+        failed_page: int | None,
         error_category: str,
         finished_at: datetime,
     ) -> BatchCollectionSnapshot:
         """Finish one ordinary category failure and keep collecting other categories."""
 
-        if failed_page < 1:
+        if failed_page is not None and failed_page < 1:
             raise ValueError("failed page must be positive")
         if not error_category:
             raise ValueError("category failure requires an error category")
@@ -1408,7 +1462,12 @@ class Database:
                 max(1, category_run.saved_page_count),
                 category_run.saved_page_count + 1,
             }
-            if failed_page not in allowed_failed_pages:
+            if failed_page is None:
+                # 空页码只表示已保存全部声明页后的整体校验失败，不隐藏未请求的页。
+                if (category_run.target_page_count is None
+                        or category_run.saved_page_count != category_run.target_page_count):
+                    raise RuntimeError("category-wide failure requires complete raw pages")
+            elif failed_page not in allowed_failed_pages:
                 raise RuntimeError("failed page is inconsistent with saved progress")
             # 普通失败只结束当前分类，批次继续保持 running 以完成其余分类。
             category_run.status = "failed"
@@ -1774,6 +1833,8 @@ class Database:
         recorded_at: datetime,
         status: str,
         error_category: str,
+        platform: str,
+        config_snapshot: dict | None,
     ) -> str | None:
         """Persist one Scheduler-only terminal batch without runtime artifacts."""
 
@@ -1799,6 +1860,9 @@ class Database:
                 CollectionBatch(
                     id=batch_id,
                     task_id=task_id,
+                    # 无采集材料的调度终态也必须保留实际平台及任务快照。
+                    platform=platform,
+                    config_snapshot=config_snapshot,
                     business_date=business_date,
                     planned_at=stored_planned_at,
                     mode="normal",
@@ -1833,6 +1897,8 @@ class Database:
         planned_at: datetime,
         error_category: str,
         recorded_at: datetime,
+        platform: str = "compass",
+        config_snapshot: dict | None = None,
     ) -> str | None:
         """Persist one missed Scheduler occurrence as a batch terminal state."""
 
@@ -1843,6 +1909,8 @@ class Database:
             recorded_at=recorded_at,
             status="missed",
             error_category=error_category,
+            platform=platform,
+            config_snapshot=config_snapshot,
         )
 
     def record_skipped_busy_run(
@@ -1852,6 +1920,8 @@ class Database:
         business_date: date,
         planned_at: datetime,
         recorded_at: datetime,
+        platform: str = "compass",
+        config_snapshot: dict | None = None,
     ) -> str | None:
         """Persist one Scheduler occurrence skipped because collection is busy."""
 
@@ -1862,6 +1932,8 @@ class Database:
             recorded_at=recorded_at,
             status="skipped_busy",
             error_category="skipped_busy",
+            platform=platform,
+            config_snapshot=config_snapshot,
         )
 
     def scheduler_checkpoint(self, task_id: str) -> datetime | None:

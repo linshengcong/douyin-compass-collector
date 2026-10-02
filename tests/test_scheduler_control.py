@@ -62,9 +62,11 @@ def test_scheduler_forwards_interrupt_without_aborting_graceful_shutdown(
     assert shutdown_requested.is_set() is True
 
 
+@pytest.mark.parametrize("poll_thread_runs", [False, True])
 def test_scheduler_start_and_stop_does_not_require_sigusr1(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    poll_thread_runs: bool,
 ) -> None:
     """Start the Scheduler control path when Windows exposes no SIGUSR1."""
 
@@ -103,6 +105,23 @@ def test_scheduler_start_and_stop_does_not_require_sigusr1(
             time.sleep(0.01)
 
     monkeypatch.setattr(scheduler_module, "RuntimeLogger", FakeRuntimeLogger)
+    if not poll_thread_runs:
+        class DeferredThread:
+            """Model a worker that has not received CPU time before startup ends."""
+
+            def __init__(self, **kwargs):
+                """Preserve the Thread constructor without starting a worker."""
+                pass
+
+            def start(self):
+                """Leave consumption to the production synchronous startup check."""
+                pass
+
+            def join(self, timeout=None):
+                """No worker exists, so shutdown can finish immediately."""
+                pass
+
+        monkeypatch.setattr(scheduler_module, "Thread", DeferredThread)
     monkeypatch.setattr(
         scheduler_module,
         "reconcile_scheduler_once",

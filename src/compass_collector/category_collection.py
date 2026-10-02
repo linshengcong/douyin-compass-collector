@@ -6,6 +6,7 @@ from compass_collector.category_batch import PreparedCategoryBatch
 from compass_collector.config import TaskConfig
 from compass_collector.errors import (
     AuthRequiredError,
+    BrowserOperationError,
     CategoryBatchCollectionError,
     CollectionInterruptedError,
     CollectorError,
@@ -29,6 +30,8 @@ SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 ORDINARY_CATEGORY_ERRORS = (HttpRequestError, HttpResponseError, ResponseContractError)
 MAX_CONSECUTIVE_PLATFORM_UNAVAILABLE_FAILURES = 3
 PLATFORM_TEMPORARY_UNAVAILABLE_ERROR_CATEGORY = "platform_temporarily_unavailable"
+# 淘宝未知业务错误使用自身分类，不能套用罗盘11001含义。
+TAOBAO_BUSINESS_ERROR_CATEGORY = "taobao_business_error"
 
 
 def _safe_emit(runtime_logger, **fields):
@@ -131,12 +134,16 @@ def _collect_category_run(
         )
         while True:
             _raise_if_stopped(control)
-            failed_page = len(raw_pages) + 1
+            # 声明的末页已完成后 next() 只触发整体校验，不存在下一页请求。
+            expected_page = len(raw_pages) + 1
+            failed_page = expected_page if target_pages is None or expected_page <= target_pages else None
             try:
                 page = next(iterator)
             except StopIteration:
                 break
-            if page.page_no != failed_page or (
+            # 若适配器仍返回多余页，失败属于该真实返回页，不能归为整体校验。
+            failed_page = expected_page
+            if page.page_no != expected_page or (
                 total is not None and page.api_total != total
             ):
                 raise ResponseContractError(
@@ -295,10 +302,20 @@ def _save_category_failure(
             status_code=failure.cause.status_code,
             error_category=failure.cause.category,
             response_body=failure.response_body,
-            failed_step=failed_step,
-            exception_type=failure.exception_type,
+            failed_step=(failure.cause.failed_step if isinstance(failure.cause, BrowserOperationError)
+                         else failed_step),
+            exception_type=(failure.cause.exception_type if isinstance(failure.cause, BrowserOperationError)
+                            else failure.exception_type),
             safe_endpoint_path=None,
         )
+        if isinstance(failure.cause, BrowserOperationError):
+            # 浏览器致命错误仍保留已有安全截图与具体步骤，不能在包装后丢失诊断材料。
+            prepared_batch.storage.save_browser_failure(
+                error_category=failure.cause.category, failed_step=failure.cause.failed_step,
+                exception_type=failure.cause.exception_type,
+                safe_page_path=failure.cause.safe_page_path, page_title=failure.cause.page_title,
+                screenshot=failure.cause.screenshot,
+            )
     except Exception:
         # 诊断材料不可写不能覆盖 SQLite 中已经决定的生命周期。
         pass
@@ -479,10 +496,12 @@ def collect_category_batch(
                     failure.cause.category == "category_unavailable"
                 )
                 is_platform_temporarily_unavailable = (
-                    failure.cause.category
-                    == PLATFORM_TEMPORARY_UNAVAILABLE_ERROR_CATEGORY
+                    (task.platform == "compass" and failure.cause.category
+                     == PLATFORM_TEMPORARY_UNAVAILABLE_ERROR_CATEGORY)
+                    or (task.platform == "taobao" and failure.cause.category
+                        == TAOBAO_BUSINESS_ERROR_CATEGORY)
                 )
-                # 非 11001 的失败会中断连续序列，保持其他普通错误的原有语义。
+                # 其他失败会中断当前平台业务错误序列，不能把网络超时累计为平台业务错误。
                 consecutive_platform_unavailable_failures = (
                     consecutive_platform_unavailable_failures + 1
                     if is_platform_temporarily_unavailable
@@ -565,7 +584,8 @@ def collect_category_batch(
                         level="ERROR",
                         event="platform_unavailable_circuit_opened",
                         message=(
-                            f"[{task.id}] 平台连续返回 11001 达到 "
+                            f"[{task.id}] 平台连续返回 "
+                            f"{'11001' if task.platform == 'compass' else TAOBAO_BUSINESS_ERROR_CATEGORY} 达到 "
                             f"{MAX_CONSECUTIVE_PLATFORM_UNAVAILABLE_FAILURES} 次，"
                             "停止本批采集"
                         ),
@@ -603,7 +623,7 @@ def collect_category_batch(
                 completed_category_runs=completed_category_runs,
             )
         completed_category_runs.append(collected_run)
-        # 任何成功分类都会中断 11001 连续失败序列。
+        # 任何成功分类都会中断当前平台连续业务失败序列。
         consecutive_platform_unavailable_failures = 0
 
     if control is not None and control.stop_requested():

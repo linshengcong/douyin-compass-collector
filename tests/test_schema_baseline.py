@@ -208,6 +208,12 @@ def test_rank_and_product_are_unique_inside_each_category_only(tmp_path: Path) -
 
         with pytest.raises(IntegrityError):
             with database.session_factory.begin() as session:
+                # 罗盘同商品即使排名不同仍受平台限定的数据库唯一索引保护。
+                duplicate_product = build_rank_entry(category_run_id="category-one")
+                duplicate_product.rank = 2
+                session.add(duplicate_product)
+        with pytest.raises(IntegrityError):
+            with database.session_factory.begin() as session:
                 # 同一分类内重复 rank/product 必须由 SQLite 拒绝。
                 session.add(build_rank_entry(category_run_id="category-one"))
     finally:

@@ -26,12 +26,15 @@ jobs:
         env:
           # 此地址会编译进浏览器代码，必须是可公开访问的 OSS latest.json 地址。
           VITE_DATA_INDEX_URL: ${{ vars.VITE_DATA_INDEX_URL }}
+          # 淘宝索引独立配置；未配置时前端仍可切回抖音。
+          VITE_TAOBAO_DATA_INDEX_URL: ${{ vars.VITE_TAOBAO_DATA_INDEX_URL }}
         run: |
           if [ -z "$VITE_DATA_INDEX_URL" ]; then
             echo "Repository variable VITE_DATA_INDEX_URL is required."
             exit 1
           fi
           npm ci --prefix web
+          npm test --prefix web
           npm run build --prefix web
       - name: Check cross-repository publishing token
         env:

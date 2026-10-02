@@ -1,6 +1,6 @@
 # 抖音电商罗盘榜单采集器
 
-这是一个本地 macOS/Windows 工程：使用独立 Chrome Profile 保存人工登录态，通过真实 Chrome 页面点击、滚动和响应监听采集商品榜单。正式采集不提取 Cookie，也不主动调用榜单 HTTP 接口。通知和部署查询仍使用各自的网络客户端。
+这是一个本地 macOS/Windows 工程：使用独立 Chrome Profile 保存人工登录态，通过真实 Chrome 页面点击、滚动和响应监听采集商品榜单。榜单采集不使用 Cookie 重放 HTTP 接口。淘宝可在独立 Profile 内额外备份会话 Cookie，用于浏览器重启时恢复；通知和部署查询仍使用各自的网络客户端。
 
 默认任务为个护家清实时榜，只循环 `industry_id=5` 下的全部三级分类，页面选择实时榜（`date_type=1`），品牌不限（`brand_type=-1`）、price_bin=不限。支持指定分类列表及 `all_level1` 自动发现；设置 `category_scope.industry_id` 时限定行业，未设置时发现所有行业。排除“全部”，忽略四级及更深节点。任务、分类和分页全部串行执行，页面操作间隔为 0.5～1 秒，超时后有限恢复重试；平台连续三次返回 `11001` 时安全停止本批。
 
@@ -18,7 +18,7 @@
 - 钉钉签名 Webhook 批次汇总，GUI 展示发送状态；
 - 用户级 `launchd` 安装、卸载和状态脚本。
 
-当前已实现罗盘页面适配器。其他平台通过显式注册表扩展，本次不包含淘宝实现或网页平台切换界面。
+当前已注册罗盘和淘宝页面适配器。淘宝可通过独立配置从 CLI、GUI 运行；分类/排行解析、存储迁移、CSV、调度接入和网站平台切换已实现。淘宝两个目标分类已通过真实账号完整采集与发布验收，全根任务仍在进行，默认调度任务暂不启用。
 
 ## 快捷命令
 
@@ -314,3 +314,71 @@ Alembic `0005_platform_capture` 增加平台标识、任务配置快照、通用
 网站不可变快照与 `latest.json` 位于 `<public_prefix>/<platform>/<task_id>/`。只有配置主任务更新兼容根 `<public_prefix>/latest.json`，其他任务不覆盖当前网页。现有网页字段和展示保持兼容。
 
 真实 Chrome 的可控页面回归单独运行：`RUN_BROWSER_TESTS=1 uv run --frozen python -m pytest tests/test_compass_browser.py`。普通自动化测试、可控浏览器测试和真实平台验收分别记录，见 `docs/浏览器改造验收.md`。
+
+## 淘宝接入与网站平台切换（开发中）
+
+四阶段范围、验收条件和剩余真实验证见 `docs/淘宝平台开发执行方案.md`。阶段记录放在 `runtime/acceptance/taobao/`；受控测试中的合成数据不代表真实账号采集结果。
+
+淘宝采集编排已实现响应归属、20条保持、有限恢复、跨午夜和共享 raw → SQLite → Manifest → CSV 链路；完整链路测试覆盖空榜、单页、多页、部分成功与全部失败。同类淘宝业务错误连续三个分类发生时停止批次，网络错误或成功分类会重置计数。平台工厂已接入 `TaobaoBrowserControls`，CLI、GUI 可使用独立 PoC 配置启动。2026-10-01 已完成香薰蜡烛与香薰精油两分类各15页、合计600条的真实 dry-run 和正式本地数据库/CSV验收；全根245分类的完整终态仍待验收。无法匹配控件时明确失败并保存本地截图。默认 `config/tasks.yaml` 仍仅运行抖音。
+
+淘宝独立 Profile 登录和两个目标分类的手动试采：
+
+当前机器的全量验收快捷命令：
+
+```bash
+make taobao-run                    # 终端强制创建新批次，默认启用钉钉通知
+make taobao-run MODE=dry-run       # 终端试采，不发布正式商品和 CSV
+make taobao-run MODE=normal        # 普通采集，当天已有正式结果时跳过
+make taobao-run GUI=yes            # 使用 GUI 执行强制采集
+make taobao-run GUI=yes TAOBAO_DINGTALK_ENABLED=false  # 本次采集关闭通知
+make taobao-login                  # 登录到与全量采集相同的 Profile
+make taobao-status                 # 读取相同验收数据库的最近批次
+```
+
+这些入口默认使用当前本机已存在的 `runtime/acceptance/taobao/2026-10-01/full-root-config.yaml` 和 `.venv/bin/python`；配置中的 Profile 指向已登录成功的工作树目录。该验收配置不随 Git 分发，其他机器需提供自己的配置路径，例如 `make taobao-run TAOBAO_CONFIG=config/taobao-poc.yaml MODE=dry-run TAOBAO_DINGTALK_ENABLED=false`，此时采集范围是 PoC 配置指定的两个分类，Profile 也切为该配置的独立目录。`CONFIG=...` 可直接覆盖最终配置，`PYTHON=...` 可覆盖解释器。淘宝入口默认启用批次钉钉汇总，读取本机 `.env` 的 `DINGTALK_WEBHOOK_URL` 和 `DINGTALK_SECRET`；本次关闭使用 `TAOBAO_DINGTALK_ENABLED=false`，不会修改 `.env`。消息展示淘宝平台、任务状态、开始/结束时间、耗时、页数、条数、结果文件及失败分类；通知失败不改变采集结果，GUI 显示发送状态。
+
+默认配置中也已声明 `taobao_household_cleaning_realtime` 全根任务，根为 `50025705`，实时、20条、全部三级分类，目前 `enabled: false`。两个目标分类及全根真实验收通过前，该任务不加入默认采集或定时调度；本地 PoC 使用下方独立配置。
+
+淘宝平台配置启用 `webdriver_compatibility: true`，在第一次导航及子 frame 页面脚本之前覆盖 `Navigator.prototype.webdriver` 的 getter，与已成功人工登录的工作树方式一致，不新增 `navigator` 实例属性。抖音默认关闭此兼容方式。该设置不保证其他自动化信号不可见，也不迁移另一工作树的登录态；相同相对 Profile 路径在不同工作树中实际是两个目录。
+
+淘宝同时开启 `persist_session_cookies: true`：首次导航前恢复原生 Profile 未恢复的会话 Cookie，正常关闭前原子更新 `<Profile>/.session-cookies.json`，退出登录后也更新为空状态。该文件包含明文登录凭证，POSIX 权限为 `0600`，与已忽略的 Profile 一起只留在本机，不进入 raw、数据库、CSV、通知或公开发布；Windows 用户应继续使用当前账号私有的 Profile 目录。持久 Cookie、Local Storage 仍由 Chrome 自身保存，抖音默认不额外备份。需要在开启后正常登录并由程序关闭一次才能建立备份；意外强制结束不保证保存最后状态，网站使登录态失效后仍需人工登录。本地合成登录的跨重启/退出检查，以及2026-10-01同一真实淘宝 Profile 的连续重启和两个目标分类 dry-run 已通过；不保证网站登录态永久有效。
+
+页面导航结束后，先在动作超时预算内等待排行榜控件；人工登录落在商家首页时，等待可见“市场”入口后返回排行榜一次。仅在页面仍需登录时进入人工等待，避免页面尚未加载就提示认证失效。真实分类菜单采用 `.item-cate` 与 `.common-picker-menu` 三列结构：悬停一级、二级名称，再点击三级名称；不使用 Ant Cascader 选择器。
+
+真实单页榜（例如香氛贴11条）不显示活动页码；控制器仅在接口确认总数不超过20、且请求是第一页时允许页码控件缺失，同时仍确认20条模式。多页榜继续逐页确认活动页码与实际请求身份。
+
+多页榜收到匹配响应后，如果活动页码确认失败，会丢弃该次响应，在 `collection.network_retry_attempts` 限制内重新进入当前分类并翻到尚未保存的页；已经保存的页不会重复写入。恢复后仍需确认分类、20条模式、请求页码和分类总数，超过恢复次数则终止并保留浏览器供检查。
+
+`login` 命令保持窗口直到在终端按 Enter，正常关闭时保存登录态。`run` 的窗口在任务结束或失败后按 `browser.keep_open_after_manual_run` 控制是否保留；手动 PoC 默认 `true`，检查结束后按 Enter 或通过 GUI 关闭。该选项不用于无人值守 Scheduler；自动验收配置可显式设为 `false`，有限诊断脚本也会在取证完成后释放浏览器。淘宝长分类名会在菜单文本中缩写，控制器在对应第三列使用完整 `title` 精确匹配，并拒绝多个同名目标。
+
+分类点击返回超时不一定表示点击未生效。适配器只在已识别的分类点击超时后继续等待同一动作代次的完整匹配响应；响应通过分类、日期、页码、20条和可见页面状态校验后才接受。没有匹配响应时保留原步骤、异常类型及截图，按配置次数重建页面，达到上限后停止。不会在原页面盲目重复点击。淘宝分类内重复商品不算失败，按原排名位置保留，不去重；条数、完整分页和排名连续性仍严格校验。罗盘继续保持原商品唯一性要求。
+
+```bash
+uv run --frozen python -m compass_collector login --config config/taobao-poc.yaml --platform taobao
+DINGTALK_ENABLED=false uv run --frozen python -m compass_collector run --config config/taobao-poc.yaml --task taobao_household_cleaning_realtime --no-gui --dry-run
+```
+
+PoC 配置的数据库为 `runtime/data/taobao-poc.db`，登录目录为 `runtime/taobao-browser-profile`，不复用内置浏览器的登录。首次需在程序打开的 Chrome 中完成正常登录。`--dry-run` 用于采集验收，不发布正式商品数据；命令中的 `DINGTALK_ENABLED=false` 仅为本次进程禁用汇总通知，不修改 `.env`；不要用 PoC 配置启动 Scheduler。两目标分类必须由当次真实分类树解析成功，控件与完整请求参数必须同时通过验证。
+
+网站默认抖音，桌面和移动均可切换淘宝。切换重置关键词、分类、数值条件、排序、分页及移动展开。淘宝展示支付买家数、访客数原始区间和商品接口提供的跳转链接；筛选和排序按人数下界计算，未知指标保持空值，排序时置后。淘宝没有首次上榜字段，因此隐藏该筛选与标记。接口商品、店铺名称中的 HTML 实体仅在前端解码一次供文本展示和搜索；原始响应、数据库、CSV 和公开快照保留来源原文。
+
+原 `VITE_DATA_INDEX_URL` 继续指向抖音公开索引。淘宝使用 `VITE_TAOBAO_DATA_INDEX_URL`，例如 `<公开前缀>/taobao/taobao_household_cleaning_realtime/latest.json`。本地可配置在仓库根 `.env`，GitHub Pages 构建读取同名 Repository variables；不能填写 Cookie、token 或私有签名下载链接。未配置淘宝地址时界面显示提示，仍可切回抖音。
+
+新公开快照版本为 3，包含平台、任务、批次、采集开始/结束时间；前端继续兼容抖音版本 1、2，历史缺图片使用占位。数据库 `0006_taobao_metrics` 在保留抖音历史值的基础上增加淘宝独立指标与链接。已有数据库升级前继续备份；有淘宝扩展数据时，迁移拒绝直接降级，避免静默丢失字段。
+
+验证命令：
+
+```bash
+.venv/bin/python -m pytest -q
+npm ci --prefix web
+npm test --prefix web
+npm run build --prefix web
+```
+
+前端状态测试使用 Node 自带测试运行器、现有 TypeScript 编译器及 jsdom，不启动用户浏览器。它覆盖加载/错误/空榜、未配置地址、平台切换重置和晚到请求；布局、滚动实际效果与线上部署需另外验收。
+
+本地网页验收可使用 `scripts/taobao_web_preview.py`。脚本只写入 runtime 独立目录并绑定 `127.0.0.1`，不读取 Profile、完整原始响应或 OSS 凭据。默认生成合成数据：构建时将两平台 VITE 索引分别指向 `http://127.0.0.1:5175/data/compass/compass_preview/latest.json` 和 `http://127.0.0.1:5175/data/taobao/taobao_preview/latest.json`，复制 `web/dist/` 到脚本的 `--root`，再运行 `PYTHONPATH=src .venv/bin/python scripts/taobao_web_preview.py --serve`。合成产物不能用来更新正式公开网站。
+
+对照真实已发布CSV时，成对传入 `--compass-manifest <抖音Manifest路径>` 与 `--taobao-manifest <淘宝Manifest路径>`，并指定独立 `--root`。脚本要求每个平台各一个成功或部分成功的正式批次，读取Manifest引用的CSV，保留实际批次、任务、分类计数和采集窗口；localhost索引中的任务ID也改为实际任务ID，构建配置须对应调整。该模式仍只生成本地预览，不上传OSS。2026-10-01 的真实600条淘宝、5000条抖音桌面/移动浏览器验收已通过；同一淘宝批次已实际发布到自己的 OSS 索引，[线上网站](https://linshengcong.github.io/) 的桌面/移动切换、实际图片、跳转链接、指标和采集窗口已验证。证据在本地 runtime 验收目录，具体批次范围与全根验收分别记录。
+
+空榜验收添加 `--taobao-state empty`，加载失败验收添加 `--taobao-state error`（仅本地淘宝索引返回503）。未配置验收使用明确为空的 `VITE_TAOBAO_DATA_INDEX_URL` 构建。为各场景指定独立 `--root` 保存构建和截图；验收结束后恢复标准构建，不把localhost地址带入发布产物。

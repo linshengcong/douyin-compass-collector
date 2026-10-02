@@ -1,5 +1,11 @@
 # 默认任务 ID 可在命令行通过 TASK=... 覆盖。
 TASK ?= compass_household_cleaning_realtime
+# 通用命令保持原主配置，可通过 CONFIG=... 切换。
+CONFIG ?= config/tasks.yaml
+# 当前淘宝全量验收配置使用已经登录成功的独立 Profile，可显式覆盖。
+TAOBAO_CONFIG ?= runtime/acceptance/taobao/2026-10-01/full-root-config.yaml
+# 淘宝采集默认启用钉钉汇总，可显式关闭；只影响本次进程，不修改本机凭证。
+TAOBAO_DINGTALK_ENABLED ?= true
 # uv 命令可在不同安装环境中通过 UV=/absolute/path/uv 覆盖。
 UV ?= uv
 # 登录和清除认证按平台选择独立 Profile。
@@ -16,28 +22,36 @@ WEB_DATA_INDEX_URL ?= https://e-commerce-data.oss-cn-shanghai.aliyuncs.com/compa
 PYTHON := $(UV) run --frozen python
 
 # MODE 只映射采集器现有互斥参数，避免新增重复 Make 目标。
-ifeq ($(MODE),normal)
-RUN_MODE_OPTION :=
-else ifeq ($(MODE),dry-run)
-RUN_MODE_OPTION := --dry-run
-else ifeq ($(MODE),force)
-RUN_MODE_OPTION := --force
-else
+ifneq ($(filter normal dry-run force,$(MODE)),$(MODE))
 $(error MODE must be normal, dry-run, or force)
 endif
+ifneq ($(words $(MODE)),1)
+$(error MODE must be normal, dry-run, or force)
+endif
+# 延迟展开以使用淘宝目标的 force 默认值，命令行 MODE 仍具有最高优先级。
+RUN_MODE_OPTION = $(if $(filter force,$(MODE)),--force,$(if $(filter dry-run,$(MODE)),--dry-run))
 
 # GUI=no 显式回退终端，其他值在 Make 阶段立即拒绝。
-ifeq ($(GUI),yes)
-RUN_GUI_OPTION :=
-else ifeq ($(GUI),no)
-RUN_GUI_OPTION := --no-gui
-else
+ifneq ($(filter yes no,$(GUI)),$(GUI))
 $(error GUI must be yes or no)
 endif
+ifneq ($(words $(GUI)),1)
+$(error GUI must be yes or no)
+endif
+# 延迟展开让淘宝默认终端模式，同时允许 GUI=yes 覆盖。
+RUN_GUI_OPTION = $(if $(filter no,$(GUI)),--no-gui)
+
+# 淘宝三个入口使用同一配置和任务；解释器与当前已验证命令一致。
+taobao-run taobao-login taobao-status: CONFIG = $(TAOBAO_CONFIG)
+taobao-run taobao-login taobao-status: TASK = taobao_household_cleaning_realtime
+taobao-run taobao-login taobao-status: PYTHON = .venv/bin/python
+# 淘宝默认终端强制采集；显式 MODE/GUI 参数仍可覆盖这些目标默认值。
+taobao-run: MODE = force
+taobao-run: GUI = no
 
 .DEFAULT_GOAL := help
 
-.PHONY: help install login app run notify-test clear-data clear-login status scheduler web-dev web-build test check service
+.PHONY: help install login app run taobao-run taobao-login taobao-status notify-test clear-data clear-login status scheduler web-dev web-build test check service
 
 help: ## 显示所有快捷命令
 	@awk 'BEGIN {FS = ":.*## "; printf "用法：make <command> [TASK=task_id]\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -46,28 +60,37 @@ install: ## 按 uv.lock 安装依赖
 	$(UV) sync --frozen
 
 login: ## 打开独立 Chrome，人工登录
-	$(PYTHON) -m compass_collector login --platform $(PLATFORM)
+	$(PYTHON) -m compass_collector login --config "$(CONFIG)" --platform $(PLATFORM)
 
 app: ## 打开空闲 PySide6 采集控制台
-	$(PYTHON) -m compass_collector app --task $(TASK)
+	$(PYTHON) -m compass_collector app --config "$(CONFIG)" --task $(TASK)
 
 run: ## 采集：MODE=normal|dry-run|force，GUI=yes|no
-	$(PYTHON) -m compass_collector run --task $(TASK) $(RUN_MODE_OPTION) $(RUN_GUI_OPTION)
+	$(PYTHON) -m compass_collector run --config "$(CONFIG)" --task $(TASK) $(RUN_MODE_OPTION) $(RUN_GUI_OPTION)
+
+taobao-run: ## 淘宝全量采集，默认 MODE=force GUI=no，钉钉通知开启
+	DINGTALK_ENABLED=$(TAOBAO_DINGTALK_ENABLED) PYTHONPATH=src $(PYTHON) -m compass_collector run --config "$(CONFIG)" --task $(TASK) $(RUN_MODE_OPTION) $(RUN_GUI_OPTION)
+
+taobao-login: ## 打开淘宝采集所用 Profile，人工登录
+	PYTHONPATH=src $(PYTHON) -m compass_collector login --config "$(CONFIG)" --platform taobao
+
+taobao-status: ## 查看淘宝验收数据库的最近批次
+	PYTHONPATH=src $(PYTHON) -m compass_collector status --config "$(CONFIG)"
 
 notify-test: ## 真实发送一条钉钉配置测试消息
 	$(PYTHON) -m compass_collector notify-test
 
 clear-data: ## 清除本地采集数据，保留 Chrome 登录态
-	$(PYTHON) -m compass_collector clear-data --yes
+	$(PYTHON) -m compass_collector clear-data --config "$(CONFIG)" --yes
 
 clear-login: ## 清除 Chrome 登录态，保留本地采集数据
-	$(PYTHON) -m compass_collector clear-auth --platform $(PLATFORM) --yes
+	$(PYTHON) -m compass_collector clear-auth --config "$(CONFIG)" --platform $(PLATFORM) --yes
 
 status: ## 查看最近运行状态
-	$(PYTHON) -m compass_collector status
+	$(PYTHON) -m compass_collector status --config "$(CONFIG)"
 
 scheduler: ## 前台启动 Scheduler，按 Ctrl-C 停止
-	$(PYTHON) -m compass_collector scheduler
+	$(PYTHON) -m compass_collector scheduler --config "$(CONFIG)"
 
 web-dev: ## 启动网站本地开发服务
 	VITE_DATA_INDEX_URL="$(WEB_DATA_INDEX_URL)" npm --prefix web run dev -- --host 127.0.0.1 --port 5175

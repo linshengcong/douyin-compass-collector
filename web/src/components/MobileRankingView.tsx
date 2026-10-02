@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { DEFAULT_RANKING_FILTERS } from "../hooks/useRankingFilters";
+import { defaultRankingFilters } from "../hooks/useRankingFilters";
 import { useInfiniteReveal } from "../hooks/useInfiniteReveal";
-import { SortDirection, SortField, type LatestIndex, type RankingFilters, type RankingRecord } from "../types";
+import { RankingPlatform, SortDirection, SortField, type LatestIndex, type RankingFilters, type RankingRecord } from "../types";
 import { CompositeFilterSheet } from "./CompositeFilterSheet";
 import { RankMark } from "./RankMark";
 import { ImagePreview, ProductThumbnail } from "./ProductThumbnail";
 
 interface MobileRankingViewProps {
+  /** 淘宝指标及首次上榜可见性由当前平台决定。 */
+  platform: RankingPlatform;
   snapshotRecords: RankingRecord[];
   records: RankingRecord[];
   index: LatestIndex | null;
@@ -16,7 +18,9 @@ interface MobileRankingViewProps {
 
 /** 渲染移动端独立榜单：突出首次上榜、底部筛选与每批 50 条上拉加载。 */
 export function MobileRankingView(props: MobileRankingViewProps) {
-  const { snapshotRecords, records, index, filters, onSetFilters } = props;
+  const { platform, snapshotRecords, records, index, filters, onSetFilters } = props;
+  // 新平台通过 keyed 父组件重建，移动展开和弹层草稿不跨平台保留。
+  const isTaobao = platform === RankingPlatform.淘宝;
   // 综合筛选弹层只在用户主动点击筛选时出现，底层列表不会因草稿变化而更新。
   const [isCompositeFilterOpen, setCompositeFilterOpen] = useState(false);
   // 仅在工具栏触顶后启用背景层，避免页面中段出现突兀的色块。
@@ -77,10 +81,10 @@ export function MobileRankingView(props: MobileRankingViewProps) {
     <section className="mobile-results" aria-busy={isFiltering}>
       <div className="mobile-result-title"><strong>共 {records.length.toLocaleString()} 条结果</strong><span>已显示 {visibleCount} 条</span></div>
       {isFiltering ? <div className="mobile-rendering"><i />筛选结果加载中…</div> : null}
-      {visibleItems.length ? <div className="mobile-list">{visibleItems.map((item, index) => <article key={`${item.category}-${item.rank}-${item.product_name}`}><RankMark rank={index + 1} /><ProductThumbnail imageUrl={item.thumbnail_url} productName={item.product_name} size="mobile" onPreview={(imageUrl, productName) => setPreview({ imageUrl, productName })} /><div className="mobile-card-body"><p className="category-line">{item.category}</p><h2>{item.product_name}</h2><p className="shop-line">{item.shop_name}</p><div className="metric-row"><span><small>用户支付金额</small>{item.pay_amount}</span><span><small>成交件数</small>{item.pay_combo_count}</span>{item.newly_on_ranking ? <em>首次上榜</em> : null}</div></div></article>)}</div> : <div className="empty-state">没有符合当前筛选条件的商品</div>}
+      {visibleItems.length ? <div className="mobile-list">{visibleItems.map((item, index) => <article key={`${item.category}-${item.rank}-${item.product_name}`}><RankMark rank={isTaobao ? item.rank : index + 1} /><ProductThumbnail imageUrl={item.thumbnail_url} productName={item.product_name} size="mobile" onPreview={(imageUrl, productName) => setPreview({ imageUrl, productName })} /><div className="mobile-card-body"><p className="category-line">{item.category}</p><h2>{isTaobao && item.product_url ? <a className="product-link" href={item.product_url} target="_blank" rel="noopener noreferrer">{item.product_name}</a> : item.product_name}</h2><p className="shop-line">{item.shop_name}</p><div className="metric-row"><span><small>{isTaobao ? "支付买家数" : "用户支付金额"}</small>{isTaobao ? item.pay_buyer_count ?? "-" : item.pay_amount}</span><span><small>{isTaobao ? "访客数" : "成交件数"}</small>{isTaobao ? item.visitor_count ?? "-" : item.pay_combo_count}</span>{!isTaobao && item.newly_on_ranking ? <em>首次上榜</em> : null}</div></div></article>)}</div> : <div className="empty-state">没有符合当前筛选条件的商品</div>}
       {visibleCount < records.length ? <div className="mobile-load-more" ref={sentinelRef}><i /><span>上拉加载更多</span></div> : records.length > 0 ? <div className="mobile-load-more finished">已加载全部 {records.length.toLocaleString()} 条</div> : null}
     </section>
-    {isCompositeFilterOpen ? <CompositeFilterSheet records={snapshotRecords} filters={filters} onClose={() => setCompositeFilterOpen(false)} onApply={applyMobileFilters} onReset={() => applyMobileFilters(DEFAULT_RANKING_FILTERS)} /> : null}<ImagePreview imageUrl={preview.imageUrl} productName={preview.productName} onClose={() => setPreview({ imageUrl: null, productName: "" })} />
+    {isCompositeFilterOpen ? <CompositeFilterSheet platform={platform} records={snapshotRecords} filters={filters} onClose={() => setCompositeFilterOpen(false)} onApply={applyMobileFilters} onReset={() => applyMobileFilters(defaultRankingFilters(platform))} /> : null}<ImagePreview imageUrl={preview.imageUrl} productName={preview.productName} onClose={() => setPreview({ imageUrl: null, productName: "" })} />
   </div>;
 }
 

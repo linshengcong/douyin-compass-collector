@@ -132,7 +132,7 @@ def test_unknown_platform_and_primary_fail_at_load(mutation):
     """Startup validation excludes unimplemented platforms and missing primary tasks."""
     config = yaml.safe_load(Path("config/tasks.yaml").read_text())
     if mutation == "platform":
-        config["platforms"]["taobao"] = {"profile_dir": "runtime/taobao-profile"}
+        config["platforms"]["unregistered"] = {"profile_dir": "runtime/unknown-profile"}
     elif mutation == "task":
         config["tasks"][0]["platform"] = "missing"
     else:

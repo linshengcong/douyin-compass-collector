@@ -13,6 +13,12 @@ browser:
 platforms:
   compass:
     profile_dir: runtime/browser-profile
+  taobao:
+    # 独立目录声明不会启动浏览器或复制其他 Profile 的凭证。
+    profile_dir: runtime/taobao-browser-profile
+    webdriver_compatibility: true
+    # 仅淘宝补充原生 Profile 未恢复的会话 Cookie，抖音保持默认关闭。
+    persist_session_cookies: true
 
 collection:
   request_interval_seconds:
@@ -63,3 +69,28 @@ tasks:
     date:
       strategy: today
       date_type: 1
+  - id: taobao_household_cleaning_realtime
+    platform: taobao
+    # 真实两分类及全根验收完成前不加入默认运行和定时调度。
+    enabled: false
+    display_name: 淘宝洗护清洁实时榜
+    schedule: "0 14 * * *"
+    rank:
+      type: product_market_rank
+      endpoint_path: /mc/mq/mkt/item/live/rank.json
+      rank_type: gmv
+      page_size: 20
+    category_scope:
+      mode: all_level1
+      root_category_id: "50025705"
+      target_level: 3
+      exclude_all: true
+    filters:
+      min_price: ""
+      max_price: ""
+      price_segment: ""
+      seller_type: -1
+      keyword: ""
+    date:
+      strategy: today
+      date_type: today

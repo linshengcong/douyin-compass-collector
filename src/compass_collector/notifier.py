@@ -145,6 +145,8 @@ class TaskNotificationResult:
     error_category: str | None = None
     # category_issues 仅包含本任务中失败或已跳过的分类明细。
     category_issues: tuple[CategoryNotificationIssue, ...] = ()
+    # 平台来自任务配置；默认罗盘兼容旧调用，渲染时仅映射固定中文标签。
+    platform: str = "compass"
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,7 +322,7 @@ def _escape_markdown_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
-def _batch_title(status: BatchNotificationStatus, *, test: bool = False) -> str:
+def _batch_title(status: BatchNotificationStatus, *, test: bool = False, platform_label: str = "罗盘") -> str:
     """Map stable batch states to concise DingTalk Markdown titles."""
 
     if test:
@@ -337,7 +339,7 @@ def _batch_title(status: BatchNotificationStatus, *, test: bool = False) -> str:
         BatchNotificationStatus.SKIPPED: "ℹ️ 罗盘采集已跳过",
         BatchNotificationStatus.NOT_COLLECTED: "⚠️ 罗盘计划未采集",
     }
-    return titles[status]
+    return titles[status].replace("罗盘", platform_label)
 
 
 def render_batch_markdown(summary: BatchNotificationSummary) -> tuple[str, str]:
@@ -361,7 +363,13 @@ def render_batch_markdown(summary: BatchNotificationSummary) -> tuple[str, str]:
     )
     # 分钟向上取整，让不足一分钟的有效执行不会显示为零耗时。
     duration_minutes = max(1, ceil(duration_seconds / 60))
-    title = _batch_title(summary.status)
+    # 单平台明确展示名称，混合批次使用通用标题；不从任务ID或自由文本猜测平台。
+    platforms = {task.platform for task in summary.tasks}
+    # 中文标签采用白名单，不将未知配置值拼入外发标题。
+    platform_label = {frozenset({"compass"}): "罗盘", frozenset({"taobao"}): "淘宝"}.get(
+        frozenset(platforms), "电商"
+    ) if platforms else "罗盘"
+    title = _batch_title(summary.status, platform_label=platform_label)
     # 必须保留的头部不包含本机路径或认证信息。
     lines = [
         f"### {title}",
