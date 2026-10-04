@@ -271,6 +271,13 @@ class WebPublisher:
                 content_type="text/csv; charset=utf-8",
                 cache_control="public, max-age=31536000, immutable",
             )
+            # 日期索引复用完整元信息；同日后续成功发布替换该日入口，批次数据保持不可变。
+            self.uploader.upload_public_file(
+                file_path=index_path,
+                object_key=f"{prefix}/dates/{business_date.isoformat()}.json",
+                content_type="application/json",
+                cache_control="no-store, max-age=0",
+            )
             # 索引必须最后覆盖，防止浏览器看到指向尚未完成上传的版本。
             self.uploader.upload_public_file(
                 file_path=index_path,
@@ -318,6 +325,9 @@ def attach_selection_identity(
         identity = json.dumps([platform, batch_id, category_run_id, position, entry.product_id])
         row["product_id"] = entry.product_id
         row["source_record_id"] = sha256(identity.encode()).hexdigest()
+        # 商品价格带来自同一条已核验采集记录，随选品来源快照保存。
+        if platform == "compass":
+            row["price_bin"] = entry.price_bin
 
 
 def _read_csv_records(csv_path: Path, *, platform: str = "compass") -> list[dict[str, Any]]:

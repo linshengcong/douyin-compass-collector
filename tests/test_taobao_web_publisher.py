@@ -78,6 +78,7 @@ def test_taobao_snapshot_preserves_raw_and_missing_without_compass_fields(tmp_pa
     assert latest["schema_version"] == snapshot["schema_version"] == 3
     assert latest["started_at"] == snapshot["started_at"] == "2026-10-01T14:00:00+08:00"
     assert latest["finished_at"] == snapshot["finished_at"] == "2026-10-01T14:05:00+08:00"
+    assert json.loads(uploader.objects[f"{prefix}/dates/2026-10-01.json"]) == latest
     assert uploader.keys[-1] == f"{prefix}/latest.json"
     assert uploader.objects["compass/web/latest.json"] == b"old Compass index"
 
@@ -197,3 +198,37 @@ def test_full_source_third_category_name_keeps_internal_path_separator(tmp_path)
     assert (record["level1"], record["level2"], record["level3"]) == (
         "洗护清洁剂/卫生巾/纸/香薰", "纸品/湿巾", "生活用纸 > 厨房纸巾")
     assert uploader.keys[-1].endswith("/latest.json")
+
+
+def test_daily_indexes_preserve_other_dates_and_use_latest_batch(tmp_path):
+    """同日新版只替换该日入口，后续日期发布不改动历史日。"""
+    # 全部上传留在内存，明确检查不可变批次和两个日期的指向。
+    uploader = MemoryUploader()
+    publisher = WebPublisher(WebPublicationSettings(enabled=True), uploader, runtime_root=tmp_path)
+    values = arguments(write_taobao_csv(tmp_path))
+    publisher.publish(**values)
+    # 同日重采成功后，该日入口指向后发布版本。
+    values.update(batch_id="b" * 32, published_at=datetime(2026, 10, 1, 15))
+    publisher.publish(**values)
+    prefix = "compass/web/taobao/taobao_household_cleaning_realtime"
+    assert json.loads(uploader.objects[f"{prefix}/dates/2026-10-01.json"])["batch_id"] == "b" * 32
+    # 下一日快照使用独立入口，昨日记录仍可定位旧版本。
+    values.update(batch_id="c" * 32, business_date=date(2026, 10, 2),
+                  started_at=datetime(2026, 10, 2, 14), finished_at=datetime(2026, 10, 2, 14, 5),
+                  published_at=datetime(2026, 10, 2, 14, 6))
+    publisher.publish(**values)
+    assert json.loads(uploader.objects[f"{prefix}/dates/2026-10-01.json"])["batch_id"] == "b" * 32
+    assert json.loads(uploader.objects[f"{prefix}/dates/2026-10-02.json"])["batch_id"] == "c" * 32
+    assert f"{prefix}/batches/{'a' * 32}.json.gz" in uploader.objects
+
+
+def test_failed_daily_index_upload_does_not_replace_latest(tmp_path):
+    """每日入口写入失败时，最新入口继续保留上一个可用版本。"""
+    # 模拟日期索引上传失败，已存在的 latest 不能提前切换。
+    uploader = MemoryUploader("/dates/2026-10-01.json")
+    prefix = "compass/web/taobao/taobao_household_cleaning_realtime"
+    uploader.objects[f"{prefix}/latest.json"] = b"previous"
+    publisher = WebPublisher(WebPublicationSettings(enabled=True), uploader, runtime_root=tmp_path)
+    with pytest.raises(WebPublicationError):
+        publisher.publish(**arguments(write_taobao_csv(tmp_path)))
+    assert uploader.objects[f"{prefix}/latest.json"] == b"previous"

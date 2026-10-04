@@ -301,6 +301,13 @@ def parse_page_entries(
             )
         if isinstance(image_url, str):
             image_url = image_url.strip()
+        # 商品价格带直接保留接口原文，不能使用请求中的价格筛选条件代替。
+        price_bin = product_info.get("price_bin")
+        if price_bin is not None and not isinstance(price_bin, str):
+            raise ResponseContractError(
+                "product price bin is invalid",
+                category="invalid_product",
+            )
         # 排名必须是正整数，整榜连续性在后续统一校验。
         rank = product_info.get("rank")
         if type(rank) is not int or rank <= 0:
@@ -370,6 +377,7 @@ def parse_page_entries(
                 pay_combo_count=pay_combo_count,
                 shops=tuple(shops),
                 image_url=image_url,
+                price_bin=price_bin,
             )
         )
     return parsed_entries

@@ -64,6 +64,39 @@ def test_three_pages_preserve_raw_values_links_and_null():
     assert entries[0].shops[0].seller_user_id == "123"
 
 
+def test_missing_shop_title_preserves_product_and_seller():
+    """真实彩漂响应仅返回卖家标识时，不能丢弃完整商品及其排名。"""
+    # 重现真实响应中缺少 title 和 shopUrl 的店铺对象。
+    payload = page_payload(total=1)
+    payload["data"]["data"]["data"][0]["shop"] = {"b2CShop": False, "userId": 123}
+    # 使用正式解析和整榜校验，确保缺失店名不会导致整类失败。
+    entries = parse_page_entries(payload, page_no=1, captured_at=CAPTURED_AT)
+    validate_complete_ranking(entries, api_total=1)
+    assert entries[0].product_id == "100001"
+    assert entries[0].shops[0].shop_name == "未知"
+    assert entries[0].shops[0].seller_user_id == "123"
+    assert entries[0].shops[0].shop_url is None
+
+
+@pytest.mark.parametrize("title", [None, "", " "])
+def test_empty_shop_title_is_unknown(title):
+    """null 和空文本按缺失处理，保留整个商品页。"""
+    # 用户明确要求所有缺失店名统一保存为未知。
+    payload = page_payload(total=1)
+    payload["data"]["data"]["data"][0]["shop"]["title"] = title
+    assert parse_page_entries(payload, page_no=1, captured_at=CAPTURED_AT)[0].shops[0].shop_name == "未知"
+
+
+@pytest.mark.parametrize("title", [123, False, {}])
+def test_malformed_present_shop_title_is_rejected(title):
+    """错误类型仍然表示契约异常，不能伪装成缺失店名。"""
+    # 每个用例仅替换明确存在的店名字段。
+    payload = page_payload(total=1)
+    payload["data"]["data"]["data"][0]["shop"]["title"] = title
+    with pytest.raises(ResponseContractError):
+        parse_page_entries(payload, page_no=1, captured_at=CAPTURED_AT)
+
+
 @pytest.mark.parametrize("raw,minimum,maximum", [
     ("3", 3, 3), ("0 ~ 10", 0, 10), ("2.5万 ~ 5万", 25000, 50000),
     ("1亿", 100000000, 100000000), ("1.2万", 12000, 12000),
@@ -148,6 +181,29 @@ def test_empty_page_and_repeated_product_ids_preserve_ranking_positions():
     with pytest.raises(ResponseContractError) as error:
         validate_complete_ranking(entries, api_total=2)
     assert error.value.category == "duplicate_rank"
+
+
+def test_observed_empty_list_envelope_is_a_successful_zero_row_category():
+    """真实砧板喷雾等空榜返回 data.data=[]，不带 recordCount。"""
+    # 固定业务正文重现真实成功响应，保留外层更新时间信息。
+    payload = {"code": 0, "message": "操作成功", "data": {
+        "updateTime": "2026-10-04 13:19:28", "timestamp": 1791091168946, "data": [],
+    }}
+    assert validate_page_payload(payload, requested_page=1).api_total == 0
+    assert validate_page_payload(payload, requested_page=1).target_page_count == 1
+    assert parse_page_entries(payload, page_no=1, captured_at=CAPTURED_AT) == []
+    validate_complete_ranking([], api_total=0)
+    with pytest.raises(ResponseContractError):
+        validate_page_payload(payload, requested_page=2)
+    with pytest.raises(ResponseContractError):
+        validate_page_payload(payload, requested_page=1, expected_total=20)
+
+
+@pytest.mark.parametrize("data", [None, {}, [None], [{"item": {}}]])
+def test_other_incomplete_envelopes_are_not_empty_successes(data):
+    """仅兼容已确认的空列表，其他不完整容器继续失败。"""
+    with pytest.raises(ResponseContractError):
+        validate_page_payload({"code": 0, "data": {"data": data}}, requested_page=1)
 
 
 @pytest.mark.parametrize("url", ["javascript:alert(1)", "data:text/html,test", "https://user:password@sycm.taobao.com/item", "https://[broken", "https://example.test:bad/item"])

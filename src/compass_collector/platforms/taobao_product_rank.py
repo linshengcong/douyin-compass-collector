@@ -64,6 +64,9 @@ def _ranking_data(payload: dict) -> dict:
     # 两层 data 分别是实时元信息和排行容器。
     outer = payload.get("data")
     data = outer.get("data") if isinstance(outer, dict) else None
+    # 真实空榜也会返回 code=0、data.data=[]；仅此明确空列表等价于零条。
+    if isinstance(data, list) and not data:
+        return {"recordCount": 0, "data": []}
     if not isinstance(data, dict) or not isinstance(data.get("data"), list):
         raise ResponseContractError("Invalid Taobao ranking envelope", category="invalid_page_result")
     return data
@@ -161,9 +164,15 @@ def parse_page_entries(payload: dict, *, page_no: int, captured_at: datetime) ->
         item, shop = row.get("item"), row.get("shop")
         if not isinstance(item, dict) or not isinstance(shop, dict):
             raise ResponseContractError("Invalid Taobao item or shop", category="invalid_product")
+        # 真实淘宝响应可省略店名；不能因此丢弃完整商品和卖家身份。
         identity, title, shop_name = item.get("itemId"), item.get("title"), shop.get("title")
-        if not isinstance(identity, str) or not identity or not isinstance(title, str) or not title.strip() or not isinstance(shop_name, str) or not shop_name.strip():
+        if not isinstance(identity, str) or not identity or not isinstance(title, str) or not title.strip():
             raise ResponseContractError("Invalid Taobao product identity", category="invalid_product")
+        if shop_name is not None and not isinstance(shop_name, str):
+            raise ResponseContractError("Invalid Taobao shop title", category="invalid_product")
+        # 缺失、null、空文本或纯空白按用户约定统一显示为“未知”。
+        if shop_name is None or not shop_name.strip():
+            shop_name = "未知"
         if "itemId" in row and str(_value(row, "itemId")) != identity:
             raise ResponseContractError("Taobao item IDs disagree", category="invalid_product")
         # 原始排名是整数；前三级图标的空 DOM 不能代替它。

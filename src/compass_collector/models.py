@@ -53,6 +53,8 @@ class ProductRankEntry:
     pay_buyer_count: MetricRange | None = None
     visitor_count_raw: str | None = None
     visitor_count: MetricRange | None = None
+    # 抖音商品价格带原文；历史响应及淘宝商品没有该字段。
+    price_bin: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
