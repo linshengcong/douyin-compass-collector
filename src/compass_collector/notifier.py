@@ -389,7 +389,7 @@ def render_batch_markdown(summary: BatchNotificationSummary) -> tuple[str, str]:
     task_lines: list[str] = []
     omitted_count = 0
     for task_index, task in enumerate(summary.tasks):
-        # 下载链接仅写入钉钉正文，不写入运行时日志、Manifest 或 SQLite。
+        # 下载链接仅写入钉钉正文，不写入运行时日志、Manifest 或 PostgreSQL。
         if task.csv_filename and task.csv_download_url:
             result_text = (
                 f"[{_escape_markdown_cell(task.csv_filename)}]"
@@ -570,7 +570,7 @@ def deliver_batch_notification(
 ) -> NotificationDeliveryResult:
     """Send one batch summary and emit safe lifecycle events without raising."""
 
-    # 通知汇总批次不伪装成可定位 SQLite/raw 的任务业务批次。
+    # 通知汇总批次不伪装成可定位 PostgreSQL/raw 的任务业务批次。
     log_context = LogContext(execution_batch_id=summary.batch_id)
     try:
         # 配置、渲染和网络 Adapter 都收口在通知边界内。
@@ -654,18 +654,18 @@ def deliver_website_notification(
     site_url: str | None,
     error_category: str | None = None,
 ) -> NotificationDeliveryResult:
-    """Send the second DingTalk message for website deployment success or failure."""
+    """Send the second DingTalk message for public data updates and website access."""
 
-    # 第二条消息使用执行批次关联，但不伪装成 SQLite 业务批次。
+    # 第二条消息使用执行批次关联，但不伪装成 PostgreSQL 业务批次。
     log_context = LogContext(execution_batch_id=execution_batch_id)
     succeeded = site_url is not None and error_category is None
-    title = "✅ 罗盘网页部署成功" if succeeded else "⚠️ 罗盘网页未更新"
+    title = "✅ 罗盘网页数据已更新" if succeeded else "⚠️ 罗盘网页未更新"
     lines = [f"### {title}", "", f"- 执行批次：`{execution_batch_id}`"]
     if succeeded:
         # site_url 来自受控环境配置，作为公开入口允许进入钉钉正文。
         lines.append(f"- 网站：[打开最新榜单]({site_url})")
     else:
-        # 只发送稳定错误分类，不能暴露 OSS、Vercel 或网络响应正文。
+        # 只发送稳定错误分类，不能暴露 OSS 或网络响应正文。
         lines.append(f"- 原因：`{error_category or 'website_notification_error'}`")
     markdown = "\n".join(lines)
     try:

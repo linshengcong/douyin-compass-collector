@@ -1,4 +1,6 @@
-"""Stage-three SQLite state-machine and raw-page indexing tests."""
+"""Stage-three PostgreSQL state-machine and raw-page indexing tests."""
+
+from pg_support import pg_url, pg_config
 
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -21,7 +23,7 @@ from compass_collector.persistence import (
 )
 
 
-# 固定批次时间让 SQLite 快照断言保持稳定。
+# 固定批次时间让 PostgreSQL 快照断言保持稳定。
 PLANNED_AT = datetime(2026, 7, 17, 14, 0)
 # 分类开始时间与批次时间分开，便于验证状态迁移。
 STARTED_AT = datetime(2026, 7, 17, 14, 0, 1)
@@ -37,7 +39,7 @@ def prepare_database(
     """Create one running batch with deterministic pending category rows."""
 
     # 每个测试使用独立迁移数据库，避免共享事务状态。
-    database_path = tmp_path / "runtime" / "data" / "collector.db"
+    database_path = pg_url(tmp_path / "runtime" / "data" / "collector.db")
     upgrade_database(database_path)
     # Database 是本测试唯一的持久化入口。
     database = Database(database_path)
@@ -345,7 +347,7 @@ def test_multiple_ordinary_failures_remain_publishable_category_outcomes(
             )
             assert snapshot.status == "running"
         with database.session_factory() as session:
-            # SQLite 读取证明三个失败不会影响尚未开始的第四个分类。
+            # PostgreSQL 读取证明三个失败不会影响尚未开始的第四个分类。
             pending_category_count = session.scalar(
                 select(func.count())
                 .select_from(CategoryRun)

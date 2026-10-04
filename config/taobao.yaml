@@ -1,4 +1,4 @@
-# 淘宝全量入口配置；本机Make优先使用已登录验收配置，可通过CONFIG覆盖。
+# 淘宝全量入口默认配置；可通过 CONFIG 显式覆盖。
 browser:
   channel: chrome
   headless: false
@@ -8,6 +8,18 @@ browser:
   keep_open_after_manual_run: true
 platforms:
   taobao:
+    # 分类路径中任一层级名称命中即跳过；去掉首尾空白后精确匹配。
+    category_blacklist:
+      - 私处护理
+      - 商务用品
+      - 商务清洁剂/用品
+      - 个护服务
+      - 头发清洁护理
+      - 头发清洁/护理/造型
+      - 其他
+      - 身体护理
+      - 口腔护理
+      - 卫生巾/经期用品
     profile_dir: runtime/taobao-browser-profile
     # 与已成功人工登录的工作树使用相同原型 getter 初始化方式。
     webdriver_compatibility: true
@@ -25,11 +37,12 @@ collection:
   response_timeout_seconds: 45
   scroll_settle_seconds: 1.5
   manual_auth_wait_seconds: 180
-  network_retry_attempts: 2
+  # 淘宝不使用页内重试；首轮后失败分类固定最多补采两轮。
+  network_retry_attempts: 0
 publication:
   web_primary_task_id: taobao_household_cleaning_realtime
 database:
-  path: runtime/data/taobao.db
+  url_env: TAOBAO_DATABASE_URL
 retention:
   raw_response_days: 30
   failure_artifact_days: 10
@@ -45,5 +58,12 @@ tasks:
     category_scope:
       mode: all_level1
       root_category_id: "50025705"
+      additional_roots:
+        # 家庭/个人清洁工具：只追加截图中的三个二级分支。
+        - root_category_id: "50016348"
+          level2_category_ids:
+            - "2132"      # 卫浴/置物用具
+            - "50003949"  # 家务/地板清洁用具
+            - "50009146"  # 个人洗护清洁用具
       target_level: 3
       exclude_all: true

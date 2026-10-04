@@ -49,7 +49,6 @@ from compass_collector.run_control import CollectionControl
 from compass_collector.runtime_locks import ProcessLock, RuntimeLockBusy
 from compass_collector.platform_runtime import PlatformRuntime
 from compass_collector.runtime_logging import LogContext, RuntimeLogger
-from compass_collector.vercel_deployer import VercelDeployer, VercelDeploymentError
 from compass_collector.web_publisher import WebPublicationError, WebPublisher
 from compass_collector.app_paths import runtime_root
 
@@ -68,7 +67,7 @@ def _safe_emit(runtime_logger: RuntimeLogger, **event_fields: Any) -> None:
     try:
         runtime_logger.emit(**event_fields)
     except Exception:
-        # SQLite、CSV 和 Manifest 终态已经决定后，日志不可用只能降级诊断。
+        # PostgreSQL、CSV 和 Manifest 终态已经决定后，日志不可用只能降级诊断。
         pass
 
 
@@ -334,6 +333,7 @@ def collect_task(
         database=database,
         runtime_logger=runtime_logger,
         control=control,
+        category_blacklist=tuple(config.platforms[plan.task.platform].category_blacklist),
     )
     # 同一适配器在创建它的线程中串行操作页面和分页。
     return collect_category_batch(
@@ -347,7 +347,7 @@ def collect_task(
 
 
 def _sync_collection_snapshot(storage: BatchStorage, snapshot: object) -> None:
-    """Retry one Manifest projection without replaying its SQLite transaction."""
+    """Retry one Manifest projection without replaying its PostgreSQL transaction."""
 
     # 同一权威快照最多重试一次，发布或终止事务不会重复执行。
     for sync_attempt in range(2):
@@ -410,9 +410,9 @@ def _record_precollection_terminal(
             safe_endpoint_path=safe_endpoint_path,
         )
     except Exception:
-        # 诊断材料失败不能阻止 SQLite 批次形成终态。
+        # 诊断材料失败不能阻止 PostgreSQL 批次形成终态。
         pass
-    # 分类发现前终止没有任何 category_run，SQLite 先成为权威终态。
+    # 分类发现前终止没有任何 category_run，PostgreSQL 先成为权威终态。
     finished_at = datetime.now(SHANGHAI_TIMEZONE)
     database.finish_discovery_failure(
         batch_id=batch_id,
@@ -420,7 +420,7 @@ def _record_precollection_terminal(
         error_category=error_category,
         finished_at=finished_at,
     )
-    # Manifest 从同一 SQLite 快照一次性投影，避免自行拼接计数。
+    # Manifest 从同一 PostgreSQL 快照一次性投影，避免自行拼接计数。
     terminal_snapshot = database.collection_snapshot(batch_id)
     _sync_collection_snapshot(storage, terminal_snapshot)
     return storage
@@ -499,7 +499,7 @@ def record_browser_failure(
 ) -> BatchStorage:
     """Persist one browser failure using only the error's safe diagnostic fields."""
 
-    # 先形成 SQLite 与 Manifest 终态，即使截图写入失败也不能留下 running 批次。
+    # 先形成 PostgreSQL 与 Manifest 终态，即使截图写入失败也不能留下 running 批次。
     storage = _record_precollection_terminal(
         plan=plan,
         database=database,
@@ -528,7 +528,7 @@ def record_browser_failure(
 
 
 def _collection_mode(*, force: bool, dry_run: bool) -> CollectionBatchMode:
-    """Map CLI flags to the SQLite and Manifest batch mode."""
+    """Map CLI flags to the PostgreSQL and Manifest batch mode."""
 
     if dry_run:
         return "dry_run"
@@ -555,7 +555,7 @@ def _build_committed_task_result(
 
     if snapshot.status not in {"success", "partial_success"}:
         raise ValueError("committed task result requires a success snapshot")
-    # notification_status 与 SQLite 最终状态保持一一对应。
+    # notification_status 与 PostgreSQL 最终状态保持一一对应。
     notification_status = (
         TaskNotificationStatus.PARTIAL_SUCCESS
         if snapshot.status == "partial_success"
@@ -640,6 +640,8 @@ def _publish_website_after_collection(
                 finished_at=candidate.collected_batch.finished_at,
                 successful_category_count=len(candidate.collected_batch.category_runs),
                 failed_category_count=candidate.collected_batch.failed_category_count,
+                # 让网页快照保留平台商品 ID 和批次内记录身份，支持可追溯选品。
+                category_runs=candidate.collected_batch.category_runs,
                 item_count=sum(
                     len(category_run.entries)
                     for category_run in candidate.collected_batch.category_runs
@@ -683,9 +685,8 @@ def _publish_website_after_collection(
             )
     if not primary_published:
         return
-    deployer = VercelDeployer.from_environment()
-    # 静态托管无需在每批数据上传后重新构建；直接通知固定公开入口。
-    if not deployer.settings.enabled and publisher.settings.site_url is not None:
+    # Web 由独立 mall-web 工程发布；采集器只更新 OSS 数据并通知固定入口。
+    if publisher.settings.site_url is not None:
         _safe_emit(
             runtime_logger,
             level="INFO",
@@ -699,53 +700,12 @@ def _publish_website_after_collection(
             site_url=publisher.settings.site_url,
         )
         return
-    try:
-        deployment = deployer.deploy_and_wait()
-    except VercelDeploymentError as error:
-        _safe_emit(
-            runtime_logger,
-            level="ERROR",
-            event="vercel_deployment_failed",
-            message=f"网页部署未确认，category={error.category}",
-            stage="vercel_deployment",
-            details={"error_category": error.category},
-        )
-        deliver_website_notification(
-            execution_batch_id=execution_batch_id,
-            runtime_logger=runtime_logger,
-            site_url=None,
-            error_category=error.category,
-        )
-        return
-    if deployment is None:
-        # WEB_ENABLED 已开启但 Vercel 未启用时，显式给出第二条可操作通知。
-        _safe_emit(
-            runtime_logger,
-            level="ERROR",
-            event="vercel_deployment_failed",
-            message="网页数据已上传，但 Vercel 部署未配置",
-            stage="vercel_deployment",
-            details={"error_category": "vercel_config_disabled"},
-        )
-        deliver_website_notification(
-            execution_batch_id=execution_batch_id,
-            runtime_logger=runtime_logger,
-            site_url=None,
-            error_category="vercel_config_disabled",
-        )
-        return
-    _safe_emit(
-        runtime_logger,
-        level="INFO",
-        event="vercel_deployment_succeeded",
-        message="网页部署成功",
-        stage="vercel_deployment",
-        details={"site_ready": True},
-    )
+    # 未配置网站入口时，数据发布仍成功，通知明确提示补齐公开地址。
     deliver_website_notification(
         execution_batch_id=execution_batch_id,
         runtime_logger=runtime_logger,
-        site_url=deployment.site_url,
+        site_url=None,
+        error_category="website_site_url_missing",
     )
 
 
@@ -761,7 +721,7 @@ def _run_collection_unlocked(
     control: CollectionControl | None = None,
     run_source: BatchSource = BatchSource.TERMINAL,
 ) -> int:
-    """Run selected tasks and optionally publish SQLite plus CSV snapshots."""
+    """Run selected tasks and optionally publish PostgreSQL plus CSV snapshots."""
 
     # 任务选择在任何数据库或浏览器操作前完成。
     selected_tasks = (
@@ -798,7 +758,7 @@ def _run_collection_unlocked(
         if force
         else BatchMode.OFFICIAL
     )
-    # SQLite/Manifest 使用 normal、force、dry_run 三种内部模式。
+    # PostgreSQL/Manifest 使用 normal、force、dry_run 三种内部模式。
     collection_mode = _collection_mode(force=force, dry_run=dry_run)
     # 防止异常分支和正常分支重复发送同一批次。
     notification_sent = False
@@ -839,8 +799,8 @@ def _run_collection_unlocked(
         details={"cleanup_counts": cleanup_summary.as_log_details()},
     )
     # dry-run 也保留 batch/category/raw 审计，因此所有模式都升级并打开数据库。
-    upgrade_database(config.database.path, platform=config.execution_platform())
-    database = Database(config.database.path)
+    upgrade_database(config.database.url, platform=config.execution_platform())
+    database = Database(config.database.url)
     try:
         # 幂等检查和版本分配在打开 Chrome 前完成。
         task_plans = prepare_task_plans(
@@ -902,7 +862,7 @@ def _run_collection_unlocked(
                 adapter = adapters[plan.task.platform]
                 # 当前计划在提交后边界中断时不得误标下一个未启动任务。
                 active_task = plan.task
-                # 当前顶层任务所有日志、raw、SQLite 和 Manifest 共用该 ID。
+                # 当前顶层任务所有日志、raw、PostgreSQL 和 Manifest 共用该 ID。
                 task_batch_id = task_batch_ids[plan.task.id]
                 try:
                     collected_batch = collect_task(
@@ -1080,7 +1040,7 @@ def _run_collection_unlocked(
                             dry_run_snapshot,
                         )
                     except Exception:
-                        # SQLite 已形成成功终态，Manifest 差异留给恢复流程处理。
+                        # PostgreSQL 已形成成功终态，Manifest 差异留给恢复流程处理。
                         _safe_emit(
                             runtime_logger,
                             level="ERROR",
@@ -1149,13 +1109,15 @@ def _run_collection_unlocked(
                             category="publication_internal",
                         )
                     )
-                    _finish_unpublished_batch(
-                        collected_batch=collected_batch,
-                        database=database,
-                        error=publication_error,
-                        exception_type=type(error).__name__,
-                        status="failed",
-                    )
+                    if publication_error.category != "publication_unconfirmed":
+                        # 只有已确认未提交的失败才能收口；断网不覆盖未知提交结果。
+                        _finish_unpublished_batch(
+                            collected_batch=collected_batch,
+                            database=database,
+                            error=publication_error,
+                            exception_type=type(error).__name__,
+                            status="failed",
+                        )
                     _safe_emit(
                         runtime_logger,
                         level="ERROR",
@@ -1197,7 +1159,7 @@ def _run_collection_unlocked(
                             collected_batch=collected_batch,
                             snapshot=authoritative_snapshot,
                         )
-                        # SQLite 已正式发布时保留 CSV 和成功通知，禁止 terminate。
+                        # PostgreSQL 已正式发布时保留 CSV 和成功通知，禁止 terminate。
                         raise
                     # interruption_error 将进程级中止映射为稳定的本地终态分类。
                     interruption_error = CollectionInterruptedError(
@@ -1226,7 +1188,7 @@ def _run_collection_unlocked(
                 )
                 # published_batch 保存正式版本和 CSV 路径供日志展示。
                 published_batch = publication_result.published_batch
-                # SQLite 已正式发布后，Manifest 同步失败不能反向撤销 CSV。
+                # PostgreSQL 已正式发布后，Manifest 同步失败不能反向撤销 CSV。
                 try:
                     _sync_collection_snapshot(
                         collected_batch.storage,
@@ -1265,7 +1227,7 @@ def _run_collection_unlocked(
                         "csv_path": str(published_batch.csv_path),
                     },
                 )
-                # 正式 CSV 已由 SQLite 协调发布后才允许上传；上传失败不回滚业务发布。
+                # 正式 CSV 已由 PostgreSQL 协调发布后才允许上传；上传失败不回滚业务发布。
                 try:
                     oss_upload = oss_uploader.upload_csv(
                         csv_path=published_batch.csv_path,
@@ -1337,7 +1299,7 @@ def _run_collection_unlocked(
                 )
             # 通知在任务终态形成后立即发送，不等待人工关闭 Chrome。
             send_batch_notification_once()
-            # 第二条通知仅在首条采集汇总完成后，反映网页数据和 Vercel 的独立结果。
+            # 第二条通知在采集汇总完成后发送，反映公开数据更新和固定网站入口。
             _publish_website_after_collection(
                 candidates=website_publication_candidates,
                 primary_task_id=config.publication.web_primary_task_id,
@@ -1525,8 +1487,8 @@ def run_scheduled_collection(
         )
     except RuntimeLockBusy:
         # 手动调试占用 Chrome 时，本次计划只记终态，不排队或自动重试。
-        upgrade_database(config.database.path, platform=config.execution_platform())
-        busy_database = Database(config.database.path)
+        upgrade_database(config.database.url, platform=config.execution_platform())
+        busy_database = Database(config.database.url)
         # 同一冲突执行使用稳定 ID 串联全部任务和汇总通知。
         busy_batch_id = uuid4().hex
         busy_logger = RuntimeLogger(
@@ -1598,9 +1560,9 @@ def run_status(config: AppConfig, limit: int, *, platform: str | None = None) ->
     # 直接API调用也按平台解析数据库，防止绕过CLI读取外平台。
     platform = platform or config.execution_platform()
     config = config.for_platform(platform)
-    upgrade_database(config.database.path, platform=config.execution_platform())
+    upgrade_database(config.database.url, platform=config.execution_platform())
     # status 查询使用独立短生命周期数据库对象。
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         # 最近 run 列表同时包含成功发布和失败尝试。
         rows = database.recent_status(limit=limit, platform=platform) if platform else database.recent_status(limit=limit)

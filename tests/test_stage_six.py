@@ -1,5 +1,7 @@
 """Stage-six GUI routing, safe events, cancellation, and lock tests."""
 
+from pg_support import pg_url, pg_config
+
 import json
 import sys
 from datetime import date, datetime
@@ -323,8 +325,8 @@ def test_pre_requested_stop_creates_interrupted_manifest_without_http(
 
             raise AssertionError("HTTP should not be called")
 
-    # 新动态链路的 dry-run 和正式运行都必须先建立 SQLite 审计批次。
-    database_path = tmp_path / "runtime" / "data" / "collector.db"
+    # 新动态链路的 dry-run 和正式运行都必须先建立 PostgreSQL 审计批次。
+    database_path = pg_url(tmp_path / "runtime" / "data" / "collector.db")
     upgrade_database(database_path)
     database = Database(database_path)
     try:
@@ -340,7 +342,7 @@ def test_pre_requested_stop_creates_interrupted_manifest_without_http(
                 mode="normal",
             )
         with database.session_factory() as session:
-            # SQLite 与 Manifest 必须共享同一个 interrupted 终态。
+            # PostgreSQL 与 Manifest 必须共享同一个 interrupted 终态。
             batch = session.get(CollectionBatch, "batch-interrupted")
     finally:
         database.close()
@@ -357,7 +359,7 @@ def test_skipped_busy_is_a_terminal_status_without_csv(tmp_path: Path) -> None:
     """Persist a busy Scheduler occurrence without publishing or retrying it."""
 
     # 临时数据库隔离正式 runtime 数据。
-    database_path = tmp_path / "runtime" / "data" / "collector.db"
+    database_path = pg_url(tmp_path / "runtime" / "data" / "collector.db")
     upgrade_database(database_path)
     database = Database(database_path)
     # 固定计划时间便于核对终态幂等。
@@ -393,14 +395,9 @@ def test_scheduled_lock_conflict_records_once_and_sends_one_summary(
 ) -> None:
     """Exercise the top-level busy branch without opening Chrome or retrying."""
 
-    # 真实任务配置只替换 SQLite 路径，Scheduler 业务参数保持生产契约。
+    # 真实任务配置只替换 PostgreSQL 路径，Scheduler 业务参数保持生产契约。
     base_config = load_config(Path("config/tasks.yaml"))
-    database_config = base_config.database.model_copy(
-        update={"path": tmp_path / "runtime" / "data" / "collector.db"}
-    )
-    # 平台解析必须仍使用临时数据库，不能触碰真实runtime。
-    platforms = {name: item.model_copy(update={"database_path": database_config.path if name == "compass" else database_config.path.with_name("taobao.db")}) for name, item in base_config.platforms.items()}
-    config = base_config.model_copy(update={"database": database_config, "platforms": platforms})
+    config = pg_config(base_config, tmp_path)
     # Runner 日志和锁目录全部进入 pytest 临时 runtime。
     monkeypatch.setattr("compass_collector.runner.RUNTIME_ROOT", tmp_path / "runtime")
 
@@ -423,7 +420,7 @@ def test_scheduled_lock_conflict_records_once_and_sends_one_summary(
     first_exit_code = run_scheduled_collection(config, [task], planned_at)
     second_exit_code = run_scheduled_collection(config, [task], planned_at)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         # 唯一状态行必须来自第一次锁冲突，第二次不得重复登记。
         status_rows = database.recent_status(limit=5)

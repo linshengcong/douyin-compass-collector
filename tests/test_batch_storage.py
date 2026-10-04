@@ -215,7 +215,7 @@ def test_zero_category_discovery_finishes_as_failed_without_category_entries(
         root_category_id="13",
         root_category_name="食品饮料",
     )
-    # 最终 Manifest 用于核对零分类状态与 SQLite 约束一致。
+    # 最终 Manifest 用于核对零分类状态与 PostgreSQL 约束一致。
     manifest = json.loads(storage.manifest_path.read_text(encoding="utf-8"))
 
     assert manifest["status"] == "failed"
@@ -506,7 +506,7 @@ def test_final_collection_snapshot_publishes_one_authoritative_manifest(
     )
     # 中文 CSV 文件名验证 Manifest 只投影最终安全本地路径。
     csv_path = tmp_path / "exports" / "2026-07-17" / "食品饮料三级分类榜单-v1.csv"
-    # SQLite 正式快照是 Manifest 状态、统计和发布时间的唯一来源。
+    # PostgreSQL 正式快照是 Manifest 状态、统计和发布时间的唯一来源。
     final_snapshot = BatchCollectionSnapshot(
         batch_id=storage.batch_id,
         task_id=storage.task_id,

@@ -32,6 +32,8 @@ MAX_CONSECUTIVE_PLATFORM_UNAVAILABLE_FAILURES = 3
 PLATFORM_TEMPORARY_UNAVAILABLE_ERROR_CATEGORY = "platform_temporarily_unavailable"
 # 淘宝未知业务错误使用自身分类，不能套用罗盘11001含义。
 TAOBAO_BUSINESS_ERROR_CATEGORY = "taobao_business_error"
+# 淘宝完整首轮后最多补采两轮，罗盘不进入分类补采。
+TAOBAO_CATEGORY_RETRY_ROUNDS = 2
 
 
 def _safe_emit(runtime_logger, **fields):
@@ -43,7 +45,7 @@ def _safe_emit(runtime_logger, **fields):
 
 
 def _sync_collection_snapshot(storage, snapshot):
-    """Retry a transient Manifest write without repeating SQLite transactions."""
+    """Retry a transient Manifest write without repeating PostgreSQL transactions."""
     # 权威数据库快照只同步镜像，绝不重放已经提交的页。
     for attempt in range(2):
         try:
@@ -90,7 +92,7 @@ class _CategoryAttemptFailed(Exception):
 
 
 def _collect_category_run(
-    *, prepared_batch, task, plan, client, database, runtime_logger, control
+    *, prepared_batch, task, plan, client, database, runtime_logger, control, retry_round=0
 ):
     """Persist validated adapter pages without browser or response-format knowledge."""
     # 失败上下文只记录当前页和是否已提交分类开始事务。
@@ -100,6 +102,9 @@ def _collect_category_run(
     iterator = None
     try:
         _raise_if_stopped(control)
+        if retry_round:
+            # 归档上轮材料后复用分类身份；数据库开始事务会重置失败分类统计。
+            prepared_batch.storage.archive_category_attempt(plan.category_run_id, retry_round)
         # 开始时间在数据库和返回结果间保持一致。
         started_at = datetime.now(SHANGHAI_TIMEZONE)
         snapshot = database.start_category_run(
@@ -111,7 +116,9 @@ def _collect_category_run(
             runtime_logger,
             level="INFO",
             event="category_collection_started",
-            message=f"[{task.id}] 开始采集 {plan.category.display_path}",
+            message=(f"[{task.id}] "
+                     + (f"补采第 {retry_round}/{TAOBAO_CATEGORY_RETRY_ROUNDS} 轮：" if retry_round else "开始采集 ")
+                     + plan.category.display_path),
             stage="category_collection",
             context=LogContext(
                 batch_id=prepared_batch.batch_id,
@@ -177,7 +184,7 @@ def _collect_category_run(
             total = page.api_total
             target_pages = page.target_page_count
             # 已验证且返回给编排的页完成审计后再响应停止。
-            # 写入顺序保持 raw -> SQLite -> Manifest，未提交页不加入完整结果。
+            # 写入顺序保持 raw -> PostgreSQL -> Manifest，未提交页不加入完整结果。
             path = prepared_batch.storage.write_category_page(
                 plan.category_run_id, page.page_no, page.payload
             )
@@ -317,7 +324,7 @@ def _save_category_failure(
                 screenshot=failure.cause.screenshot,
             )
     except Exception:
-        # 诊断材料不可写不能覆盖 SQLite 中已经决定的生命周期。
+        # 诊断材料不可写不能覆盖 PostgreSQL 中已经决定的生命周期。
         pass
 
 
@@ -333,7 +340,7 @@ def _terminate_batch_and_raise(
 ) -> None:
     """Atomically terminate current and pending categories, then raise safely."""
 
-    # 批次终止时间由 SQLite 和 Manifest 共享。
+    # 批次终止时间由 PostgreSQL 和 Manifest 共享。
     finished_at = datetime.now(SHANGHAI_TIMEZONE)
     # 只有已经进入 running 的分类才交给终止事务收口。
     current_category_run_id = (
@@ -420,6 +427,17 @@ def _interrupt_before_next_category(
     )
 
 
+def _category_attempts(plans, failed_ids, platform):
+    """完整首轮后，仅按发现顺序生成上一轮仍失败的淘宝分类。"""
+    # 集合由消费方更新，每轮快照避免本轮失败被即时重试。
+    retry_rounds = TAOBAO_CATEGORY_RETRY_ROUNDS if platform == "taobao" else 0
+    for retry_round in range(retry_rounds + 1):
+        # 首轮遍历所有计划，后续只保留当前失败分类。
+        pending = [plan for plan in plans if retry_round == 0 or plan.category_run_id in failed_ids]
+        for plan in pending:
+            yield plan, retry_round
+
+
 def collect_category_batch(
     *,
     prepared_batch: PreparedCategoryBatch,
@@ -437,12 +455,16 @@ def collect_category_batch(
     completed_category_runs: list[CollectedCategoryRun] = []
     # 普通失败计数用于部分成功发布汇总，不再因少量异常中止任务。
     failed_category_count = 0
+    # 最终失败按分类去重，补采成功时移除，不能累计失败尝试次数。
+    failed_category_ids = set()
     # last_ordinary_failure 在全部分类失败时提供批次终态原因。
     last_ordinary_failure: tuple[CategoryRunPlan, _CategoryAttemptFailed] | None = None
     # 连续三次平台暂时不可用终止本批，不增加页面请求压力。
     consecutive_platform_unavailable_failures = 0
 
-    for plan in prepared_batch.category_run_plans:
+    for plan, retry_round in _category_attempts(
+        prepared_batch.category_run_plans, failed_category_ids, task.platform
+    ):
         if control is not None and control.stop_requested():
             _interrupt_before_next_category(
                 prepared_batch=prepared_batch,
@@ -460,6 +482,7 @@ def collect_category_batch(
                 database=database,
                 runtime_logger=runtime_logger,
                 control=control,
+                retry_round=retry_round,
             )
         except _CategoryAttemptFailed as failure:
             _save_category_failure(
@@ -488,9 +511,11 @@ def collect_category_batch(
                     runtime_logger=runtime_logger,
                     completed_category_runs=completed_category_runs,
                 )
-            if isinstance(failure.cause, ORDINARY_CATEGORY_ERRORS):
+            if (isinstance(failure.cause, ORDINARY_CATEGORY_ERRORS)
+                    or (task.platform == "taobao" and isinstance(failure.cause, BrowserOperationError))):
                 # 单分类请求或数据契约异常留档后跳过，批次继续采集其他分类。
-                failed_category_count += 1
+                failed_category_ids.add(plan.category_run_id)
+                failed_category_count = len(failed_category_ids)
                 last_ordinary_failure = (plan, failure)
                 is_category_unavailable = (
                     failure.cause.category == "category_unavailable"
@@ -498,8 +523,6 @@ def collect_category_batch(
                 is_platform_temporarily_unavailable = (
                     (task.platform == "compass" and failure.cause.category
                      == PLATFORM_TEMPORARY_UNAVAILABLE_ERROR_CATEGORY)
-                    or (task.platform == "taobao" and failure.cause.category
-                        == TAOBAO_BUSINESS_ERROR_CATEGORY)
                 )
                 # 其他失败会中断当前平台业务错误序列，不能把网络超时累计为平台业务错误。
                 consecutive_platform_unavailable_failures = (
@@ -545,7 +568,7 @@ def collect_category_batch(
                         error_category=failure.cause.category,
                         finished_at=datetime.now(SHANGHAI_TIMEZONE),
                     )
-                    # SQLite 返回快照即表示当前分类已经离开 running。
+                    # PostgreSQL 返回快照即表示当前分类已经离开 running。
                     failure_committed = True
                     _sync_collection_snapshot(
                         prepared_batch.storage,
@@ -623,6 +646,8 @@ def collect_category_batch(
                 completed_category_runs=completed_category_runs,
             )
         completed_category_runs.append(collected_run)
+        failed_category_ids.discard(plan.category_run_id)
+        failed_category_count = len(failed_category_ids)
         # 任何成功分类都会中断当前平台连续业务失败序列。
         consecutive_platform_unavailable_failures = 0
 
@@ -646,6 +671,8 @@ def collect_category_batch(
             runtime_logger=runtime_logger,
             completed_category_runs=completed_category_runs,
         )
+    # 补采完成后恢复分类发现顺序，发布结果不受成功时间影响。
+    completed_category_runs.sort(key=lambda run: run.plan.category.discovery_order)
     # 阶段三完成时间不终结数据库批次，后续阶段仍负责正式发布。
     finished_at = datetime.now(SHANGHAI_TIMEZONE)
     # 成功分类商品数仅用于允许字段的批次准备日志。

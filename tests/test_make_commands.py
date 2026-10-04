@@ -14,7 +14,7 @@ from compass_collector.config import load_config
 
 
 # 常规Make检查使用-n；并行测试替换执行器，不采集、不发送、不清理、不安装服务。
-PLATFORM_COMMANDS = ("run", "login", "status", "clean", "schedule", "notify", "web", "check")
+PLATFORM_COMMANDS = ("run", "login", "status", "clean", "schedule", "notify", "check")
 
 
 def make_output(*arguments):
@@ -74,7 +74,7 @@ def test_run_overrides_preserve_existing_mode_semantics(arguments, expected):
     ("run", ["GUI=", "START=yes no"]),
     ("run", ["GUI=no", "START=no"]), ("run", ["NOTIFY=maybe"]),
     ("clean", []), ("clean", ["ACTION=all"]),
-    ("check", ["ACTION=install"]), ("web", ["ACTION=uninstall"]),
+    ("check", ["ACTION=install"]),
     ("schedule", ["ACTION=data"]),
     ("start", ["MODE=unknown"]), ("start", ["NOTIFY=maybe"]),
 ])
@@ -85,7 +85,7 @@ def test_invalid_actions_and_options_never_expand_a_destructive_recipe(command, 
     assert result.returncode != 0 and not result.stdout
 
 
-def test_help_install_and_selected_platform_web_and_service_surface():
+def test_help_install_and_selected_platform_service_surface():
     """Help, installation and dual-platform startup do not require a platform."""
     assert make_output().returncode == 0
     assert make_output("help").returncode == 0
@@ -95,12 +95,9 @@ def test_help_install_and_selected_platform_web_and_service_surface():
     assert {line.split()[0] for line in help_result.stdout.splitlines() if line.startswith("  ")} == {
         "help", "install", "start", *PLATFORM_COMMANDS,
     }
-    # 模板脚本选择独立平台标签和配置，web使用独立索引及初始平台。
+    # 模板脚本选择独立平台标签和配置。
     service = make_output("schedule", "PLATFORM=tb", "ACTION=check")
-    website = make_output("web", "PLATFORM=tb", "ACTION=build")
     assert "COLLECTOR_PLATFORM=taobao" in service.stdout and "--dry-run" in service.stdout
-    assert "VITE_DEFAULT_PLATFORM=taobao" in website.stdout
-    assert "VITE_TAOBAO_DATA_INDEX_URL=" in website.stdout and "run build" in website.stdout
     for obsolete in ("app", "taobao-run", "taobao-login", "taobao-status", "service", "test", "scheduler"):
         assert make_output(obsolete, "PLATFORM=tb").returncode != 0
 

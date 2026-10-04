@@ -1,5 +1,7 @@
 """Stage-four durable scheduling, missed-state, and browser lifecycle tests."""
 
+from pg_support import pg_url, pg_config
+
 from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -21,17 +23,9 @@ SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def temporary_config(tmp_path: Path) -> AppConfig:
-    """Point the real checked-in config at a test-only SQLite database."""
-
-    # 真实配置模型只替换数据库路径，其余业务参数保持不变。
-    config = load_config(CONFIG_PATH)
-    # 嵌套 Pydantic 模型使用不可变式复制避免污染其他测试。
-    database_config = config.database.model_copy(
-        update={"path": tmp_path / "runtime" / "data" / "collector.db"}
-    )
-    # 临时测试把两个平台路径都隔离到同一个pytest根目录。
-    platforms = {name: item.model_copy(update={"database_path": database_config.path if name == "compass" else database_config.path.with_name("taobao.db")}) for name, item in config.platforms.items()}
-    return config.model_copy(update={"database": database_config, "platforms": platforms})
+    """Keep task settings while isolating each platform in PostgreSQL."""
+    # 所有真实连接指向测试 schema，不触碰工程运行库。
+    return pg_config(load_config(Path("config/tasks.yaml")), tmp_path)
 
 
 def test_scheduler_config_and_daily_cron_are_strict() -> None:
@@ -102,7 +96,7 @@ def test_first_reconcile_runs_today_once_and_advances_checkpoint(
         )
     ]
     # 持久化检查点证明第二次调用没有依赖进程内状态。
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         checkpoint = database.scheduler_checkpoint(
             "compass_household_cleaning_realtime"
@@ -123,8 +117,8 @@ def test_cross_day_occurrence_is_missed_and_never_dispatched(
     monkeypatch.setattr(
         "compass_collector.scheduler.RUNTIME_ROOT", tmp_path / "runtime"
     )
-    upgrade_database(config.database.path)
-    database = Database(config.database.path)
+    upgrade_database(config.database.url)
+    database = Database(config.database.url)
     try:
         database.set_scheduler_checkpoint(
             "compass_household_cleaning_realtime",
@@ -148,7 +142,7 @@ def test_cross_day_occurrence_is_missed_and_never_dispatched(
 
     reconcile_scheduler_once(config, now=now, run_callback=fake_run)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         rows = database.recent_status(limit=5)
     finally:
@@ -248,7 +242,7 @@ def test_scheduler_auth_failure_closes_browser_without_waiting(
         },
     )
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         rows = database.recent_status(limit=5)
     finally:

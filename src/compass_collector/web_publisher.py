@@ -2,6 +2,7 @@
 
 import csv
 import gzip
+from hashlib import sha256
 import json
 import os
 import re
@@ -15,6 +16,7 @@ from zoneinfo import ZoneInfo
 from compass_collector.oss_uploader import OssUploadError, OssUploader
 from compass_collector.exporter import CSV_HEADERS, TAOBAO_CSV_HEADERS
 from compass_collector.errors import ResponseContractError
+from compass_collector.models import CollectedCategoryRun
 from compass_collector.platforms.taobao_product_rank import parse_metric_value, normalize_url
 
 
@@ -22,7 +24,7 @@ from compass_collector.platforms.taobao_product_rank import parse_metric_value, 
 WEB_PREFIX_PATTERN = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 # 网站数据版本在前端与发布器之间保持明确兼容边界。
 WEB_SCHEMA_VERSION = 3
-# SQLite 时间是北京墙上时间，公开快照必须补充时区后再比较及展示。
+# PostgreSQL 时间是北京墙上时间，公开快照必须补充时区后再比较及展示。
 PUBLIC_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
@@ -85,7 +87,7 @@ def load_web_publication_settings() -> WebPublicationSettings:
     )
     if not public_prefix or WEB_PREFIX_PATTERN.fullmatch(public_prefix) is None:
         return WebPublicationSettings(enabled=True, error_category="web_config_invalid")
-    # 空值保留 Vercel 旧链路；非空静态网站地址必须是无凭据 HTTPS URL。
+    # 空值只发布数据；非空静态网站地址必须是无凭据 HTTPS URL。
     site_url = os.environ.get("WEB_SITE_URL", "").strip().rstrip("/") or None
     if site_url is not None and not _is_valid_public_site_url(site_url):
         return WebPublicationSettings(enabled=True, error_category="web_config_invalid")
@@ -116,7 +118,7 @@ def _is_valid_public_site_url(value: str) -> bool:
 
 
 def _public_timestamp(value: datetime) -> datetime:
-    """Convert SQLite wall time and live aware time to the same Beijing instant."""
+    """Convert PostgreSQL wall time and live aware time to the same Beijing instant."""
     return value.replace(tzinfo=PUBLIC_TIMEZONE) if value.tzinfo is None else value.astimezone(PUBLIC_TIMEZONE)
 
 
@@ -161,6 +163,8 @@ class WebPublisher:
         # 采集窗口与网页发布时间分开，历史抖音快照可没有窗口。
         started_at: datetime | None = None,
         finished_at: datetime | None = None,
+        # 正式采集提供成功分类，身份字段取自原始商品而非名称或展示序号。
+        category_runs: tuple[CollectedCategoryRun, ...] | None = None,
     ) -> WebPublicationResult | None:
         """Upload versioned CSV/data first and replace the public index last."""
 
@@ -175,7 +179,7 @@ class WebPublisher:
         if not csv_path.is_file() or not re.fullmatch(r"[0-9a-f]{32}", batch_id):
             raise WebPublicationError("web_publication_input_invalid")
 
-        # 发布时刻来自 SQLite 快照时可能无时区；采集窗口来自内存时带时区。
+        # 发布时刻来自 PostgreSQL 快照时可能无时区；采集窗口来自内存时带时区。
         published_at = _public_timestamp(published_at)
         started_at = _public_timestamp(started_at) if started_at is not None else None
         finished_at = _public_timestamp(finished_at) if finished_at is not None else None
@@ -204,6 +208,11 @@ class WebPublisher:
         records = _read_csv_records(csv_path, platform=platform)
         if type(item_count) is not int or item_count != len(records):
             raise WebPublicationError("web_csv_contract_invalid")
+        # 只有附带可核验商品身份的新快照支持选品；旧调用仍输出只读 v3。
+        schema_version = WEB_SCHEMA_VERSION
+        if category_runs is not None:
+            attach_selection_identity(records, category_runs, platform, batch_id)
+            schema_version = 4
         # 各任务拥有独立索引，非主任务禁止覆盖旧网站根索引。
         prefix = f"{self.settings.public_prefix}/{platform}/{task_id}"
         data_key = f"{prefix}/batches/{batch_id}.json.gz"
@@ -214,7 +223,7 @@ class WebPublisher:
         index_url = self.uploader.public_object_url(latest_key)
         # gzip 数据文件不可变，浏览器可长期缓存且始终经 latest.json 定位。
         data_payload = {
-            "schema_version": WEB_SCHEMA_VERSION,
+            "schema_version": schema_version,
             "batch_id": batch_id,
             "task_id": task_id,
             "platform": platform,
@@ -230,7 +239,7 @@ class WebPublisher:
             )
         # latest.json 不包含业务行，只提供当前快照元信息和公开资源 URL。
         index_payload = {
-            "schema_version": WEB_SCHEMA_VERSION,
+            "schema_version": schema_version,
             "batch_id": batch_id,
             "task_id": task_id,
             "platform": platform,
@@ -283,6 +292,32 @@ class WebPublisher:
             data_url=data_url,
             csv_url=csv_url,
         )
+
+
+def attach_selection_identity(
+    records: list[dict[str, Any]],
+    category_runs: tuple[CollectedCategoryRun, ...],
+    platform: str,
+    batch_id: str,
+) -> None:
+    """按 CSV 的稳定输出顺序核对原始商品，附加可提交的身份字段。"""
+    # 分类发现顺序和排名排序与 CsvExporter 一致，重复商品仍有独立来源记录。
+    identities = [
+        (run.plan.category_run_id, run.plan.category.display_path, entry)
+        for run in sorted(category_runs, key=lambda item: item.plan.category.discovery_order)
+        for entry in sorted(run.entries, key=lambda item: item.rank)
+    ]
+    if len(identities) != len(records):
+        raise WebPublicationError("web_identity_contract_invalid")
+    # 逐行核对后才补身份，禁止将错位的 CSV 行绑定到另一个商品。
+    for position, (row, (category_run_id, category, entry)) in enumerate(zip(records, identities)):
+        if (not entry.product_id or row["category"] != category
+                or row["rank"] != entry.rank or row["product_name"] != entry.product_name):
+            raise WebPublicationError("web_identity_contract_invalid")
+        # JSON 编码消除分隔符歧义，同批次重试得到相同来源 ID。
+        identity = json.dumps([platform, batch_id, category_run_id, position, entry.product_id])
+        row["product_id"] = entry.product_id
+        row["source_record_id"] = sha256(identity.encode()).hexdigest()
 
 
 def _read_csv_records(csv_path: Path, *, platform: str = "compass") -> list[dict[str, Any]]:

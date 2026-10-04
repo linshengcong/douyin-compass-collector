@@ -86,7 +86,7 @@ def test_collection_lock_blocks_both_platforms_without_losing_identity(config, t
         with ProcessLock(tmp_path / "runtime" / "locks" / runner.COLLECTION_LOCK_NAME, "collection"):
             assert runner.run_scheduled_collection(selected, selected.tasks, planned) == 0
             assert runner.run_scheduled_collection(selected, selected.tasks, planned) == 0
-        database = Database(selected.database.path)
+        database = Database(selected.database.url)
         try:
             with database.session_factory() as session:
                 rows = session.scalars(select(CollectionBatch)).all()

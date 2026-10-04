@@ -1,5 +1,6 @@
 """Strict YAML configuration models for the collector."""
 
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -53,12 +54,25 @@ class PlatformConfig(StrictModel):
 
     # 罗盘继续复用旧目录，未来平台必须声明自己的独立目录。
     profile_dir: Path
-    # 多平台配置必须为各平台指定独立数据库，单平台旧配置可沿用顶层路径。
-    database_path: Path | None = None
+    # 多平台指定不同数据库连接环境变量，凭证不进入 YAML。
+    database_env: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]*$")
     # 默认关闭，避免为淘宝排查改变抖音浏览器环境。
     webdriver_compatibility: bool = False
     # 默认关闭，防止改变已有罗盘登录生命周期。
     persist_session_cookies: bool = False
+    # 同一平台所有任务共用分类名称黑名单，父级命中时跳过其全部待采子分类。
+    category_blacklist: list[str] = Field(default_factory=list)
+
+    @field_validator("category_blacklist")
+    @classmethod
+    def validate_category_blacklist(cls, value: list[str]) -> list[str]:
+        """去掉名称首尾空白并去重，拒绝无法辨识的空分类名称。"""
+
+        # 保留首次出现顺序，方便配置快照和人工维护核对。
+        names = list(dict.fromkeys(name.strip() for name in value))
+        if any(not name for name in names):
+            raise ValueError("category_blacklist names must not be blank")
+        return names
 
 
 class IntervalConfig(StrictModel):
@@ -86,7 +100,7 @@ class IntervalConfig(StrictModel):
 class CollectionConfig(StrictModel):
     """Configure bounded, interruptible serial page operations."""
 
-    # 重试必须先恢复页面状态，不能重复盲点下一页。
+    # 罗盘页内重试必须先恢复页面状态；淘宝只在首轮后按分类补采。
     network_retry_attempts: int = Field(ge=0, le=3, default=2)
     # 页面操作之间的间隔，沿用已有低频范围。
     request_interval_seconds: IntervalConfig = Field(
@@ -119,9 +133,21 @@ class RetentionConfig(StrictModel):
 
 
 class DatabaseConfig(StrictModel):
-    """Configure the local SQLite database managed by Alembic."""
+    """Reference a PostgreSQL DSN without storing credentials in configuration."""
 
-    path: Path
+    # 连接地址由环境或项目 .env 提供，只支持 PostgreSQL。
+    url_env: str = Field(pattern=r"^[A-Z][A-Z0-9_]*$")
+
+    @property
+    def url(self):
+        """Resolve and validate the DSN only when a database operation is requested."""
+        from compass_collector.database_connection import database_url
+
+        # 缺少连接时立即失败，不静默回退历史 SQLite。
+        value = os.environ.get(self.url_env)
+        if not value:
+            raise ValueError(f"database environment variable {self.url_env} is required")
+        return database_url(value)
 
 
 class SchedulerConfig(StrictModel):
@@ -221,7 +247,7 @@ class AppConfig(StrictModel):
             "tasks": selected_tasks,
             "platforms": {platform: self.platforms[platform]},
             "database": self.database.model_copy(update={
-                "path": self.platforms[platform].database_path or self.database.path,
+                "url_env": self.platforms[platform].database_env or self.database.url_env,
             }),
             "publication": self.publication.model_copy(update={"web_primary_task_id": primary_task_id}),
         })
@@ -265,13 +291,14 @@ class AppConfig(StrictModel):
         ]
         if len(profiles) != len(set(profiles)):
             raise ValueError("platform profiles must be distinct")
-        # 多平台不能退回共享顶层数据库；规范化路径同时消解相对路径及符号链接。
+        # 多平台保留独立数据库，环境变量别名不能代替真实归属检查。
         if len(self.platforms) > 1:
-            if any(platform.database_path is None for platform in self.platforms.values()):
-                raise ValueError("multiple platforms require independent database_path values")
-            database_paths = [platform.database_path.resolve() for platform in self.platforms.values()]
-            if len(database_paths) != len(set(database_paths)):
-                raise ValueError("platform databases must be distinct")
+            if any(platform.database_env is None for platform in self.platforms.values()):
+                raise ValueError("multiple platforms require independent database_env values")
+            # 此处只检查变量名；连接后 runtime_platform 再验证真实数据库归属。
+            database_names = [platform.database_env for platform in self.platforms.values()]
+            if len(database_names) != len(set(database_names)):
+                raise ValueError("platform database environment variables must be distinct")
         if self.publication.web_primary_task_id not in {task.id for task in self.tasks}:
             raise ValueError("primary publication task is not configured")
         return self
@@ -316,14 +343,10 @@ def load_config(config_path: Path) -> AppConfig:
                 name: platform.model_copy(
                     update={
                         "profile_dir": resolve_runtime_value(platform.profile_dir),
-                        "database_path": resolve_runtime_value(platform.database_path) if platform.database_path else None,
                     }
                 )
                 for name, platform in config.platforms.items()
             },
-            "database": config.database.model_copy(
-                update={"path": resolve_runtime_value(config.database.path)}
-            ),
         }
     )
     return AppConfig.model_validate(resolved_config.model_dump(mode="python"))

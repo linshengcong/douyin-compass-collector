@@ -21,7 +21,7 @@ BATCH_TERMINAL_STATUSES = {
     "interrupted",
     "abandoned",
 }
-# BatchStorage 接受的执行模式与 SQLite 约束保持一致。
+# BatchStorage 接受的执行模式与 PostgreSQL 约束保持一致。
 BATCH_MODES = {"normal", "dry_run", "force"}
 
 
@@ -78,7 +78,7 @@ class _CategoryRunSnapshotLike(Protocol):
 
 
 class _BatchCollectionSnapshotLike(Protocol):
-    """Describe the SQLite batch snapshot consumed by BatchStorage."""
+    """Describe the PostgreSQL batch snapshot consumed by BatchStorage."""
 
     batch_id: str
     task_id: str
@@ -116,9 +116,9 @@ def current_time_iso() -> str:
 
 
 def _manifest_time_iso(value: datetime) -> str:
-    """Restore the configured timezone when SQLite returns a wall-clock value."""
+    """Restore the configured timezone when PostgreSQL returns a wall-clock value."""
 
-    # SQLite 快照是无时区北京时间，Manifest 继续显式保留 +08:00。
+    # PostgreSQL 快照是无时区北京时间，Manifest 继续显式保留 +08:00。
     manifest_time = (
         value.replace(tzinfo=SHANGHAI_TIMEZONE)
         if value.tzinfo is None
@@ -296,6 +296,21 @@ class BatchStorage:
         _write_gzip_json_atomic(self.category_tree_path, payload)
         return self.category_tree_path
 
+    def archive_category_attempt(self, category_run_id: str, retry_round: int) -> None:
+        """补采前保存旧页和故障材料，让新尝试使用独立的空目录。"""
+        self._category_manifest(category_run_id)
+        if retry_round not in (1, 2):
+            raise ValueError("invalid category retry round")
+        # 两轮补采分别归档各自上一轮；不删除审计材料，不覆盖已有归档。
+        for source in (self.categories_dir / category_run_id, self.artifact_dir / category_run_id):
+            if source.exists():
+                # 原目录同级归档，rename 在同一文件系统内完成。
+                destination = source.parent / "attempts" / category_run_id / str(retry_round)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists():
+                    raise FileExistsError(destination)
+                source.rename(destination)
+
     def write_category_page(
         self,
         category_run_id: str,
@@ -428,7 +443,7 @@ class BatchStorage:
         self,
         snapshot: _BatchCollectionSnapshotLike,
     ) -> None:
-        """Atomically replace collection state from one authoritative SQLite snapshot."""
+        """Atomically replace collection state from one authoritative PostgreSQL snapshot."""
 
         # 存储实例与数据库快照必须描述同一个顶层批次。
         if snapshot.platform != self.manifest["platform"]:
@@ -454,7 +469,7 @@ class BatchStorage:
         category_snapshots = tuple(snapshot.categories)
         if snapshot.discovered_category_count != len(category_snapshots):
             raise ValueError("snapshot category count is inconsistent")
-        # 已登记 Manifest 分类用于防止 SQLite 快照意外改变分类身份。
+        # 已登记 Manifest 分类用于防止 PostgreSQL 快照意外改变分类身份。
         existing_categories_by_id = {
             category_manifest["category_run_id"]: category_manifest
             for category_manifest in self.manifest["categories"]
@@ -551,7 +566,7 @@ class BatchStorage:
             raise ValueError("snapshot category set does not match Manifest")
         # category_tree_captured_at 没有数据库列，继续保留阶段二已记录值。
         category_tree_captured_at = self.manifest["category_tree_captured_at"]
-        # 其余状态全部由 SQLite 快照重新投影，不进行增量合并。
+        # 其余状态全部由 PostgreSQL 快照重新投影，不进行增量合并。
         updated_manifest: dict[str, Any] = {
             "platform": snapshot.platform,
             "config_snapshot": snapshot.config_snapshot,

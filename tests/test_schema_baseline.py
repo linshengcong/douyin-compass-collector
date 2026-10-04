@@ -1,5 +1,7 @@
 """Clean v1 schema and batch-publication semantics tests."""
 
+from pg_support import pg_url, pg_config
+
 from datetime import date, datetime
 from pathlib import Path
 
@@ -18,7 +20,7 @@ from compass_collector.persistence import (
 )
 
 
-# 所有时间固定为北京墙上时间，便于 SQLite 断言。
+# 所有时间固定为北京墙上时间，便于 PostgreSQL 断言。
 PLANNED_AT = datetime(2026, 7, 17, 14, 0)
 STARTED_AT = datetime(2026, 7, 17, 14, 0, 1)
 FINISHED_AT = datetime(2026, 7, 17, 14, 8)
@@ -27,8 +29,8 @@ FINISHED_AT = datetime(2026, 7, 17, 14, 8)
 def create_database(tmp_path: Path) -> Database:
     """Create one fully migrated test database below the pytest temp root."""
 
-    # 每个测试使用独立 SQLite，不触碰工程 runtime。
-    database_path = tmp_path / "runtime" / "data" / "collector.db"
+    # 每个测试使用独立 PostgreSQL，不触碰工程 runtime。
+    database_path = pg_url(tmp_path / "runtime" / "data" / "collector.db")
     upgrade_database(database_path)
     return Database(database_path)
 
@@ -120,7 +122,7 @@ def test_clean_migration_creates_only_the_new_baseline_tables(tmp_path: Path) ->
     # 临时数据库执行仓库当前唯一迁移。
     database = create_database(tmp_path)
     try:
-        # Inspector 用于核对真实 SQLite 表和关键字段。
+        # Inspector 用于核对真实 PostgreSQL 表和关键字段。
         database_inspector = inspect(database.engine)
         table_names = set(database_inspector.get_table_names())
         batch_columns = {
@@ -215,7 +217,7 @@ def test_rank_and_product_are_unique_inside_each_category_only(tmp_path: Path) -
                 session.add(duplicate_product)
         with pytest.raises(IntegrityError):
             with database.session_factory.begin() as session:
-                # 同一分类内重复 rank/product 必须由 SQLite 拒绝。
+                # 同一分类内重复 rank/product 必须由 PostgreSQL 拒绝。
                 session.add(build_rank_entry(category_run_id="category-one"))
     finally:
         database.close()

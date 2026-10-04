@@ -118,7 +118,7 @@ def cleanup_runtime(
     platform: str | None = None,
     task_ids: tuple[str, ...] = (),
 ) -> CleanupSummary:
-    """Apply configured cleanup without touching SQLite, CSV, or Chrome Profile."""
+    """Apply configured cleanup without touching PostgreSQL, CSV, or Chrome Profile."""
 
     # 测试可注入固定时间，真实运行使用当前北京时间。
     current_time = now or datetime.now(SHANGHAI_TIMEZONE)

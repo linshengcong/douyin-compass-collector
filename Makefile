@@ -3,7 +3,7 @@ PLATFORM ?=
 # 当前命令集合用于仅校验实际使用的参数，help/install/start不需要平台。
 COMMANDS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),help)
 # start启动两个平台；其余业务入口必须明确选择一个平台。
-PLATFORM_COMMANDS := run login status clean schedule notify web check
+PLATFORM_COMMANDS := run login status clean schedule notify check
 ifneq ($(filter $(PLATFORM_COMMANDS),$(COMMANDS)),)
 ifneq ($(words $(PLATFORM)),1)
 $(error 必须指定 PLATFORM=tt 或 PLATFORM=tb，例如 make run PLATFORM=tb)
@@ -17,8 +17,8 @@ endif
 COLLECTOR_PLATFORM = $(if $(filter tb,$(PLATFORM)),taobao,compass)
 # 抖音保持既有主配置，允许通过CONFIG显式覆盖。
 TT_CONFIG ?= config/tasks.yaml
-# 本机优先复用已经登录的淘宝全量配置；其他机器使用可分发的全量配置。
-TB_CONFIG ?= $(if $(wildcard runtime/acceptance/taobao/2026-10-01/full-root-config.yaml),runtime/acceptance/taobao/2026-10-01/full-root-config.yaml,config/taobao.yaml)
+# 当前 PostgreSQL 配置为默认入口；历史验收配置只作归档。
+TB_CONFIG ?= config/taobao.yaml
 # 最终配置是全部平台入口的唯一配置来源。
 CONFIG ?= $(if $(filter tb,$(PLATFORM)),$(TB_CONFIG),$(TT_CONFIG))
 # 默认任务按平台选择，显式TASK仍由CLI核验平台归属。
@@ -33,9 +33,6 @@ START ?= yes
 NOTIFY ?= yes
 # ACTION由对应命令设置默认值；清理必须显式指定data或login。
 ACTION ?=
-# 网站两个平台的公开地址独立，不能将淘宝地址注入抖音变量。
-TT_WEB_DATA_INDEX_URL ?= https://e-commerce-data.oss-cn-shanghai.aliyuncs.com/compass/web/latest.json
-TB_WEB_DATA_INDEX_URL ?= https://e-commerce-data.oss-cn-shanghai.aliyuncs.com/compass/web/taobao/taobao_household_cleaning_realtime/latest.json
 # 环境注入只影响本次进程，不修改.env或真实凭证。
 NOTIFY_ENABLED = $(if $(filter yes,$(NOTIFY)),true,false)
 RUN_MODE_OPTION = $(if $(filter force,$(MODE)),--force,$(if $(filter dry-run,$(MODE)),--dry-run))
@@ -43,19 +40,17 @@ RUN_GUI_OPTION = $(if $(filter no,$(GUI)),--no-gui)
 # 动作只在对应命令解析，check不继承服务安装动作，clean没有隐式默认值。
 VALID_ACTIONS_clean := data login
 VALID_ACTIONS_schedule := run check install status uninstall
-VALID_ACTIONS_web := dev build
 VALID_ACTIONS_check := test all
 # 用于Make读取阶段的默认动作，目标内默认值保持相同语义。
 DEFAULT_ACTION_schedule := run
-DEFAULT_ACTION_web := dev
 DEFAULT_ACTION_check := all
-ifneq ($(filter clean schedule web check,$(COMMANDS)),)
+ifneq ($(filter clean schedule check,$(COMMANDS)),)
 ifneq ($(strip $(ACTION)),)
 ifneq ($(words $(ACTION)),1)
 $(error ACTION 必须是一个动作)
 endif
 endif
-$(foreach command,$(filter clean schedule web check,$(COMMANDS)),$(if $(filter $(if $(strip $(ACTION)),$(ACTION),$(DEFAULT_ACTION_$(command))),$(VALID_ACTIONS_$(command))),,$(error $(command) 的 ACTION 可选值为 $(VALID_ACTIONS_$(command)))))
+$(foreach command,$(filter clean schedule check,$(COMMANDS)),$(if $(filter $(if $(strip $(ACTION)),$(ACTION),$(DEFAULT_ACTION_$(command))),$(VALID_ACTIONS_$(command))),,$(error $(command) 的 ACTION 可选值为 $(VALID_ACTIONS_$(command)))))
 endif
 
 ifneq ($(filter run start,$(COMMANDS)),)
@@ -88,7 +83,7 @@ endif
 endif
 
 .DEFAULT_GOAL := help
-.PHONY: help install start run login status clean schedule notify web check
+.PHONY: help install start run login status clean schedule notify check
 
 help: ## 帮助；单平台命令须带PLATFORM=tt|tb（install/start除外）
 	@awk 'BEGIN {FS = ":.*## "; print "用法：make start [参数] 或 make <command> PLATFORM=tt|tb [参数]\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -128,15 +123,9 @@ schedule: ## ACTION=run|check|install|status|uninstall；默认前台调度
 notify: ## 真实发送所选平台钉钉测试消息
 	DINGTALK_ENABLED=$(NOTIFY_ENABLED) PYTHONPATH=src $(PYTHON) -m compass_collector notify-test --platform $(COLLECTOR_PLATFORM)
 
-web: ACTION = dev
-web: ## ACTION=dev|build；默认开发服务，并默认展示所选平台
-	@case "$(ACTION)" in dev|build) ;; *) echo "ACTION只允许dev或build" >&2; exit 2;; esac
-	VITE_DEFAULT_PLATFORM=$(COLLECTOR_PLATFORM) VITE_DATA_INDEX_URL="$(TT_WEB_DATA_INDEX_URL)" VITE_TAOBAO_DATA_INDEX_URL="$(TB_WEB_DATA_INDEX_URL)" npm --prefix web run $(if $(filter build,$(ACTION)),build,dev -- --host 127.0.0.1 --port 5175)
-
 check: ACTION = all
-check: ## ACTION=test|all；默认后端/前端测试及所选平台服务无副作用检查
+check: ## ACTION=test|all；默认后端测试及所选平台服务无副作用检查
 	@case "$(ACTION)" in test|all) ;; *) echo "ACTION只允许test或all" >&2; exit 2;; esac
 	PYTHONPATH=src $(PYTHON) -m pytest
-	$(if $(filter all,$(ACTION)),npm --prefix web test,@true)
 	$(if $(filter all,$(ACTION)),bash -n scripts/install_launchd.sh scripts/uninstall_launchd.sh scripts/status_launchd.sh,@true)
 	$(if $(filter all,$(ACTION)),COLLECTOR_PLATFORM=$(COLLECTOR_PLATFORM) COLLECTOR_CONFIG="$(CONFIG)" ./scripts/install_launchd.sh --dry-run,@true)

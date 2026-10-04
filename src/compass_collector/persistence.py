@@ -1,15 +1,14 @@
-"""SQLite schema, Alembic upgrades, publication identity, and scheduler state."""
+"""PostgreSQL schema, Alembic upgrades, publication identity, and scheduler state."""
 
 from dataclasses import dataclass, field
-import sqlite3
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
 from alembic import command
 from alembic.config import Config as AlembicConfig
-from alembic.script import ScriptDirectory
 from sqlalchemy import (
     BigInteger,
     Boolean,
@@ -23,17 +22,16 @@ from sqlalchemy import (
     Numeric,
     String,
     UniqueConstraint,
-    create_engine,
-    event,
     func,
+    delete,
     select,
     text,
 )
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from compass_collector.errors import PublicationError
-from compass_collector.runtime_locks import ProcessLock, RuntimeLockBusy
+from compass_collector.database_connection import database_engine, database_url
 from compass_collector.models import (
     CategoryDiscoveryResult,
     CategoryRunPlan,
@@ -363,7 +361,7 @@ class RawResponse(Base):
         ),
     )
 
-    # 自增主键只用于 SQLite 内部索引。
+    # 自增主键只用于 PostgreSQL 内部索引。
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     category_run_id: Mapped[str] = mapped_column(
         String(32),
@@ -419,7 +417,7 @@ class ProductRankEntryModel(Base):
             "category_run_id",
             "product_id",
             unique=True,
-            sqlite_where=text("platform = 'compass'"),
+            postgresql_where=text("platform = 'compass'"),
         ),
         CheckConstraint("platform IN ('compass', 'taobao')", name="ck_product_rank_entries_platform"),
         UniqueConstraint(
@@ -508,7 +506,7 @@ class SchedulerCheckpoint(Base):
 
     # 任务 ID 是调度检查点的稳定主键。
     task_id: Mapped[str] = mapped_column(String(120), primary_key=True)
-    # SQLite 保存北京无时区墙上时间。
+    # PostgreSQL 保存北京无时区墙上时间。
     last_checked_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
@@ -577,7 +575,7 @@ class CategoryRunSnapshot:
     level2_category_name: str
     category_id: str
     category_name: str
-    # 分类生命周期和分页统计均来自同一 SQLite 事务。
+    # 分类生命周期和分页统计均来自同一 PostgreSQL 事务。
     status: str
     api_total: int | None
     target_page_count: int | None
@@ -607,7 +605,7 @@ class BatchCollectionSnapshot:
     # 实际请求筛选值随批次固定，配置修改不会改写历史语义。
     brand_type: int | None
     price_bin: str | None
-    # 根分类和安全路径由 SQLite 作为权威来源。
+    # 根分类和安全路径由 PostgreSQL 作为权威来源。
     root_category_id: str | None
     root_category_name: str | None
     manifest_path: str | None
@@ -632,112 +630,62 @@ class BatchCollectionSnapshot:
 
 
 def normalize_datetime(value: datetime) -> datetime:
-    """Store Beijing wall-clock datetimes consistently in SQLite."""
+    """Store Beijing wall-clock datetimes consistently in PostgreSQL."""
 
-    # SQLite 不保存时区偏移，入库前转为无时区墙上时间。
-    return value.replace(tzinfo=None)
-
-
-def database_url(database_path: Path) -> str:
-    """Build an absolute SQLite URL for SQLAlchemy and Alembic."""
-
-    # 绝对路径避免 Alembic 和 CLI 从不同目录启动时指向不同数据库。
-    absolute_path = database_path.resolve()
-    return f"sqlite:///{absolute_path}"
+    # PostgreSQL 不保存时区偏移，入库前转为无时区墙上时间。
+    return value.astimezone(ZoneInfo("Asia/Shanghai")).replace(tzinfo=None) if value.tzinfo is not None else value
 
 
-def enable_sqlite_foreign_keys(engine: Engine) -> None:
-    """Enable SQLite foreign-key enforcement for every new connection."""
-
-    @event.listens_for(engine, "connect")
-    def set_sqlite_pragma(dbapi_connection, connection_record) -> None:
-        """Enable foreign keys on one DB-API connection."""
-
-        # DB-API cursor 只执行固定 PRAGMA，不包含用户数据。
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-
-def _check_platform_identity(connection: sqlite3.Connection, platform: str) -> None:
-    """Reject mixed history or an already claimed foreign database without mutation."""
+def _check_platform_identity(connection: Connection, platform: str) -> None:
+    """Claim one database owner and reject another platform without rewriting it."""
     if platform not in {"compass", "taobao"}:
         raise ValueError("unsupported database platform")
-    # 旧版本可能没有平台列，历史无平台列的批次归属抖音。
-    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-    if "collection_batches" in tables:
-        # PRAGMA只读取固定表的结构，不拼接配置值。
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(collection_batches)")}
-        identities = {row[0] for row in connection.execute("SELECT DISTINCT platform FROM collection_batches")} if "platform" in columns else ({"compass"} if connection.execute("SELECT 1 FROM collection_batches LIMIT 1").fetchone() else set())
-        if identities - {platform}:
-            raise ValueError("database contains another platform or mixed platform history")
-    if "runtime_platform" in tables:
-        # 单行归属不可由另一份配置重新认领，即使数据库没有业务记录。
-        owner = connection.execute("SELECT platform FROM runtime_platform WHERE id=1").fetchone()
-        if owner is not None and owner != (platform,):
-            raise ValueError("database belongs to another platform")
+    # 调用者持有初始化锁，认领与历史检查位于同一事务。
+    identities = set(connection.execute(text("SELECT DISTINCT platform FROM collection_batches")).scalars())
+    if identities - {platform}:
+        raise ValueError("database contains another platform or mixed platform history")
+    connection.execute(text("INSERT INTO runtime_platform(id, platform) VALUES(1, :platform) ON CONFLICT (id) DO NOTHING"), {"platform": platform})
+    # 首次认领后即使清空业务表也不允许另一平台复用。
+    owner = connection.execute(text("SELECT platform FROM runtime_platform WHERE id=1")).scalar_one()
+    if owner != platform:
+        raise ValueError("database belongs to another platform")
 
 
-def upgrade_database(database_path: Path, *, platform: str | None = None) -> None:
-    """Serialize initialization and validate/claim an immutable platform identity."""
-    # 锁按数据库绝对路径定位，GUI和Scheduler即使配置名称不同也共用。
-    database_path = database_path.resolve()
-    database_path.parent.mkdir(parents=True, exist_ok=True)
-    initialization_lock = ProcessLock(database_path.with_name(database_path.name + ".init.lock"), "database_initialization")
-    # 初始化是短事务，最多等待30秒；采集互斥仍采用立即拒绝。
-    initialization_lock.acquire_wait(timeout=30)
+def upgrade_database(value: str | URL, *, platform: str | None = None) -> None:
+    """Serialize PostgreSQL migrations with a database-wide transaction advisory lock."""
+    from compass_collector.app_paths import resource_root
+
+    # 连接创建在凭证解析后执行，绝不访问历史 SQLite 文件。
+    engine = database_engine(value)
     try:
-        # 迁移资源同时适用于开发仓库和PyInstaller包。
-        from compass_collector.app_paths import resource_root
-        project_root = resource_root()
-        alembic_config = AlembicConfig(str(project_root / "alembic.ini"))
-        alembic_config.set_main_option("script_location", str(project_root / "migrations"))
-        alembic_config.set_main_option("sqlalchemy.url", database_url(database_path))
-        head = ScriptDirectory.from_config(alembic_config).get_current_head()
-        revision = None
-        if database_path.is_file():
-            with sqlite3.connect(database_path) as source:
-                if platform is not None:
-                    _check_platform_identity(source, platform)
-                tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                revision = source.execute("SELECT version_num FROM alembic_version").fetchone() if "alembic_version" in tables else None
-                if revision != (head,):
-                    # 只在实际迁移前备份，SQLite backup包括已提交WAL。
-                    backup_dir = database_path.parent / "backups"
-                    backup_dir.mkdir(exist_ok=True)
-                    backup_path = backup_dir / f"{database_path.stem}-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}.db"
-                    with sqlite3.connect(backup_path) as destination:
-                        source.backup(destination)
-        if revision != (head,):
+        with engine.begin() as connection:
+            # 锁属于事务，提交、异常或连接断开后自动释放；跨主机共享。
+            connection.execute(text("SET LOCAL lock_timeout = '30s'"))
+            connection.execute(text("SELECT pg_advisory_xact_lock(172936, 1)"))
+            # 同一连接完成迁移、版本检查及平台认领，避免初始化竞态。
+            project_root = resource_root()
+            alembic_config = AlembicConfig(str(project_root / "alembic.ini"))
+            alembic_config.set_main_option("script_location", str(project_root / "migrations_postgresql"))
+            alembic_config.attributes["connection"] = connection
             command.upgrade(alembic_config, "head")
-        if platform is not None:
-            with sqlite3.connect(database_path) as connection:
-                _check_platform_identity(connection, platform)
-                connection.execute("INSERT OR IGNORE INTO runtime_platform(id, platform) VALUES(1, ?)", (platform,))
+            if platform is not None:
                 _check_platform_identity(connection, platform)
     finally:
-        initialization_lock.release()
+        engine.dispose()
 
 
 class Database:
     """Provide clean-baseline idempotence, status, and scheduler operations."""
 
-    def __init__(self, database_path: Path) -> None:
-        """Create a SQLite engine and session factory for the configured path."""
-
-        database_path.parent.mkdir(parents=True, exist_ok=True)
-        # SQLAlchemy Engine 使用与 Alembic 完全一致的绝对 URL。
-        self.engine = create_engine(database_url(database_path), future=True)
-        enable_sqlite_foreign_keys(self.engine)
-        # 事务 Session 禁止提交后自动过期，便于返回摘要。
-        self.session_factory = sessionmaker(
-            bind=self.engine,
-            expire_on_commit=False,
-            future=True,
-        )
+    def __init__(self, value: str | URL) -> None:
+        """Create the configured PostgreSQL pool and transactional session factory."""
+        # 连接、连接池参数统一由独立模块维护。
+        self.engine = database_engine(value)
+        # 返回摘要与快照在事务结束后仍可读取。
+        self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def close(self) -> None:
-        """Dispose pooled SQLite connections."""
+        """Dispose pooled PostgreSQL connections."""
 
         self.engine.dispose()
 
@@ -957,7 +905,7 @@ class Database:
             )
         if collected_batch.failed_category_count != len(failed_category_runs):
             raise PublicationError(
-                "collected failure count does not match SQLite",
+                "collected failure count does not match PostgreSQL",
                 category="publication_contract_error",
             )
         # 内存结果必须按发现顺序包含全部且仅包含 success 分类。
@@ -1012,7 +960,7 @@ class Database:
                 or len(collected_category_run.entries) != category_run.saved_item_count
             ):
                 raise PublicationError(
-                    "collected category totals do not match SQLite",
+                    "collected category totals do not match PostgreSQL",
                     category="publication_contract_error",
                 )
             if (
@@ -1022,7 +970,7 @@ class Database:
                 != category_run.finished_at
             ):
                 raise PublicationError(
-                    "collected category lifecycle does not match SQLite",
+                    "collected category lifecycle does not match PostgreSQL",
                     category="publication_contract_error",
                 )
             # raw_pages 必须覆盖连续目标页并累计到分类 total。
@@ -1038,7 +986,7 @@ class Database:
                 or collected_item_count != category_run.saved_item_count
             ):
                 raise PublicationError(
-                    "collected raw pages do not match SQLite progress",
+                    "collected raw pages do not match PostgreSQL progress",
                     category="publication_contract_error",
                 )
         # 零失败为 success；至少一个成功与任意数量分类失败为 partial_success。
@@ -1123,7 +1071,7 @@ class Database:
                     )
 
     def collection_snapshot(self, batch_id: str) -> BatchCollectionSnapshot:
-        """Read the current SQLite state for retrying a failed Manifest sync."""
+        """Read the current PostgreSQL state for retrying a failed Manifest sync."""
 
         with self.session_factory() as session:
             # 主键读取确保快照只属于调用方指定批次。
@@ -1151,7 +1099,7 @@ class Database:
     ) -> None:
         """Create one running task batch before the category-tree request."""
 
-        # SQLite 统一保存北京无时区墙上时间。
+        # PostgreSQL 统一保存北京无时区墙上时间。
         stored_planned_at = normalize_datetime(planned_at)
         # 批次开始时间与计划时间使用相同的存储规则。
         stored_started_at = normalize_datetime(started_at)
@@ -1303,7 +1251,7 @@ class Database:
             raise ValueError("discovery failure requires an error category")
         if (root_category_id is None) != (root_category_name is None):
             raise ValueError("root category id and name must be provided together")
-        # 失败时间按 SQLite 墙上时间保存。
+        # 失败时间按 PostgreSQL 墙上时间保存。
         stored_finished_at = normalize_datetime(finished_at)
         with self.session_factory.begin() as session:
             # 同一批次只能从 running 进入发现失败终态。
@@ -1341,12 +1289,12 @@ class Database:
         category_run_id: str,
         started_at: datetime,
     ) -> BatchCollectionSnapshot:
-        """Start one pending category while the batch remains in collection state."""
+        """Start a pending category or restart a failed Taobao category during collection."""
 
-        # SQLite 保存无时区的北京时间墙上时间。
+        # PostgreSQL 保存无时区的北京时间墙上时间。
         stored_started_at = normalize_datetime(started_at)
         with self.session_factory.begin() as session:
-            # 分类必须存在且仍处于尚未开始状态。
+            # 分类必须存在；只有淘宝失败分类允许从第一页重新采集。
             category_run = session.get(CategoryRun, category_run_id)
             if category_run is None:
                 raise RuntimeError("category run does not exist")
@@ -1356,7 +1304,17 @@ class Database:
                 raise RuntimeError("collection batch does not exist")
             if batch.status != "running":
                 raise RuntimeError("collection batch is not running")
-            if category_run.status != "pending":
+            if category_run.status == "failed" and batch.platform == "taobao":
+                # 补采从第一页开始；只移除失败尝试索引，原始文件已由编排归档。
+                session.execute(delete(RawResponse).where(RawResponse.category_run_id == category_run_id))
+                category_run.api_total = None
+                category_run.target_page_count = None
+                category_run.saved_page_count = 0
+                category_run.saved_item_count = 0
+                category_run.failed_page = None
+                category_run.error_category = None
+                category_run.finished_at = None
+            elif category_run.status != "pending":
                 raise RuntimeError("category run is not pending")
             # 一级分类并发时允许多个 running 分类；调度层保证每个一级组内顺序。
             # 状态与开始时间在同一事务中生效。
@@ -1386,7 +1344,7 @@ class Database:
             raise ValueError("api total cannot be negative")
         if target_page_count < 1:
             raise ValueError("target page count must be positive")
-        # 页面采集时间使用与其他运行时间相同的 SQLite 规则。
+        # 页面采集时间使用与其他运行时间相同的 PostgreSQL 规则。
         stored_captured_at = normalize_datetime(raw_page.captured_at)
         with self.session_factory.begin() as session:
             # 公共 helper 同时校验分类和父批次仍为 running。
@@ -1458,7 +1416,7 @@ class Database:
             raise ValueError("api total cannot be negative")
         if target_page_count < 1:
             raise ValueError("target page count must be positive")
-        # 成功时间统一转换为 SQLite 墙上时间。
+        # 成功时间统一转换为 PostgreSQL 墙上时间。
         stored_finished_at = normalize_datetime(finished_at)
         with self.session_factory.begin() as session:
             # 分类和批次都必须仍在运行。
@@ -1638,7 +1596,7 @@ class Database:
     ) -> BatchCollectionSnapshot:
         """Finalize a validated dry-run without official rows, CSV, or publication time."""
 
-        # dry-run 完成时间按 SQLite 北京墙上时间保存。
+        # dry-run 完成时间按 PostgreSQL 北京墙上时间保存。
         stored_finished_at = normalize_datetime(finished_at)
         try:
             with self.session_factory.begin() as session:
@@ -1654,7 +1612,7 @@ class Database:
                     )
                 # dry-run 永远不允许出现正式商品记录。
                 self._ensure_no_product_entries(session, category_runs)
-                # 最终状态完全由 SQLite 分类终态推导。
+                # 最终状态完全由 PostgreSQL 分类终态推导。
                 batch.status = final_status
                 batch.version = None
                 batch.csv_path = None
@@ -1680,7 +1638,7 @@ class Database:
         final_path: Path,
         published_at: datetime,
     ) -> bool:
-        """Confirm that SQLite durably owns the exact official publication."""
+        """Confirm that PostgreSQL durably owns the exact official publication."""
 
         with self.session_factory() as session:
             # 新事务只接受相同批次、版本、CSV 和发布时间的正式成功终态。
@@ -1719,7 +1677,7 @@ class Database:
         publication_ready_to_commit = False
         try:
             with self.session_factory.begin() as session:
-                # SQLite 分类终态决定 success 或 partial_success。
+                # PostgreSQL 分类终态决定 success 或 partial_success。
                 batch, category_runs, final_status = self._validate_collected_batch(
                     session,
                     collected_batch,
@@ -1784,21 +1742,32 @@ class Database:
             return publication_result
         except BaseException as error:
             # begin 边界可能在真实 commit 后收到中止，必须用新事务读取权威终态。
-            publication_committed = (
-                publication_ready_to_commit
-                and self._official_publication_is_committed(
-                    batch_id=collected_batch.batch_id,
-                    version=version,
-                    final_path=staged_csv.final_path,
-                    published_at=stored_published_at,
+            try:
+                # 网络提交结果不确定时先重新读取，不能把断网当作未提交。
+                publication_committed = (
+                    publication_ready_to_commit
+                    and self._official_publication_is_committed(
+                        batch_id=collected_batch.batch_id,
+                        version=version,
+                        final_path=staged_csv.final_path,
+                        published_at=stored_published_at,
+                    )
                 )
-            )
+            except Exception:
+                # 二次查询也失败时保留文件和数据库状态，交给恢复后的核对。
+                raise PublicationError(
+                    "publication outcome requires database verification",
+                    category="publication_unconfirmed",
+                ) from None
             if not publication_committed:
                 # 未提交或提交失败时补偿临时 CSV 和本次已经移动的最终 CSV。
                 _rollback_staged_csv_or_raise(staged_csv)
             if not isinstance(error, Exception):
-                # 进程级中止保留原始退出语义，由 runner 根据 SQLite 终态收口。
+                # 进程级中止保留原始退出语义，由 runner 根据 PostgreSQL 终态收口。
                 raise
+            if publication_committed:
+                # 普通连接错误发生在提交后且已核实成功时，返回已构造的结果。
+                return publication_result
             if isinstance(error, PublicationError):
                 raise
             raise PublicationError(
@@ -1813,7 +1782,7 @@ class Database:
     ) -> PublishedBatch | None:
         """Return the latest officially published version for one planned task."""
 
-        # 查询时间使用与入库一致的 SQLite 墙上时间。
+        # 查询时间使用与入库一致的 PostgreSQL 墙上时间。
         stored_planned_at = normalize_datetime(planned_at)
         with self.session_factory() as session:
             # published_at 非空是唯一正式发布判定，包含 partial_success。
@@ -1840,7 +1809,7 @@ class Database:
     def next_version(self, task_id: str, planned_at: datetime) -> int:
         """Allocate the next immutable publication version."""
 
-        # 查询时间使用与入库一致的 SQLite 墙上时间。
+        # 查询时间使用与入库一致的 PostgreSQL 墙上时间。
         stored_planned_at = normalize_datetime(planned_at)
         with self.session_factory() as session:
             # publishing 也会暂时占用版本，崩溃恢复在阶段五负责释放。
@@ -1885,7 +1854,7 @@ class Database:
     ) -> str | None:
         """Persist one Scheduler-only terminal batch without runtime artifacts."""
 
-        # 计划时间和记录时间统一保存为 SQLite 墙上时间。
+        # 计划时间和记录时间统一保存为 PostgreSQL 墙上时间。
         stored_planned_at = normalize_datetime(planned_at)
         stored_recorded_at = normalize_datetime(recorded_at)
         # Scheduler-only 批次使用独立 UUID，可被日志和 status 稳定引用。
@@ -1999,7 +1968,7 @@ class Database:
     ) -> None:
         """Upsert one task checkpoint after all due occurrences are handled."""
 
-        # 检查时间按 SQLite 统一墙上时间保存。
+        # 检查时间按 PostgreSQL 统一墙上时间保存。
         stored_checked_at = normalize_datetime(checked_at)
         with self.session_factory.begin() as session:
             # 主键存在时原地推进，不存在时初始化。

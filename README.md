@@ -1,5 +1,7 @@
 # 抖音电商罗盘榜单采集器
 
+
+当前数据库运行时只支持 PostgreSQL；先阅读 [PostgreSQL 本地运行与 RDS 接入](docs/PostgreSQL迁移与运行.md)。历史 SQLite 不导入新库，采集运行仅使用 PostgreSQL。
 这是一个本地 macOS/Windows 工程：使用独立 Chrome Profile 保存人工登录态，通过真实 Chrome 页面点击、滚动和响应监听采集商品榜单。榜单采集不使用 Cookie 重放 HTTP 接口。淘宝可在独立 Profile 内额外备份会话 Cookie，用于浏览器重启时恢复；通知和部署查询仍使用各自的网络客户端。
 
 默认任务为个护家清实时榜，只循环 `industry_id=5` 下的全部三级分类，页面选择实时榜（`date_type=1`），品牌不限（`brand_type=-1`）、price_bin=不限。支持指定分类列表及 `all_level1` 自动发现；设置 `category_scope.industry_id` 时限定行业，未设置时发现所有行业。排除“全部”，忽略四级及更深节点。任务、分类和分页全部串行执行，页面操作间隔为 0.5～1 秒，超时后有限恢复重试；平台连续三次返回 `11001` 时安全停止本批。
@@ -10,7 +12,7 @@
 
 - 手动登录和登录态持久化；
 - 手动正式采集、`--dry-run`、`--force`；
-- SQLite + Alembic、CSV、原始响应和 Manifest；
+- PostgreSQL + SQLAlchemy + Alembic、CSV、原始响应和 Manifest；
 - JSONL 日志、失败截图和脱敏诊断材料；
 - APScheduler 北京时间定时运行、同日宽限补采、跨天 `missed`；
 - PySide6 本地控制台、实时进度、安全日志和 Chrome 生命周期控制；
@@ -41,9 +43,7 @@ make schedule PLATFORM=tb ACTION=install   # 安装并启动所选平台服务
 make schedule PLATFORM=tb ACTION=status    # 查看所选平台服务
 make schedule PLATFORM=tb ACTION=uninstall # 卸载所选平台服务
 make notify PLATFORM=tb           # 真实发送淘宝钉钉测试消息
-make web PLATFORM=tb              # 本地网站开发，首屏淘宝
-make web PLATFORM=tb ACTION=build # 构建首屏为淘宝的网站
-make check PLATFORM=tb            # 后端/前端测试及所选平台服务检查
+make check PLATFORM=tb            # 后端测试及所选平台服务检查
 make check PLATFORM=tb ACTION=test # 仅完整后端测试
 ```
 
@@ -63,7 +63,7 @@ make start START=no NOTIFY=no       # 同时打开两个GUI，等待手动开始
 
 运行中关闭GUI只需确认一次：本窗口的采集、Chrome及自有Scheduler收尾后自动退出，另一平台继续运行。正在执行的请求会在完成或超时后响应中止；退出保留登录Profile，不发布本次未完成数据。
 
-登录、采集、状态、清理及调度共用所选平台配置。tt默认 `config/tasks.yaml`；tb在本机验收配置存在时使用 `runtime/acceptance/taobao/2026-10-01/full-root-config.yaml`，保持已登录Profile和数据库，否则使用可分发的 `config/taobao.yaml` 全量配置。可通过 `CONFIG=...` 覆盖，但平台及TASK归属仍校验。运行解释器统一为 `.venv/bin/python`，可通过 `PYTHON=...` 覆盖。
+登录、采集、状态、清理及调度共用所选平台配置。tt默认 `config/tasks.yaml`；tb默认 `config/taobao.yaml` 全量配置。可通过 `CONFIG=...` 覆盖，但平台及TASK归属仍校验。运行解释器统一为 `.venv/bin/python`，可通过 `PYTHON=...` 覆盖。
 
 `NOTIFY=yes|no` 控制本次采集/调度/通知测试，不修改.env；Webhooks及加签密钥继续从本机.env读取。后台服务仅存布尔开关，不保存凭证。网页分别使用 `TT_WEB_DATA_INDEX_URL`、`TB_WEB_DATA_INDEX_URL`，可显式覆盖公开索引；公开站未设置初始平台时仍默认抖音。
 
@@ -80,11 +80,11 @@ make run PLATFORM=tt
 
 每个平台内部仍串行采集。GUI、采集和调度分别使用 `runtime/locks/<platform>/` 下的锁；日志和控制文件分别写入 `runtime/logs/<platform>/`、`runtime/controls/<platform>/`。停止或关闭一个窗口不操作另一个平台。Chrome保留检查期仍持有本平台采集锁。
 
-多平台配置必须在 `platforms.<id>.database_path` 声明独立数据库，单平台旧配置可继续使用顶层 `database.path`。规范化后的数据库或Profile路径重复会拒绝启动；数据库通过 `runtime_platform` 元数据登记唯一归属，跨平台复用及混合历史数据库均拒绝，不自动拆分或清理。迁移只在升级前备份，原数据库、CSV和登录态路径保留。
+多平台配置使用 `platforms.<id>.database_env` 引用各自 PostgreSQL 连接环境变量，顶层 `database.url_env` 用于单平台默认连接。数据库通过 `runtime_platform` 登记唯一归属；环境变量不同但指向同一个数据库时，第二个平台也会被拒绝。Profile 仍按本地规范化路径隔离。旧 SQLite 不再用于采集或升级；新库通过独立 PostgreSQL 基线从空库创建。
 
 升级前关闭旧版本GUI、采集和Scheduler。检测到旧全局锁仍被占用时，新版本提示 `legacy_gui`、`legacy_collection` 或 `legacy_scheduler` 并拒绝启动，不终止旧进程。旧CLI按明确平台、任务所属平台或唯一启用平台解析；多平台歧义需要 `--platform`，清理始终必填该参数。
 
-实际回归、并行试采、发布通知结果及GUI验收限制见[双平台独立运行验收](docs/双平台独立运行验收.md)。
+普通回归、受控浏览器测试、真实平台采集与发布通知分别验证；合成测试数据不能作为真实采集验收证据。
 
 下面仍保留完整CLI，方便排查具体执行链路。
 
@@ -113,8 +113,32 @@ uv run --frozen python -m compass_collector --help
 
 主配置位于 `config/tasks.yaml`，GUI 只读展示平台、Profile、任务范围及执行状态，不提供配置编辑器。未知平台、缺失主任务、重复任务 ID、重复分类组合和无效配置在启动 Chrome 前报错；行业归属错误或不存在的分类，在当次分类发现阶段使整个任务失败。
 
+分类黑名单在**当前运行使用的配置文件**中，通过 `platforms.<平台>.category_blacklist` 维护，同一平台的所有任务共用，默认 `[]` 不跳过任何分类。例如，在已有 `platforms.compass` 下加入 `category_blacklist: ["分类甲", "分类乙"]`，只跳过抖音的这些分类；淘宝单独维护 `platforms.taobao.category_blacklist`。
+
+名单与当次发现的分类路径中各层级名称去掉首尾空白后精确匹配，不匹配子串；父级命中时，其下待采分类全部跳过，同平台不同路径下的同名分类也均跳过。重复名称自动去重，空名称或非字符串配置报错。自动发现与指定分类模式都应用黑名单：先完成平台分类校验，再过滤并创建待采分类；跳过项不请求榜单、不计入待采总数、不参与失败补采。保留分类按原有顺序从 1 重新编号。原始分类树、批次配置快照和 `category_blacklisted` 日志保留核对依据。
+
+若所有分类均被过滤，本批次以 `failed / category_blacklist_empty` 结束，不创建分类运行、不发布 CSV 或网站快照。使用当前代码的 GUI 每次点击开始会重新读取 YAML；常驻 Scheduler 需重启以读取更新，正在运行的批次保持原配置。代码更新后仍需重启旧进程。`make run PLATFORM=tb` 默认使用 `config/taobao.yaml`，抖音默认使用 `config/tasks.yaml`；显式传入 `CONFIG=...` 时需编辑对应 YAML，不同配置文件的黑名单不会自动合并。
+
+淘宝正式任务保留“洗护清洁剂/卫生巾/纸/香薰”主根，同时追加“家庭/个人清洁工具”下的“卫浴/置物用具、家务/地板清洁用具、个人洗护清洁用具”三个二级分支的全部三级分类，不包含“男士理容工具”。追加范围在同一任务、批次和发布快照中处理，并共用淘宝黑名单与失败补采规则。每次按当次分类树动态展开；以下 ID 已从历史真实分类树核对，实时数量以本次发现结果为准：
+
+```yaml
+category_scope:
+  mode: all_level1
+  root_category_id: "50025705"
+  additional_roots:
+    - root_category_id: "50016348"  # 家庭/个人清洁工具
+      level2_category_ids:
+        - "2132"      # 卫浴/置物用具
+        - "50003949"  # 家务/地板清洁用具
+        - "50009146"  # 个人洗护清洁用具
+  target_level: 3
+  exclude_all: true
+```
+
+先采主根，再按追加根和二级 ID 的配置顺序展开，分支内保留接口顺序。追加根必须唯一，二级 ID 必须直属该根；不存在、层级不符、重复或无三级分类时整个分类发现报错，不静默少采。多个根的批次根字段为空，各分类保留完整路径和真实根 ID。`additional_roots` 仅用于 `all_level1` 模式，不能与 `selected` 三级名单混用；两分类 PoC 配置继续只采原有香薰蜡烛、香薰精油。
+
 - `browser`：共享 Chrome 参数；
-- `platforms.<id>.database_path`：多平台独立数据库；
+- `platforms.<id>.database_env`：独立 PostgreSQL 连接环境变量；
 - `platforms.<id>.profile_dir`：每个平台独立 Profile；罗盘复用 `runtime/browser-profile`；
 - `collection`：页面动作超时、响应超时、采集间隔、有限重试及人工等待；
 - `tasks`：任务 ID、平台、启停、名称、每日时间、分类、筛选与日期；
@@ -282,7 +306,7 @@ launchd 标准输出和错误输出写入 `/dev/null`；业务运行状态统一
 ```text
 runtime/
 ├── browser-profile/    # 登录凭证，敏感
-├── data/collector.db   # SQLite 审计与正式数据
+├── taobao-browser-profile/ # 淘宝独立登录凭证，敏感
 ├── exports/            # CSV，按日期/task_id 隔离并长期保留
 ├── raw/                # gzip 原始响应，默认 30 天
 ├── logs/               # JSONL，默认 10 天
@@ -324,7 +348,7 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 4. 执行 `login` 并人工登录；
 5. 从 `.env.example` 创建 `.env`，填入当前有效凭证并执行 `make notify PLATFORM=tt`；
 6. 执行 `make run PLATFORM=tt START=no`，检查单窗口、最近日志、通知和 Scheduler 状态；
-7. 执行一次 GUI `dry-run`，核对动态三级分类数量、完整分页、SQLite/raw 审计和批次汇总；
+7. 执行一次 GUI `dry-run`，核对动态三级分类数量、完整分页、PostgreSQL/raw 审计和批次汇总；
 8. 执行 GUI 正式 `run`，核对 `published_at`、中文 8 列 CSV、打开文件和关闭 Chrome；
 9. 前台启动 Scheduler 并用 Ctrl-C 停止；
 10. 先执行 launchd `--dry-run`；
@@ -336,36 +360,34 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 - 云主机和 systemd；
 - 重试策略与 Scheduler 逻辑后续重新梳理；
 - [ ] 分类级补录：针对失败或缺失分类，从第一页完整重采，按本次接口排名生成新版本；保留原版本及分类来源、采集时间，不按商品或缺失页插入旧榜单。版本合并与发布规则、排名变化验收待设计；
-- 以 SQLite 权威状态重建 Manifest 和 raw 索引的崩溃恢复；
+- 以 PostgreSQL 权威状态重建 Manifest 和 raw 索引的崩溃恢复；
 - 以更多平台的页面和字段契约验证适配器扩展；
 - 多主机独立运行与监控；
 - 其他榜单 Adapter。
 
 当前 `normal` 模式仍为：同一任务、同一计划时间已有正式发布结果（含部分成功）则跳过；否则创建新批次完整重采。分类级补录尚未实现，不作为 `normal` 的现有行为。
 
-## 浏览器改造与历史兼容
+## 采集调用链与数据契约
 
-调用链为 CLI / GUI / Scheduler → 任务配置及幂等锁 → 平台适配器 → 分类发现与校验 → 页面响应采集 → 分页审计与完整性校验 → SQLite / CSV 协调发布 → OSS、网站及通知。
+调用链为 CLI / GUI / Scheduler → 任务配置及幂等锁 → 平台适配器 → 分类发现与校验 → 页面响应采集 → 分页审计与完整性校验 → PostgreSQL / CSV 协调发布 → OSS、网站及通知。
 
 `platforms/contracts.py` 规定 `open_session`、`discover_scopes`、`collect_scope`、`close`。共享编排不持有页面对象、不解析罗盘响应和请求参数；罗盘导航、选择器、日期匹配、错误码及原始指标换算集中在适配器。共享金额为实际人民币元 `CNY`、件数为实际件 `count`，导出器只负责展示。
 
-Alembic `0005_platform_capture` 增加平台标识、任务配置快照、通用分类路径、平台元数据和安全请求参数，迁移旧金额/件数单位。升级已有数据库前使用 SQLite backup 保存完整已提交状态，包括 WAL。旧记录归属罗盘，无法还原的请求范围标记为未知，不套用新配置。历史 raw、CSV、Manifest 保持原路径可读；新 raw、artifacts、exports 按平台和任务隔离，保留策略同时兼容旧日期目录和新平台目录。
+数据库仅执行 `migrations_postgresql/` 中的 Alembic 迁移。raw、artifacts、exports 按平台、日期和任务隔离，批次保存任务配置、分类路径和安全请求参数快照。
 
 网站不可变快照与 `latest.json` 位于 `<public_prefix>/<platform>/<task_id>/`。只有配置主任务更新兼容根 `<public_prefix>/latest.json`，其他任务不覆盖当前网页。现有网页字段和展示保持兼容。
 
-真实 Chrome 的可控页面回归单独运行：`RUN_BROWSER_TESTS=1 uv run --frozen python -m pytest tests/test_compass_browser.py`。普通自动化测试、可控浏览器测试和真实平台验收分别记录，见 `docs/浏览器改造验收.md`。
+真实 Chrome 的可控页面回归单独运行：`RUN_BROWSER_TESTS=1 uv run --frozen python -m pytest tests/test_compass_browser.py`。普通自动化测试、可控浏览器测试和真实平台验收应分别记录，不能互相替代。
 
-## 淘宝接入与网站平台切换（开发中）
+## 淘宝采集
 
-四阶段范围、验收条件和剩余真实验证见 `docs/淘宝平台开发执行方案.md`。阶段记录放在 `runtime/acceptance/taobao/`；受控测试中的合成数据不代表真实账号采集结果。
-
-淘宝采集编排已实现响应归属、20条保持、有限恢复、跨午夜和共享 raw → SQLite → Manifest → CSV 链路；完整链路测试覆盖空榜、单页、多页、部分成功与全部失败。同类淘宝业务错误连续三个分类发生时停止批次，网络错误或成功分类会重置计数。平台工厂已接入 `TaobaoBrowserControls`，CLI、GUI 可使用独立 PoC 配置启动。2026-10-01 已完成香薰蜡烛与香薰精油两分类各15页、合计600条的真实 dry-run 和正式本地数据库/CSV验收；全根245分类的完整终态仍待验收。无法匹配控件时明确失败并保存本地截图。默认 `config/tasks.yaml` 仍仅运行抖音。
+淘宝采集编排包含响应归属、20条模式、跨午夜检查和共享 raw → PostgreSQL → Manifest → CSV 链路。普通分类失败继续首轮剩余分类，首轮结束后按下述规则补采。无法匹配控件时明确失败并保存本地截图。默认 `config/tasks.yaml` 仅启用抖音任务。
 
 淘宝独立 Profile 登录和两个目标分类的手动试采：
 
-淘宝全量采集统一使用 `make run PLATFORM=tb`，登录使用 `make login PLATFORM=tb`，状态使用 `make status PLATFORM=tb`。本机优先使用已认证的验收配置；其他机器使用 `config/taobao.yaml` 并在该独立Profile重新登录。两分类PoC可用 `make run PLATFORM=tb CONFIG=config/taobao-poc.yaml MODE=dry-run NOTIFY=no`，此时范围和Profile都由PoC配置决定。
+淘宝全量采集统一使用 `make run PLATFORM=tb`，登录使用 `make login PLATFORM=tb`，状态使用 `make status PLATFORM=tb`。默认使用 `config/taobao.yaml`；首次运行在该平台独立 Profile 中登录。两分类PoC可用 `make run PLATFORM=tb CONFIG=config/taobao-poc.yaml MODE=dry-run NOTIFY=no`，此时范围和Profile都由PoC配置决定。
 
-主配置 `config/tasks.yaml` 中的淘宝任务仍为 `enabled: false`，不自动加入抖音调度。独立全量配置声明根 `50025705`、实时、20条和全部三级分类；通过显式tb入口启动，新增入口不代表全根真实验收已通过。
+主配置 `config/tasks.yaml` 中的淘宝任务仍为 `enabled: false`，不自动加入抖音调度。独立全量配置采集根 `50025705` 下的三级分类，并加入“家庭/个人清洁工具”下“卫浴/置物用具”“家务/地板清洁用具”“个人洗护清洁用具”三个二级类目的三级分类；使用实时、20条模式，再按平台黑名单排除同名分类。通过显式tb入口启动，范围配置不代表真实全量验收已通过。
 
 淘宝平台配置启用 `webdriver_compatibility: true`，在第一次导航及子 frame 页面脚本之前覆盖 `Navigator.prototype.webdriver` 的 getter，与已成功人工登录的工作树方式一致，不新增 `navigator` 实例属性。抖音默认关闭此兼容方式。该设置不保证其他自动化信号不可见，也不迁移另一工作树的登录态；相同相对 Profile 路径在不同工作树中实际是两个目录。
 
@@ -375,38 +397,28 @@ Alembic `0005_platform_capture` 增加平台标识、任务配置快照、通用
 
 真实单页榜（例如香氛贴11条）不显示活动页码；控制器仅在接口确认总数不超过20、且请求是第一页时允许页码控件缺失，同时仍确认20条模式。多页榜继续逐页确认活动页码与实际请求身份。
 
-多页榜收到匹配响应后，如果活动页码确认失败，会丢弃该次响应，在 `collection.network_retry_attempts` 限制内重新进入当前分类并翻到尚未保存的页；已经保存的页不会重复写入。恢复后仍需确认分类、20条模式、请求页码和分类总数，超过恢复次数则终止并保留浏览器供检查。
+淘宝每页只执行一次采集动作，不进行页内重试。请求超时、页面控件异常或数据契约失败会记录为分类失败，然后继续首轮剩余分类。全部分类首轮结束后，只补采仍失败的分类，最多两轮；每次从第一页重新采集，成功分类不重复采集。旧页和失败材料归档在批次的 `categories/attempts/<分类运行ID>/<补采轮数>/` 与对应故障目录，数据库和 Manifest 只索引新尝试。补采结束后统一汇总、发布和通知。`collection.network_retry_attempts` 仅影响罗盘页内重试，不再影响淘宝。登录失效、停止和跨天仍终止任务。接口成功且总数为 0、列表为空的分类按成功处理，不参与补采；未确认的空响应结构仍需真实响应证据。
 
 `login` 命令保持窗口直到在终端按 Enter，正常关闭时保存登录态。`run` 的窗口在任务结束或失败后按 `browser.keep_open_after_manual_run` 控制是否保留；手动 PoC 默认 `true`，检查结束后按 Enter 或通过 GUI 关闭。该选项不用于无人值守 Scheduler；自动验收配置可显式设为 `false`，有限诊断脚本也会在取证完成后释放浏览器。淘宝长分类名会在菜单文本中缩写，控制器在对应第三列使用完整 `title` 精确匹配，并拒绝多个同名目标。
 
-分类点击返回超时不一定表示点击未生效。适配器只在已识别的分类点击超时后继续等待同一动作代次的完整匹配响应；响应通过分类、日期、页码、20条和可见页面状态校验后才接受。没有匹配响应时保留原步骤、异常类型及截图，按配置次数重建页面，达到上限后停止。不会在原页面盲目重复点击。淘宝分类内重复商品不算失败，按原排名位置保留，不去重；条数、完整分页和排名连续性仍严格校验。罗盘继续保持原商品唯一性要求。
+分类点击返回超时不一定表示点击未生效。适配器只在已识别的分类点击超时后继续等待同一动作代次的完整匹配响应；响应通过分类、日期、页码、20条和可见页面状态校验后才接受。没有匹配响应时保留原步骤、异常类型及截图，结束当前分类尝试，由首轮完成后的分类补采统一处理。不会在原页面盲目重复点击。淘宝分类内重复商品不算失败，按原排名位置保留，不去重；条数、完整分页和排名连续性仍严格校验。罗盘继续保持原商品唯一性要求。
 
 ```bash
 uv run --frozen python -m compass_collector login --config config/taobao-poc.yaml --platform taobao
 DINGTALK_ENABLED=false uv run --frozen python -m compass_collector run --config config/taobao-poc.yaml --task taobao_household_cleaning_realtime --no-gui --dry-run
 ```
 
-PoC 配置的数据库为 `runtime/data/taobao-poc.db`，登录目录为 `runtime/taobao-browser-profile`，不复用内置浏览器的登录。首次需在程序打开的 Chrome 中完成正常登录。`--dry-run` 用于采集验收，不发布正式商品数据；命令中的 `DINGTALK_ENABLED=false` 仅为本次进程禁用汇总通知，不修改 `.env`；不要用 PoC 配置启动 Scheduler。两目标分类必须由当次真实分类树解析成功，控件与完整请求参数必须同时通过验证。
+PoC 配置通过 `TAOBAO_POC_DATABASE_URL` 连接独立 PostgreSQL 数据库，登录目录为 `runtime/taobao-browser-profile`，不复用内置浏览器的登录。首次需在程序打开的 Chrome 中完成正常登录。`--dry-run` 用于采集验收，不发布正式商品数据；命令中的 `DINGTALK_ENABLED=false` 仅为本次进程禁用汇总通知，不修改 `.env`；不要用 PoC 配置启动 Scheduler。两目标分类必须由当次真实分类树解析成功，控件与完整请求参数必须同时通过验证。
 
-网站默认抖音，桌面和移动均可切换淘宝。切换重置关键词、分类、数值条件、排序、分页及移动展开。淘宝展示支付买家数、访客数原始区间和商品接口提供的跳转链接；筛选和排序按人数下界计算，未知指标保持空值，排序时置后。淘宝没有首次上榜字段，因此隐藏该筛选与标记。接口商品、店铺名称中的 HTML 实体仅在前端解码一次供文本展示和搜索；原始响应、数据库、CSV 和公开快照保留来源原文。
+采集器向独立网站交付不可变快照和 `latest.json`。带有 `product_id`、`source_record_id` 的正式快照使用 v4；兼容调用未提供商品身份时仍输出只读 v3。网站交互和部署由独立 mall-web 工程维护。
 
-原 `VITE_DATA_INDEX_URL` 继续指向抖音公开索引。淘宝使用 `VITE_TAOBAO_DATA_INDEX_URL`，例如 `<公开前缀>/taobao/taobao_household_cleaning_realtime/latest.json`。本地可配置在仓库根 `.env`，GitHub Pages 构建读取同名 Repository variables；不能填写 Cookie、token 或私有签名下载链接。未配置淘宝地址时界面显示提示，仍可切回抖音。
-
-新公开快照版本为 3，包含平台、任务、批次、采集开始/结束时间；前端继续兼容抖音版本 1、2，历史缺图片使用占位。数据库 `0006_taobao_metrics` 在保留抖音历史值的基础上增加淘宝独立指标与链接。已有数据库升级前继续备份；有淘宝扩展数据时，迁移拒绝直接降级，避免静默丢失字段。
-
-验证命令：
+采集端验证命令：
 
 ```bash
-.venv/bin/python -m pytest -q
-npm ci --prefix web
-npm test --prefix web
-npm run build --prefix web
+TEST_DATABASE_URL='postgresql+psycopg://collector:collector_local@127.0.0.1:55432/collector_test' \
+QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q
 ```
 
-前端状态测试使用 Node 自带测试运行器、现有 TypeScript 编译器及 jsdom，不启动用户浏览器。它覆盖加载/错误/空榜、未配置地址、平台切换重置和晚到请求；布局、滚动实际效果与线上部署需另外验收。
+## 工程职责
 
-本地网页验收可使用 `scripts/taobao_web_preview.py`。脚本只写入 runtime 独立目录并绑定 `127.0.0.1`，不读取 Profile、完整原始响应或 OSS 凭据。默认生成合成数据：构建时将两平台 VITE 索引分别指向 `http://127.0.0.1:5175/data/compass/compass_preview/latest.json` 和 `http://127.0.0.1:5175/data/taobao/taobao_preview/latest.json`，复制 `web/dist/` 到脚本的 `--root`，再运行 `PYTHONPATH=src .venv/bin/python scripts/taobao_web_preview.py --serve`。合成产物不能用来更新正式公开网站。
-
-对照真实已发布CSV时，成对传入 `--compass-manifest <抖音Manifest路径>` 与 `--taobao-manifest <淘宝Manifest路径>`，并指定独立 `--root`。脚本要求每个平台各一个成功或部分成功的正式批次，读取Manifest引用的CSV，保留实际批次、任务、分类计数和采集窗口；localhost索引中的任务ID也改为实际任务ID，构建配置须对应调整。该模式仍只生成本地预览，不上传OSS。2026-10-01 的真实600条淘宝、5000条抖音桌面/移动浏览器验收已通过；同一淘宝批次已实际发布到自己的 OSS 索引，[线上网站](https://linshengcong.github.io/) 的桌面/移动切换、实际图片、跳转链接、指标和采集窗口已验证。证据在本地 runtime 验收目录，具体批次范围与全根验收分别记录。
-
-空榜验收添加 `--taobao-state empty`，加载失败验收添加 `--taobao-state error`（仅本地淘宝索引返回503）。未配置验收使用明确为空的 `VITE_TAOBAO_DATA_INDEX_URL` 构建。为各场景指定独立 `--root` 保存构建和截图；验收结束后恢复标准构建，不把localhost地址带入发布产物。
+本项目负责 RPA 采集、调度、原始材料、PostgreSQL 持久化、CSV 与 OSS 快照发布及通知。网站源码在独立 mall-web 工程，选品 API 在独立 mall-server 工程；本项目不包含前端构建、部署或业务 API。采集器通过 `WEB_SITE_URL` 通知固定网站入口。

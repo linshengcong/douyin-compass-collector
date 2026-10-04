@@ -1,4 +1,4 @@
-"""Synthetic Taobao response → transactional SQLite → platform CSV checks."""
+"""Synthetic Taobao response → transactional PostgreSQL → platform CSV checks."""
 
 import csv
 from dataclasses import replace
@@ -35,14 +35,10 @@ def test_taobao_publication_preserves_source_and_missing_values(tmp_path):
             version=1, batch_id=collected.batch_id, category_runs=collected.category_runs, platform="taobao",
         )
         database.publish_collected_batch(collected, 1, staged, PUBLISHED_AT)
-        # 回到有真实淘宝商品/店铺的旧版后重新升级，验证平台回填和外键保留。
-        database.close()
-        migration_config = Config("alembic.ini")
-        migration_config.set_main_option("sqlalchemy.url", str(database.engine.url))
-        command.downgrade(migration_config, "0006_taobao_metrics")
-        upgrade_database(tmp_path / "runtime" / "data" / "collector.db")
+        # 重复迁移必须保留已正式发布的排名和关联。
+        upgrade_database(database.engine.url)
         with database.session_factory() as session:
-            # 从 SQLite 读取而非仅检查内存，证明空值与原始区间完整落库。
+            # 从 PostgreSQL 读取而非仅检查内存，证明空值与原始区间完整落库。
             product = session.scalar(select(ProductRankEntryModel))
             shop = session.scalar(select(ProductRankEntryShopModel))
             assert product.platform == "taobao" and shop.entry_id == product.id

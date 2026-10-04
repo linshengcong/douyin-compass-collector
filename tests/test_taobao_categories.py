@@ -78,3 +78,92 @@ def test_scope_configuration_is_strict(selection):
     """Reject unsupported scope settings without opening Chrome."""
     with pytest.raises(ValidationError):
         TaobaoCategoryScopeConfig(**selection)
+
+
+def additional_root_payload():
+    """构造含目标三分支和额外兄弟分支的合成分类树，避免依赖真实数据。"""
+    # 每个目标分支都有三级节点，另保留一个未配置的男士理容分支。
+    payload = deepcopy(TREE)
+    payload["data"].extend([
+        [0, 50016348, "家庭/个人清洁工具", 1],
+        [50016348, 2132, "卫浴/置物用具", 2],
+        [2132, 9101, "浴帘", 0],
+        [2132, 9102, "皂盒", 0],
+        [50016348, 50003949, "家务/地板清洁用具", 2],
+        [50003949, 9201, "拖把 > 平板拖把", 0],
+        [50016348, 50009146, "个人洗护清洁用具", 2],
+        [50009146, 9301, "浴帽", 0],
+        [50016348, 9400, "男士理容工具", 2],
+        [9400, 9401, "理容工具", 0],
+        [9101, 9501, "不采四级", 0],
+    ])
+    return payload
+
+
+def test_additional_root_keeps_main_scope_and_only_selected_branches():
+    """跨根追加保持主根、分支顺序、完整路径和连续编号，不扩展到兄弟分支。"""
+    # 故意与树顺序不同，验证追加分支严格按配置顺序展开。
+    selection = TaobaoCategoryScopeConfig(additional_roots=[{
+        "root_category_id": "50016348", "level2_category_ids": ["50009146", "2132"],
+    }])
+    # 正式解析器处理完整合成树，不能靠固定的已解析对象绕过归属验证。
+    result = parse_category_tree(additional_root_payload(), selection)
+    assert result.root_category_id is None and result.root_category_name is None
+    assert [scope.key for scope in result.categories] == ["50021853", "216502", "9301", "9101", "9102"]
+    assert [scope.discovery_order for scope in result.categories] == [1, 2, 3, 4, 5]
+    assert result.categories[2].path == ("家庭/个人清洁工具", "个人洗护清洁用具", "浴帽")
+    assert result.categories[2].platform_metadata == {
+        "root_category_id": "50016348", "parent_cate_id": "50009146",
+        "cate_id": "9301", "cate_flag": "0",
+    }
+    assert selection == TaobaoCategoryScopeConfig.model_validate(selection.model_dump())
+
+
+@pytest.mark.parametrize("root_id,branch_id", [
+    ("123456", "2132"), ("2132", "9101"), ("50016348", "2165"),
+    ("50016348", "9101"), ("50016348", "123456"),
+])
+def test_additional_root_rejects_missing_or_wrong_level_scope(root_id, branch_id):
+    """根、二级分支和归属必须全部存在，禁止静默遗漏或误采。"""
+    # 只修改范围身份，保留其余正常分类以证明局部错误会阻断整个发现。
+    selection = TaobaoCategoryScopeConfig(additional_roots=[{
+        "root_category_id": root_id, "level2_category_ids": [branch_id],
+    }])
+    with pytest.raises(ResponseContractError) as caught:
+        parse_category_tree(additional_root_payload(), selection)
+    assert caught.value.category == "invalid_configured_category"
+
+
+@pytest.mark.parametrize("mutation", ["empty_branch", "duplicate_branch", "duplicate_leaf"])
+def test_additional_root_rejects_empty_and_ambiguous_branches(mutation):
+    """任一追加分支为空或身份歧义时不能只返回其他成功分支。"""
+    # 独立树副本只在本测试中注入无效节点。
+    payload = additional_root_payload()
+    if mutation == "empty_branch":
+        payload["data"] = [row for row in payload["data"] if row[0] != 2132]
+    elif mutation == "duplicate_branch":
+        payload["data"].append([50016348, 2132, "重复二级", 2])
+    else:
+        payload["data"].append([50009146, 9101, "重复三级", 0])
+    # 第二个有效分支不能掩盖第一个无效分支。
+    selection = TaobaoCategoryScopeConfig(additional_roots=[{
+        "root_category_id": "50016348", "level2_category_ids": ["2132", "50009146"],
+    }])
+    with pytest.raises(ResponseContractError):
+        parse_category_tree(payload, selection)
+
+
+@pytest.mark.parametrize("changes", [
+    {"additional_roots": [{"root_category_id": "50016348", "level2_category_ids": []}]},
+    {"additional_roots": [{"root_category_id": "50016348", "level2_category_ids": ["0"]}]},
+    {"additional_roots": [{"root_category_id": "50016348", "level2_category_ids": ["2132", "2132"]}]},
+    {"additional_roots": [{"root_category_id": "50025705", "level2_category_ids": ["2165"]}]},
+    {"additional_roots": [{"root_category_id": "50016348", "level2_category_ids": ["2132"]}] * 2},
+    {"mode": "selected", "targets": ["50021853"], "additional_roots": [
+        {"root_category_id": "50016348", "level2_category_ids": ["2132"]},
+    ]},
+])
+def test_additional_root_configuration_rejects_ambiguous_selections(changes):
+    """配置加载阶段拒绝重复根、重复分支和指定三级模式的混用。"""
+    with pytest.raises(ValidationError):
+        TaobaoCategoryScopeConfig(**changes)

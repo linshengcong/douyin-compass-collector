@@ -8,6 +8,18 @@ browser:
   keep_open_after_manual_run: true
 platforms:
   taobao:
+    # 指定分类试采同样应用黑名单；命中名称的目标分类会跳过。
+    category_blacklist:
+      - 私处护理
+      - 商务用品
+      - 商务清洁剂/用品
+      - 个护服务
+      - 头发清洁护理
+      - 头发清洁/护理/造型
+      - 其他
+      - 身体护理
+      - 口腔护理
+      - 卫生巾/经期用品
     profile_dir: runtime/taobao-browser-profile
     # 与已成功人工登录的工作树使用相同原型 getter 初始化方式。
     webdriver_compatibility: true
@@ -25,11 +37,12 @@ collection:
   response_timeout_seconds: 45
   scroll_settle_seconds: 1.5
   manual_auth_wait_seconds: 180
-  network_retry_attempts: 2
+  # 淘宝不使用页内重试；首轮后失败分类固定最多补采两轮。
+  network_retry_attempts: 0
 publication:
   web_primary_task_id: taobao_household_cleaning_realtime
 database:
-  path: runtime/data/taobao-poc.db
+  url_env: TAOBAO_POC_DATABASE_URL
 retention:
   raw_response_days: 30
   failure_artifact_days: 10

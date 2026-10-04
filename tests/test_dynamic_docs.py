@@ -43,7 +43,7 @@ def test_documents_use_only_the_current_dynamic_category_contract() -> None:
         "水饮冲调",
         "max_items",
         "collection_runs",
-        "不写 SQLite",
+        "不写 PostgreSQL",
         "最近成功 CSV",
         "6 列",
         "六列",

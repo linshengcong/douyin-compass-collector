@@ -1,0 +1,20 @@
+# 本地开发专用，仅暴露回环地址；RDS 使用环境变量中的独立连接地址。
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: collector
+      POSTGRES_PASSWORD: collector_local
+      POSTGRES_DB: compass
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - collector_postgres:/var/lib/postgresql/data
+      - ./scripts/init_postgres.sql:/docker-entrypoint-initdb.d/01-databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collector -d compass"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  collector_postgres:

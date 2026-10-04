@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from compass_collector.browser import open_browser
-from compass_collector.errors import AuthRequiredError, BrowserOperationError, CollectionInterruptedError, HttpRequestError, ResponseContractError
+from compass_collector.errors import AuthRequiredError, BrowserOperationError, CollectionInterruptedError, HttpRequestError, HttpResponseError, ResponseContractError
 from compass_collector.platforms.contracts import DiscoveryCapture, PageCapture
 from compass_collector.platforms.taobao_capture import TaobaoResponseCapture, read_completed_payload
 from compass_collector.platforms.taobao_categories import parse_category_tree
@@ -50,7 +50,7 @@ class TaobaoPageControls(Protocol):
 
 
 class TaobaoAdapter:
-    """Own serial capture, cancellation, finite restoration and full-rank checks."""
+    """Own serial capture, cancellation, fresh category attempts and full-rank checks."""
 
     def __init__(self, browser, collection, *, manual, controls: TaobaoPageControls, control=None):
         """Accept a page-control implementation without starting a browser."""
@@ -65,6 +65,8 @@ class TaobaoAdapter:
         self.page = None
         self.capture = None
         self.initialized = False
+        # 分类异常后的下一次采集必须重新进入榜单页面。
+        self.needs_reset = False
 
     def _check(self, business_date=None) -> None:
         """Keep both cooperative stop and midnight interruption at every boundary."""
@@ -163,7 +165,7 @@ class TaobaoAdapter:
         generation = self.capture.arm(params)
         try:
             # 分类点击可能已发出请求而click仍返回超时；先验证同一代次的响应，绝不重复点击。
-            # 没有完整匹配响应时保留原错误，交由有限页面重建处理。
+            # 没有完整匹配响应时保留原错误，交由分类补采处理。
             action_timeout = None
             try:
                 action()
@@ -194,74 +196,51 @@ class TaobaoAdapter:
         finally:
             self.capture.disarm()
 
-    def _capture_page(self, task, scope, business_date, page_no, *, restore, expected_total):
-        """Rebuild category and advance from page one only for a bounded recovery."""
-        self._initialize(task, business_date, restore=restore)
-        if page_no == 1 or restore:
-            # 恢复时先核验第一页总数，恢复页不交给 raw/SQLite 重复持久化。
-            payload, params = self._action(task, scope, business_date, 1,
-                                           lambda: self.controls.select_scope(self.page, scope))
-            validate_page_payload(payload, requested_page=1, expected_total=expected_total)
-            for restored_page in range(2, page_no + 1):
-                payload, params = self._action(task, scope, business_date, restored_page,
-                                               lambda: self.controls.next_page(self.page))
-                validate_page_payload(payload, requested_page=restored_page, expected_total=expected_total)
-            return payload, params
+    def _capture_page(self, task, scope, business_date, page_no):
+        """每页执行一次 UI 动作，不回放或即时重试失败页。"""
+        self._initialize(task, business_date)
+        if page_no == 1:
+            return self._action(task, scope, business_date, page_no,
+                                lambda: self.controls.select_scope(self.page, scope))
         return self._action(task, scope, business_date, page_no,
                             lambda: self.controls.next_page(self.page))
 
     def collect_scope(self, task, scope, business_date):
         """Yield validated pages and reject duplicate, missing or changing rankings."""
         self.open_session()
+        if self.needs_reset:
+            self._initialize(task, business_date, restore=True)
+            self.needs_reset = False
         # 分类状态独立，分类内总数冻结，更新时间不参与一致性校验。
         entries = []
         total = None
         target_pages = 1
         page_no = 1
-        while page_no <= target_pages:
-            for attempt in range(self.settings.network_retry_attempts + 1):
+        try:
+            while page_no <= target_pages:
+                # 每页只尝试一次；失败分类由批次在完整遍历后从第一页补采。
                 try:
-                    payload, params = self._capture_page(task, scope, business_date, page_no,
-                                                         restore=attempt > 0, expected_total=total)
-                    break
-                except AuthRequiredError:
-                    if not self.manual:
-                        raise
-                    # 每页最多一次人工恢复；恢复后仍鉴权失败直接终止，不能无限重试。
-                    self._authenticate()
-                    payload, params = self._capture_page(task, scope, business_date, page_no,
-                                                         restore=True, expected_total=total)
-                    break
-                except BrowserOperationError as error:
-                    # 已识别的下一页、活动页码/20条丢失或分类点击超时才允许有限重建。
-                    # 活动页码确认失败时丢弃该响应，重建分类并回放到尚未保存页，不直接接受错页。
-                    recoverable_step = (error.failed_step in {"taobao_next_page", "taobao_active_page", "taobao_page_size_lost"}
-                                        or (error.failed_step == "taobao_category_select"
-                                            and error.exception_type == "TimeoutError"))
-                    if (error.category != "browser_page_error"
-                            or not recoverable_step
-                            or error.exception_type not in {"RuntimeError", "TimeoutError"}
-                            or attempt == self.settings.network_retry_attempts):
-                        raise
-                    # 下一轮从正确分类第一页恢复到未完成页，已yield页绝不重新持久化。
-                    self._pump(2 ** attempt, business_date)
-                except (HttpRequestError, PlaywrightTimeoutError):
-                    if attempt == self.settings.network_retry_attempts:
-                        raise HttpRequestError("Taobao page retries exhausted", category="page_response_timeout")
-                    self._pump(2 ** attempt, business_date)
-            # 原始接口字段、页排名和跨页完整性仍使用已测试的淘宝解析器。
-            contract = validate_page_payload(payload, requested_page=page_no, expected_total=total)
-            total, target_pages = contract.api_total, contract.target_page_count
-            captured_at = datetime.now(TIMEZONE)
-            page_entries = tuple(parse_page_entries(payload, page_no=page_no, captured_at=captured_at))
-            self._check(business_date)
-            entries.extend(page_entries)
-            yield PageCapture(page_no, total, target_pages, captured_at, page_entries, payload, params)
-            page_no += 1
-            if page_no <= target_pages:
-                self._pump(random.uniform(self.settings.request_interval_seconds.min,
-                                          self.settings.request_interval_seconds.max), business_date)
-        validate_complete_ranking(entries, api_total=total)
+                    payload, params = self._capture_page(task, scope, business_date, page_no)
+                except PlaywrightTimeoutError as error:
+                    raise HttpRequestError("Taobao page timed out", category="page_response_timeout") from error
+                # 原始接口字段、页排名和跨页完整性仍使用已测试的淘宝解析器。
+                contract = validate_page_payload(payload, requested_page=page_no, expected_total=total)
+                total, target_pages = contract.api_total, contract.target_page_count
+                captured_at = datetime.now(TIMEZONE)
+                page_entries = tuple(parse_page_entries(payload, page_no=page_no, captured_at=captured_at))
+                self._check(business_date)
+                entries.extend(page_entries)
+                yield PageCapture(page_no, total, target_pages, captured_at, page_entries, payload, params)
+                page_no += 1
+                if page_no <= target_pages:
+                    self._pump(random.uniform(self.settings.request_interval_seconds.min,
+                                              self.settings.request_interval_seconds.max), business_date)
+            validate_complete_ranking(entries, api_total=total)
+        except (HttpRequestError, HttpResponseError, BrowserOperationError, ResponseContractError):
+            # 下一分类或补采前重新初始化页面，不在失败页即时重试。
+            self.initialized = False
+            self.needs_reset = True
+            raise
 
     def close(self) -> None:
         """Remove response listeners and close even a partially initialized session."""
@@ -277,3 +256,4 @@ class TaobaoAdapter:
                 self.page = None
                 self.capture = None
                 self.initialized = False
+                self.needs_reset = False

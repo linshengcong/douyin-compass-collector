@@ -1,4 +1,6 @@
-"""Platform-aware status and cleanup tests using real isolated SQLite relationships."""
+"""Platform-aware status and cleanup tests using real isolated PostgreSQL relationships."""
+
+from pg_support import pg_url
 
 import json
 from datetime import datetime, timedelta
@@ -26,7 +28,7 @@ def create_both_platforms(tmp_path):
     started = datetime(2026, 10, 2, 14)
     for index, platform in enumerate(("compass", "taobao")):
         from compass_collector.persistence import Database, upgrade_database
-        database_path = tmp_path / "runtime/data" / f"{platform}.db"
+        database_path = pg_url(tmp_path / "runtime/data" / f"{platform}.db")
         upgrade_database(database_path, platform=platform)
         database = Database(database_path)
         databases[platform] = database
@@ -58,10 +60,10 @@ def create_both_platforms(tmp_path):
             session.add(RawResponse(category_run_id=plans[0].category_run_id, page_no=1,
                                     path=str(tree), item_count=1, captured_at=started))
         database.set_scheduler_checkpoint(task_id, started)
-        for name in ("exports", "artifacts", "web-publication"):
+        for name in ("exports", "raw", "artifacts", "web-publication"):
             # 两个平台的现代目录，以及只有日期/task维度的历史目录。
             file = tmp_path / "runtime" / name / platform / "data.txt"
-            file.parent.mkdir(parents=True)
+            file.parent.mkdir(parents=True, exist_ok=True)
             file.write_text("synthetic")
         legacy = tmp_path / "runtime" / "exports" / "2026-10-02" / task_id / "old.csv"
         legacy.parent.mkdir(parents=True)
@@ -89,18 +91,18 @@ def test_platform_cleanup_preserves_other_platform_rows_files_profiles_and_logs(
     for file in preserved:
         file.parent.mkdir(parents=True, exist_ok=True)
         file.write_text("preserve")
-    # 调用真实加锁入口，SQLite文件应保留，所选批次被级联清除。
+    # 调用真实加锁入口，PostgreSQL文件应保留，所选批次被级联清除。
     # 另一平台同时调度及采集时，仍可清理自己的独立数据库与材料。
     other = "taobao" if platform == "compass" else "compass"
     other_scope = PlatformRuntime(tmp_path / "runtime", other)
     with other_scope.operation("scheduler"), other_scope.operation("collection"):
-        summary = clear_local_data_with_locks(tmp_path / "runtime", tmp_path / "runtime/data" / f"{platform}.db",
+        summary = clear_local_data_with_locks(tmp_path / "runtime", pg_url(tmp_path / "runtime/data" / f"{platform}.db"),
                                               platform=platform, task_ids=(f"{platform}_task",))
     assert summary.succeeded and summary.database_batches == 1 and summary.database_files == 0
     # 再打开同一个数据库验证另一平台每层关系完整及检查点不丢失。
     from compass_collector.persistence import Database
     other = "taobao" if platform == "compass" else "compass"
-    database = Database(tmp_path / "runtime/data" / f"{other}.db")
+    database = Database(pg_url(tmp_path / "runtime/data" / f"{other}.db"))
     try:
         with database.session_factory() as session:
             assert [batch.platform for batch in session.scalars(select(CollectionBatch))] == [other]
@@ -112,10 +114,11 @@ def test_platform_cleanup_preserves_other_platform_rows_files_profiles_and_logs(
         assert database.scheduler_checkpoint(f"{other}_task") is not None
     finally:
         database.close()
+    # 新数据库只拥有登记的批次路径，未登记的历史和另一平台文件必须保留。
     for name in ("exports", "raw", "artifacts", "web-publication"):
-        assert not (tmp_path / "runtime" / name / platform).exists()
+        assert (tmp_path / "runtime" / name / platform / "data.txt").exists()
         assert (tmp_path / "runtime" / name / other).exists()
-    assert not (tmp_path / "runtime/exports/2026-10-02" / f"{platform}_task").exists()
+    assert (tmp_path / "runtime/exports/2026-10-02" / f"{platform}_task" / "old.csv").is_file()
     assert (tmp_path / "runtime/exports/2026-10-02" / f"{other}_task" / "old.csv").is_file()
     assert all(file.read_text() == "preserve" for file in preserved)
 
@@ -129,7 +132,7 @@ def test_platform_cleanup_respects_running_collection_and_scheduler(tmp_path, lo
         database.close()
     with ProcessLock(PlatformRuntime(tmp_path / "runtime", "taobao").lock_path(role), role):
         with pytest.raises(RuntimeLockBusy):
-            clear_local_data_with_locks(tmp_path / "runtime", tmp_path / "runtime/data/taobao.db", platform="taobao")
+            clear_local_data_with_locks(tmp_path / "runtime", pg_url(tmp_path / "runtime/data/taobao.db"), platform="taobao")
     assert (tmp_path / "runtime/raw/taobao").is_dir()
 
 
@@ -144,7 +147,7 @@ def test_platform_cleanup_rejects_symlinked_parent_before_database_mutation(tmp_
     external.mkdir()
     root = tmp_path / "alias-runtime"
     root.mkdir()
-    (root / "web-publication").symlink_to(external, target_is_directory=True)
-    with pytest.raises(ValueError, match="outside runtime"):
-        clear_local_data_with_locks(root, root / "data/collector.db", platform="taobao")
+    (root / "raw").symlink_to(external, target_is_directory=True)
+    with pytest.raises(ValueError, match="outside runtime|symlink"):
+        clear_local_data_with_locks(root, pg_url(tmp_path / "runtime/data/taobao.db"), platform="taobao")
     assert (tmp_path / "runtime/raw/taobao").is_dir() and external.is_dir()

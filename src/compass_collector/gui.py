@@ -66,8 +66,13 @@ MAX_VISIBLE_EVENTS = 2000
 def category_scope_summary(task) -> str:
     """Display the selected platform's category contract without foreign fields."""
     if task.platform == "taobao":
-        return (", ".join(task.category_scope.targets)
-                or f"cateId={task.category_scope.root_category_id} 下全部三级分类")
+        # 主范围沿用旧展示，追加分支明确显示，避免跨根任务仍被描述为单根。
+        summary = (", ".join(task.category_scope.targets)
+                   or f"cateId={task.category_scope.root_category_id} 下全部三级分类")
+        for root in task.category_scope.additional_roots:
+            summary += (f"；追加 cateId={root.root_category_id} 下二级分类 "
+                        f"{', '.join(root.level2_category_ids)} 的全部三级分类")
+        return summary
     return (", ".join(f"{target.industry_id}:{target.category_id}"
                       for target in task.category_scope.targets)
             or (f"industry_id={task.category_scope.industry_id} 下全部三级分类"
@@ -108,7 +113,7 @@ def read_scheduler_event_file(
 class RunMode(str, Enum):
     """Represent stable manual collection modes shown in the GUI."""
 
-    # 正式采集会发布 SQLite 和 CSV。
+    # 正式采集会发布 PostgreSQL 和 CSV。
     OFFICIAL = "official"
     # 试运行只采集和校验，不发布正式数据。
     DRY_RUN = "dry_run"
@@ -124,7 +129,7 @@ class GuiLaunchRequest:
     task_id: str | None
     # auto_start 区分等待手动开始和启动后立即采集。
     auto_start: bool
-    # dry_run 保留 SQLite 审计，但不发布正式商品和 CSV。
+    # dry_run 保留 PostgreSQL 审计，但不发布正式商品和 CSV。
     dry_run: bool = False
     # force 对应忽略当天成功幂等记录的高级开关。
     force: bool = False
@@ -689,7 +694,7 @@ class CollectionWorker(QObject):
         super().__init__()
         # request 保存配置和任务入口，不包含认证值。
         self.request = request
-        # mode 决定是否发布正式商品和 CSV，dry-run 仍保留 SQLite 审计。
+        # mode 决定是否发布正式商品和 CSV，dry-run 仍保留 PostgreSQL 审计。
         self.mode = mode
         # force 只影响正式运行幂等版本分配。
         self.force = force
@@ -758,15 +763,15 @@ def _local_event(*, level: str, event: str, message: str, stage: str) -> dict[st
 
 
 def latest_published_csv(config: AppConfig, platform: str | None = None) -> Path | None:
-    """Return the newest existing formally published CSV from SQLite metadata."""
+    """Return the newest existing formally published CSV from PostgreSQL metadata."""
 
     # 查询入口也必须解析平台及数据库，不读取另一个平台的历史。
     platform = platform or config.execution_platform()
     config = config.for_platform(platform)
     # GUI 初次打开允许初始化数据库结构，但不会创建采集记录。
-    upgrade_database(config.database.path, platform=platform or config.execution_platform())
-    # 短生命周期查询避免 GUI 长期占用 SQLite 连接。
-    database = Database(config.database.path)
+    upgrade_database(config.database.url, platform=platform or config.execution_platform())
+    # 短生命周期查询避免 GUI 长期占用 PostgreSQL 连接。
+    database = Database(config.database.url)
     try:
         # 多取少量记录以跳过已经被人工移动的旧 CSV。
         status_rows = database.recent_status(limit=100, platform=platform) if platform else database.recent_status(limit=100)
@@ -1563,8 +1568,8 @@ class CollectorWindow(QMainWindow):
         # 确认文案显式列出删除与保留边界。
         answer = QMessageBox.question(
             self,
-            "确认清除本地采集数据",
-            "此操作不可恢复，仅删除当前平台的批次、CSV、原始响应和失败材料，保留另一平台数据、日志及登录态。\n\n确认继续吗？",
+            "确认清除当前平台采集数据",
+            "此操作不可恢复，将删除配置的 PostgreSQL 数据库中当前平台的批次及其本地产物，保留旧 SQLite 归档、另一平台数据、日志及登录态。\n\n确认继续吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1575,7 +1580,7 @@ class CollectorWindow(QMainWindow):
         try:
             cleanup_summary = clear_local_data_with_locks(
                 RUNTIME_ROOT,
-                self.config.database.path,
+                self.config.database.url,
                 platform=self.runtime_scope.platform, task_ids=tuple(task.id for task in self.config.tasks),
             )
         except RuntimeLockBusy:

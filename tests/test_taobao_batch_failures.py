@@ -29,7 +29,7 @@ class OutcomesAdapter:
         outcome = self.outcomes[scope.discovery_order - 1]
         if outcome is not None:
             raise outcome
-        # 成功夹在错误中时仍要经过真实共享 raw/SQLite 生命周期。
+        # 成功夹在错误中时仍要经过真实共享 raw/PostgreSQL 生命周期。
         payload = page_payload(total=1)
         entries = tuple(parse_page_entries(payload, page_no=1, captured_at=PLANNED_AT))
         yield PageCapture(1, 1, 1, PLANNED_AT, entries, payload, {"pageSize": 20, "page": 1})
@@ -54,18 +54,17 @@ def execute(outcomes):
     return prepared, task, adapter, database, logger, storage
 
 
-def test_three_business_failures_stop_before_fourth_category():
-    """The third local failure closes the batch and prevents further page actions."""
+def test_business_failures_finish_all_categories_before_retry():
+    """连续业务失败仍完成首轮，并在两轮补采后终止。"""
     prepared, task, adapter, database, logger, storage = execute([business_failure() for _ in range(4)])
     with pytest.raises(CategoryBatchCollectionError) as failure:
         collect_category_batch(prepared_batch=prepared, task=task, client=adapter,
                                database=database, runtime_logger=logger)
     assert failure.value.cause.category == "taobao_business_error"
-    assert adapter.calls == ["category-1", "category-2", "category-3"]
-    assert len(storage.failure_calls) == 3 and len(database.failure_calls) == 3
+    assert adapter.calls == ["category-1", "category-2", "category-3", "category-4"] * 3
+    assert len(storage.failure_calls) == 12 and len(database.failure_calls) == 12
     assert database.terminate_calls[0]["status"] == "failed"
-    assert any(event["event"] == "platform_unavailable_circuit_opened"
-               and "11001" not in event["message"] for event in logger.events)
+    assert not any(event["event"] == "platform_unavailable_circuit_opened" for event in logger.events)
 
 
 def test_final_integrity_failure_is_not_reported_as_nonexistent_next_page(monkeypatch):
@@ -96,7 +95,75 @@ def test_success_or_transport_failure_resets_business_error_sequence(separator):
     ])
     result = collect_category_batch(prepared_batch=prepared, task=task, client=adapter,
                                     database=database, runtime_logger=logger)
-    assert len(adapter.calls) == 6
+    assert adapter.calls[:6] == [f"category-{i}" for i in range(1, 7)]
+    assert len(adapter.calls) == (14 if separator is None else 16)
+    assert result.failed_category_count == (4 if separator is None else 5)
     assert len(result.category_runs) == (2 if separator is None else 1)
     assert not database.terminate_calls
     assert not any(event["event"] == "platform_unavailable_circuit_opened" for event in logger.events)
+
+
+def test_failed_categories_retry_only_after_full_round(monkeypatch):
+    """首轮完整遍历后补采，成功分类不重复，最终失败数按分类计算。"""
+    # 第一分类第二轮成功，第三分类第三轮成功。
+    prepared, task, adapter, database, logger, storage = execute([None, None, None])
+    # 逐次记录分类尝试，验证真实编排顺序。
+    counts = {}
+    original = adapter.collect_scope
+
+    def intermittent(task, scope, business_date):
+        """按分类注入有限失败，成功仍走真实淘宝解析。"""
+        counts[scope.key] = counts.get(scope.key, 0) + 1
+        if counts[scope.key] < {"category-1": 2, "category-3": 3}.get(scope.key, 1):
+            adapter.calls.append(scope.key)
+            raise HttpRequestError("Synthetic timeout", category="page_response_timeout")
+        yield from original(task, scope, business_date)
+
+    monkeypatch.setattr(adapter, "collect_scope", intermittent)
+    result = collect_category_batch(prepared_batch=prepared, task=task, client=adapter,
+                                    database=database, runtime_logger=logger)
+    assert adapter.calls == ["category-1", "category-2", "category-3", "category-1", "category-3", "category-3"]
+    assert result.failed_category_count == 0
+    assert [run.plan.category.key for run in result.category_runs] == ["category-1", "category-2", "category-3"]
+
+
+def test_persistent_failures_exhaust_two_full_retry_rounds():
+    """持续业务失败也先遍历全部分类，最多补采两轮。"""
+    # 淘宝业务错误不能提前熔断，全部失败时仍禁止发布。
+    prepared, task, adapter, database, logger, storage = execute([business_failure() for _ in range(4)])
+    with pytest.raises(CategoryBatchCollectionError):
+        collect_category_batch(prepared_batch=prepared, task=task, client=adapter,
+                               database=database, runtime_logger=logger)
+    assert adapter.calls == [f"category-{i}" for i in range(1, 5)] * 3
+    assert len(database.failure_calls) == 12
+
+
+@pytest.mark.parametrize("interrupt", ["auth", "stop"])
+def test_task_interrupt_during_retry_prevents_remaining_retry_categories(monkeypatch, interrupt):
+    """补采中的登录失效和用户停止必须终止任务，不能当成分类失败继续。"""
+    from compass_collector.errors import AuthRequiredError, CollectionInterruptedError
+    from compass_collector.run_control import CollectionControl
+    # 首轮两分类都失败，第一轮补采第一分类时中断。
+    prepared, task, adapter, database, logger, storage = execute([None, None])
+    control = CollectionControl()
+    counts = {}
+
+    def fail_or_interrupt(task, scope, business_date):
+        """记录调用顺序并在第一个补采分类触发任务级中断。"""
+        adapter.calls.append(scope.key)
+        counts[scope.key] = counts.get(scope.key, 0) + 1
+        if counts[scope.key] == 1:
+            raise HttpRequestError("Synthetic timeout", category="page_response_timeout")
+        if interrupt == "auth":
+            raise AuthRequiredError("Synthetic login expired", category="auth_required")
+        control.request_stop()
+        raise CollectionInterruptedError("Synthetic stop", category="interrupted")
+        yield  # 保持与生产适配器一致的惰性迭代入口。
+
+    monkeypatch.setattr(adapter, "collect_scope", fail_or_interrupt)
+    with pytest.raises(CategoryBatchCollectionError) as caught:
+        collect_category_batch(prepared_batch=prepared, task=task, client=adapter,
+                               database=database, runtime_logger=logger, control=control)
+    assert adapter.calls == ["category-1", "category-2", "category-1"]
+    assert caught.value.cause.category == ("auth_required" if interrupt == "auth" else "interrupted")
+    assert database.terminate_calls[-1]["status"] == caught.value.cause.category

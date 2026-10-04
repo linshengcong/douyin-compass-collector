@@ -135,8 +135,6 @@ def test_taobao_primary_task_publishes_own_index_through_shared_runner(tmp_path,
     publisher = WebPublisher(WebPublicationSettings(enabled=True, site_url="https://example.invalid"),
                              uploader, runtime_root=tmp_path)
     monkeypatch.setattr(runner.WebPublisher, "from_environment", lambda *args, **kwargs: publisher)
-    monkeypatch.setattr(runner.VercelDeployer, "from_environment",
-                        lambda: SimpleNamespace(settings=SimpleNamespace(enabled=False)))
     monkeypatch.setattr(runner, "deliver_website_notification", lambda **kwargs: None)
     # 复用独立淘宝配置的合法主任务，保持实际编排入口的配置边界。
     task = load_config(Path("config/taobao-poc.yaml")).tasks[0]
@@ -146,7 +144,11 @@ def test_taobao_primary_task_publishes_own_index_through_shared_runner(tmp_path,
         published_at=values["published_at"], collected_batch=SimpleNamespace(
             business_date=values["business_date"], started_at=values["started_at"],
             finished_at=values["finished_at"], failed_category_count=0,
-            category_runs=(SimpleNamespace(entries=(object(),)),)))
+            # v4 发布核对真实商品身份；该夹具提供与 CSV 一致的分类和商品。
+            category_runs=(SimpleNamespace(
+                plan=SimpleNamespace(category_run_id="category-1", category=SimpleNamespace(
+                    discovery_order=0, display_path="一级 > 二级 > 三级")),
+                entries=(SimpleNamespace(product_id="synthetic-product", rank=1, product_name="合成商品"),)),)))
     runner._publish_website_after_collection(candidates=[candidate], oss_uploader=uploader,
         execution_batch_id="b" * 32, runtime_logger=RuntimeLogger(tmp_path / "logs"),
         primary_task_id=task.id)
@@ -154,10 +156,16 @@ def test_taobao_primary_task_publishes_own_index_through_shared_runner(tmp_path,
     assert uploader.keys[-1] == "compass/web/taobao/taobao_household_cleaning_realtime/latest.json"
     assert uploader.objects["compass/web/latest.json"] == b"old Compass index"
 
+    # 确认正式 runner 路径已经输出可提交的 v4 身份，旧 CSV-only 调用仍为 v3。
+    snapshot = json.loads(gzip.decompress(uploader.objects[uploader.keys[0]]))
+    assert snapshot["schema_version"] == 4
+    assert snapshot["records"][0]["product_id"] == "synthetic-product"
+    assert len(snapshot["records"][0]["source_record_id"]) == 64
+
 
 def test_aware_collection_window_matches_naive_sqlite_publication_time(tmp_path):
     """Live UTC times and stored Beijing wall time describe one ordered batch."""
-    # runner 的采集窗口带时区，而 SQLite 读取的发布时间没有时区。
+    # runner 的采集窗口带时区，而 PostgreSQL 读取的发布时间没有时区。
     uploader = MemoryUploader()
     publisher = WebPublisher(WebPublicationSettings(enabled=True), uploader, runtime_root=tmp_path)
     values = arguments(write_taobao_csv(tmp_path))

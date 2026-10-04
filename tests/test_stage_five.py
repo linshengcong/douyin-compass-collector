@@ -137,7 +137,6 @@ def test_makefile_exposes_compact_parameterized_commands() -> None:
         "clean",
         "status",
         "schedule",
-        "web",
         "check",
     }
 

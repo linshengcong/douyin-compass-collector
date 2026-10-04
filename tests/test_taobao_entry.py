@@ -58,6 +58,10 @@ def test_gui_summary_accepts_selected_and_full_taobao_scopes():
     assert category_scope_summary(task) == "50021853, 216502"
     full = TaskConfig(id="taobao_full", platform="taobao", display_name="全根", schedule="0 14 * * *")
     assert category_scope_summary(full) == "cateId=50025705 下全部三级分类"
+    # 正式配置增加第二个根，界面必须明确展示追加范围。
+    expanded = load_config(Path("config/taobao.yaml")).tasks[0]
+    assert "追加 cateId=50016348" in category_scope_summary(expanded)
+    assert "2132, 50003949, 50009146" in category_scope_summary(expanded)
     assert "industry_id=5" in category_scope_summary(load_config(Path("config/tasks.yaml")).tasks[0])
 
 

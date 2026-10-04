@@ -1,5 +1,7 @@
 """Stage-three serial category ranking orchestration tests."""
 
+from pg_support import pg_url, pg_config
+
 import json
 from datetime import date, datetime
 from pathlib import Path
@@ -135,7 +137,7 @@ class FakeBatchStorage:
     ) -> None:
         """Share one event stream with the fake database for order assertions."""
 
-        # events 精确验证 raw -> SQLite -> Manifest 调用顺序。
+        # events 精确验证 raw -> PostgreSQL -> Manifest 调用顺序。
         self.events = events
         # failure_calls 用于确认每个失败分类只留档一次。
         self.failure_calls: list[dict[str, Any]] = []
@@ -143,6 +145,10 @@ class FakeBatchStorage:
         self.write_thread_ids: list[int] = []
         # fail_once_operations 模拟一次瞬时 Manifest 原子替换失败。
         self.fail_once_operations = set(fail_once_operations or ())
+
+    def archive_category_attempt(self, category_run_id, retry_round):
+        """记录补采归档，供共享编排替身验证调用顺序。"""
+        self.events.append(("archive_attempt", category_run_id, retry_round))
 
     def write_category_page(
         self,
@@ -157,7 +163,7 @@ class FakeBatchStorage:
         return Path(f"/runtime/{category_run_id}/page-{page_no:03d}.json.gz")
 
     def sync_collection_snapshot(self, snapshot: dict[str, Any]) -> None:
-        """Record the Manifest synchronization after each SQLite snapshot."""
+        """Record the Manifest synchronization after each PostgreSQL snapshot."""
 
         # 指定操作第一次失败后移除标记，使同快照重试可以成功。
         self.write_thread_ids.append(get_ident())
@@ -195,7 +201,7 @@ class FakeDatabase:
         self.failure_calls: list[dict[str, Any]] = []
         # terminate_calls 用于核对 auth/interrupted/内部错误的原子收口。
         self.terminate_calls: list[dict[str, Any]] = []
-        # write_thread_ids 验证 SQLite 生命周期没有落到网络 worker。
+        # write_thread_ids 验证 PostgreSQL 生命周期没有落到网络 worker。
         self.write_thread_ids: list[int] = []
 
     @staticmethod
@@ -430,7 +436,7 @@ def test_collects_more_than_two_hundred_items_in_strict_page_order() -> None:
     assert result.failed_category_count == 0
     assert database.success_calls == ["run-1"]
     assert database.terminate_calls == []
-    # 每页三层操作必须连续保持 raw -> SQLite -> Manifest。
+    # 每页三层操作必须连续保持 raw -> PostgreSQL -> Manifest。
     page_events = [
         event
         for event in events
@@ -488,7 +494,7 @@ def test_serial_page_failure_retains_prior_pages() -> None:
 def test_total_zero_still_saves_one_empty_page() -> None:
     """Treat an empty ranking as a valid one-page complete category."""
 
-    # 空榜单仍完整走 raw、SQLite 和 Manifest。
+    # 空榜单仍完整走 raw、PostgreSQL 和 Manifest。
     events: list[tuple[Any, ...]] = []
     storage = FakeBatchStorage(events)
     database = FakeDatabase(events)
@@ -768,7 +774,7 @@ def test_stop_after_response_marks_batch_interrupted_without_retry() -> None:
     assert database.terminate_calls[0]["status"] == "interrupted"
     assert database.terminate_calls[0]["current_category_run_id"] == "run-1"
     assert database.terminate_calls[0]["failed_page"] == 1
-    # 已验收页面仍严格完成 raw -> SQLite -> Manifest 后才响应停止。
+    # 已验收页面仍严格完成 raw -> PostgreSQL -> Manifest 后才响应停止。
     assert ("raw", "run-1", 1) in events
     assert ("sqlite_page", "run-1", 1) in events
     assert ("manifest", "page", "run-1", 1) in events
@@ -777,10 +783,10 @@ def test_stop_after_response_marks_batch_interrupted_without_retry() -> None:
 def test_real_sqlite_and_manifest_finish_collection_without_publication(
     tmp_path: Path,
 ) -> None:
-    """Integrate one empty category through real runtime storage and SQLite."""
+    """Integrate one empty category through real runtime storage and PostgreSQL."""
 
     # 隔离数据库先升级到当前全新基线 Schema。
-    database_path = tmp_path / "runtime" / "data" / "collector.db"
+    database_path = pg_url(tmp_path / "runtime" / "data" / "collector.db")
     upgrade_database(database_path)
     database = Database(database_path)
     # 单分类发现结果模拟阶段二已经完成的真实状态。
@@ -813,7 +819,7 @@ def test_real_sqlite_and_manifest_finish_collection_without_publication(
             manifest_path=storage.manifest_path,
             started_at=PLANNED_AT,
         )
-        # 分类树正文只写 runtime，再按 SQLite -> Manifest 建立索引。
+        # 分类树正文只写 runtime，再按 PostgreSQL -> Manifest 建立索引。
         category_tree_path = storage.write_category_tree({"st": 0, "data": {}})
         database.record_category_tree_raw(
             batch_id="real-stage-three-batch",
@@ -860,7 +866,7 @@ def test_real_sqlite_and_manifest_finish_collection_without_publication(
     finally:
         database.close()
 
-    # Manifest 必须与 SQLite 的阶段三停点一致。
+    # Manifest 必须与 PostgreSQL 的阶段三停点一致。
     manifest = json.loads(storage.manifest_path.read_text(encoding="utf-8"))
     assert len(result.category_runs) == 1
     assert batch is not None

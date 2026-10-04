@@ -1,0 +1,41 @@
+name: PostgreSQL regression
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: collector
+          POSTGRES_PASSWORD: collector_test
+          POSTGRES_DB: collector_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U collector -d collector_test"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+    env:
+      # 此账号只属于 CI 临时测试库，不是云端凭证。
+      TEST_DATABASE_URL: postgresql+psycopg://collector:collector_test@127.0.0.1:5432/collector_test
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Qt runtime libraries
+        run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0
+      - name: Install dependencies
+        run: uv sync --frozen --group test
+      - name: Verify real PostgreSQL workflows
+        run: uv run pytest

@@ -2,7 +2,8 @@
 
 import json
 import os
-import sqlite3
+from sqlalchemy import text
+from pg_support import pg_url, pg_config
 import subprocess
 import sys
 from contextlib import ExitStack
@@ -78,52 +79,59 @@ def test_old_global_process_blocks_new_runtime_without_being_stopped(tmp_path, r
 
 
 def test_database_claim_rejects_another_platform_even_when_empty(tmp_path):
-    """Independent configs cannot reuse an empty database claimed by another platform."""
-    # 没有商品或批次时也必须保留平台身份。
-    path = tmp_path / "data.db"
-    upgrade_database(path, platform="compass")
+    """Platform identity survives an empty PG database and repeated migration."""
+    # 使用真实事务检查归属，失败不能覆盖已认领身份。
+    url = pg_url(tmp_path)
+    upgrade_database(url, platform="compass")
     with pytest.raises(ValueError, match="another platform"):
-        upgrade_database(path, platform="taobao")
-    # 重复初始化不创建新备份，不重新执行迁移。
-    upgrade_database(path, platform="compass")
-    assert not (tmp_path / "backups").exists()
-    with sqlite3.connect(path) as connection:
-        assert connection.execute("SELECT id,platform FROM runtime_platform").fetchall() == [(1, "compass")]
+        upgrade_database(url, platform="taobao")
+    upgrade_database(url, platform="compass")
+    database = Database(url)
+    try:
+        with database.engine.connect() as connection:
+            assert connection.execute(text("SELECT id,platform FROM runtime_platform")).fetchall() == [(1, "compass")]
+    finally:
+        database.close()
 
 
 def test_mixed_history_is_rejected_without_modifying_database(tmp_path):
-    """Preflight refuses mixed source history before migrations or identity claims."""
-    # 创建历史混合库，只检验拒绝行为，不调用真实采集或发布。
-    path = tmp_path / "mixed.db"
-    upgrade_database(path)
-    database = Database(path)
-    for platform in ("compass", "taobao"):
-        database.create_batch(batch_id=platform, task_id=platform, platform=platform,
-                              business_date=datetime(2026, 10, 2).date(),
-                              planned_at=datetime(2026, 10, 2), mode="force", brand_type=None,
-                              price_bin=None, manifest_path=tmp_path / platform,
-                              started_at=datetime(2026, 10, 2))
-    database.close()
-    # 原数据库字节内容及归属表在失败后保持不变。
-    before = path.read_bytes()
-    with pytest.raises(ValueError, match="mixed platform"):
-        upgrade_database(path, platform="taobao")
-    assert path.read_bytes() == before
+    """Mixed unclaimed history cannot be claimed by either platform."""
+    # 失败后比较关系数据和归属，而不是数据库文件字节。
+    url = pg_url(tmp_path)
+    upgrade_database(url)
+    database = Database(url)
+    try:
+        for platform in ("compass", "taobao"):
+            database.create_batch(batch_id=platform, task_id=platform, platform=platform,
+                                  business_date=datetime(2026, 10, 2).date(),
+                                  planned_at=datetime(2026, 10, 2), mode="force", brand_type=None,
+                                  price_bin=None, manifest_path=tmp_path / platform,
+                                  started_at=datetime(2026, 10, 2))
+        with pytest.raises(ValueError, match="mixed platform"):
+            upgrade_database(url, platform="taobao")
+        with database.engine.connect() as connection:
+            assert connection.execute(text("SELECT count(*) FROM collection_batches")).scalar_one() == 2
+            assert connection.execute(text("SELECT count(*) FROM runtime_platform")).scalar_one() == 0
+    finally:
+        database.close()
 
 
 def test_concurrent_initialization_of_same_database_is_serialized(tmp_path):
-    """Real processes race on initialization while only one schema is created."""
-    # 四个进程独立运行迁移，验证数据库锁覆盖首次建库及归属认领。
-    path = tmp_path / "concurrent.db"
-    code = "from pathlib import Path; from compass_collector.persistence import upgrade_database; import sys; upgrade_database(Path(sys.argv[1]), platform='taobao')"
-    environment = {**os.environ, "PYTHONPATH": "src"}
-    processes = [subprocess.Popen([sys.executable, "-c", code, str(path)], env=environment,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(4)]
+    """Four processes migrate the same PG schema without racing DDL or identity."""
+    # 连接凭证通过子进程环境传入，不出现在命令行或错误输出中。
+    url = pg_url(tmp_path)
+    code = "import os; from compass_collector.persistence import upgrade_database; upgrade_database(os.environ['TEST_INIT_URL'], platform='taobao')"
+    environment = {**os.environ, "PYTHONPATH": "src", "TEST_INIT_URL": url.render_as_string(hide_password=False)}
+    processes = [subprocess.Popen([sys.executable, "-c", code], env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(4)]
     for process in processes:
         stdout, stderr = process.communicate(timeout=30)
         assert process.returncode == 0, stderr
-    with sqlite3.connect(path) as connection:
-        assert connection.execute("SELECT platform FROM runtime_platform").fetchone() == ("taobao",)
+    database = Database(url)
+    try:
+        with database.engine.connect() as connection:
+            assert connection.execute(text("SELECT platform FROM runtime_platform")).scalar_one() == "taobao"
+    finally:
+        database.close()
 
 
 def test_real_processes_do_not_mistake_parallel_legacy_probes_for_old_gui(tmp_path):
@@ -150,7 +158,7 @@ for attempt in range(80):
 def test_owned_database_refuses_foreign_batch_writes(tmp_path):
     """An entrypoint cannot contaminate a claimed database after initialization."""
     # 同一业务事务内再核验归属，不仅依赖配置加载阶段。
-    path = tmp_path / "owned.db"
+    path = pg_url(tmp_path / "owned")
     upgrade_database(path, platform="taobao")
     database = Database(path)
     try:
@@ -166,34 +174,30 @@ def test_owned_database_refuses_foreign_batch_writes(tmp_path):
 
 
 def test_config_paths_and_legacy_single_platform_database(tmp_path):
-    """Validate canonical separation while retaining old single-platform YAML support."""
-    # 主配置的两个数据库独立；旧单平台PoC仍使用顶层路径。
+    """Require independent connection environment variables for multiple platforms."""
+    # 两个平台共用 PostgreSQL 服务，但配置选择不同数据库地址。
     config = load_config(Path("config/tasks.yaml"))
-    assert config.for_platform("compass").database.path != config.for_platform("taobao").database.path
-    legacy = load_config(Path("config/taobao-poc.yaml"))
-    assert legacy.for_platform("taobao").database.path == legacy.database.path
-    # 路径别名不能绕过配置校验，也不能遗漏多平台数据库字段。
+    assert config.for_platform("compass").database.url_env != config.for_platform("taobao").database.url_env
+    single = load_config(Path("config/taobao-poc.yaml"))
+    assert single.for_platform("taobao").database.url_env == single.database.url_env
     raw = config.model_dump(mode="python")
-    raw["platforms"]["taobao"]["database_path"] = raw["platforms"]["compass"]["database_path"]
-    with pytest.raises(ValidationError, match="databases must be distinct"):
+    raw["platforms"]["taobao"]["database_env"] = raw["platforms"]["compass"]["database_env"]
+    with pytest.raises(ValidationError, match="must be distinct"):
         AppConfig.model_validate(raw)
-    raw["platforms"]["taobao"]["database_path"] = None
-    with pytest.raises(ValidationError, match="independent database_path"):
+    raw["platforms"]["taobao"]["database_env"] = None
+    with pytest.raises(ValidationError, match="independent database_env"):
         AppConfig.model_validate(raw)
 
 
 def test_portable_path_mapping_cannot_create_database_aliases(tmp_path, monkeypatch):
-    """Validate actual portable paths after relative runtime values are relocated."""
+    """Portable paths change only browser resources, preserving connection selection."""
     from compass_collector import config as config_module
-    # 映射前路径不同，映射后两个数据库相同，必须再次校验。
-    raw = yaml.safe_load(Path("config/tasks.yaml").read_text())
-    raw["platforms"]["taobao"]["database_path"] = str(tmp_path / "data/collector.db")
-    path = tmp_path / "portable.yaml"
-    path.write_text(yaml.safe_dump(raw))
+    # 数据库地址不再依赖本机目录，打包映射不改连接变量名。
     monkeypatch.setattr(config_module, "is_packaged_application", lambda: True)
     monkeypatch.setattr(config_module, "runtime_root", lambda: tmp_path)
-    with pytest.raises(ValidationError, match="databases must be distinct"):
-        load_config(path)
+    config = load_config(Path("config/tasks.yaml"))
+    assert config.for_platform("compass").database.url_env == "COMPASS_DATABASE_URL"
+    assert config.for_platform("taobao").database.url_env == "TAOBAO_DATABASE_URL"
 
 
 def test_logs_and_retention_never_cross_platforms(tmp_path):
@@ -236,10 +240,7 @@ def test_two_actual_gui_windows_have_independent_titles_and_scheduler_status(tmp
         for platform in ("compass", "taobao"):
             selected = config.for_platform(platform)
             # 两窗口的数据库均处于pytest目录，登录Profile只读展示。
-            selected = selected.model_copy(update={
-                "database": selected.database.model_copy(update={"path": tmp_path / "data" / f"{platform}.db"}),
-                "platforms": {platform: selected.platforms[platform].model_copy(update={"database_path": None})},
-            })
+            selected = pg_config(selected, tmp_path / platform)
             request = gui.GuiLaunchRequest(config_path=Path("config/tasks.yaml"), platform=platform, task_id=selected.tasks[0].id, auto_start=False)
             windows.append(gui.CollectorWindow(selected, request))
         assert windows[0].windowTitle() != windows[1].windowTitle()

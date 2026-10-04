@@ -195,7 +195,7 @@ class CollectedCategoryRun:
     # api_total 与目标页数来自第一页已验证分页元数据。
     api_total: int
     target_page_count: int
-    # raw_pages 只索引已按 raw -> SQLite -> Manifest 顺序保存的页面。
+    # raw_pages 只索引已按 raw -> PostgreSQL -> Manifest 顺序保存的页面。
     raw_pages: tuple[RawPageRecord, ...]
     # entries 只包含通过完整榜单校验的商品，不暴露失败分类残片。
     entries: tuple[ProductRankEntry, ...]

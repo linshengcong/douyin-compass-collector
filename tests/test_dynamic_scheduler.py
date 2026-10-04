@@ -1,5 +1,7 @@
 """Dynamic-category Scheduler publication and log-identity tests."""
 
+from pg_support import pg_config
+
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -21,25 +23,17 @@ SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def build_test_config(tmp_path: Path) -> AppConfig:
-    """Point the checked-in task configuration at one isolated SQLite database."""
-
-    # 真实配置只替换数据库路径，cron 和动态分类范围保持不变。
-    config = load_config(CONFIG_PATH)
-    # 临时数据库配置避免专项测试读写仓库 runtime。
-    database_config = config.database.model_copy(
-        update={"path": tmp_path / "runtime" / "data" / "collector.db"}
-    )
-    # 临时测试把两个平台路径都隔离到同一个pytest根目录。
-    platforms = {name: item.model_copy(update={"database_path": database_config.path if name == "compass" else database_config.path.with_name("taobao.db")}) for name, item in config.platforms.items()}
-    return config.model_copy(update={"database": database_config, "platforms": platforms})
+    """Isolate platform stores while retaining the checked-in scheduling contract."""
+    # 每个平台的测试库独立，生产连接不会被读取。
+    return pg_config(load_config(CONFIG_PATH), tmp_path)
 
 
 def create_test_database(config: AppConfig) -> Database:
     """Create the clean current schema required by Scheduler status queries."""
 
     # 每个 pytest 临时配置都先升级到当前干净 v1 基线。
-    upgrade_database(config.database.path)
-    return Database(config.database.path)
+    upgrade_database(config.database.url)
+    return Database(config.database.url)
 
 
 def insert_partial_success_batch(
@@ -52,7 +46,7 @@ def insert_partial_success_batch(
 ) -> None:
     """Insert one constraint-valid partial-success batch for scheduling decisions."""
 
-    # SQLite 按北京墙上时间保存无时区 datetime。
+    # PostgreSQL 按北京墙上时间保存无时区 datetime。
     stored_planned_at = planned_at.replace(tzinfo=None)
     # 完成时间固定晚于开始时间，满足终态生命周期约束。
     finished_at = stored_planned_at + timedelta(minutes=10)

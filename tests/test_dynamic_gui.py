@@ -160,7 +160,7 @@ def test_batch_skipped_clears_loading_progress() -> None:
 def test_gui_batch_display_ignores_notification_execution_identity() -> None:
     """Keep the visible batch ID tied to a real task batch during notification."""
 
-    # business_event 带 task_id，可定位到真实 SQLite/raw 任务批次。
+    # business_event 带 task_id，可定位到真实 PostgreSQL/raw 任务批次。
     business_event = {"batch_id": "task-batch", "task_id": "food-task"}
     # legacy_notification 模拟升级前通知复用 batch_id 的安全事件。
     legacy_notification = {
@@ -237,7 +237,7 @@ def test_terminal_category_failure_overrides_the_continue_message() -> None:
 
 
 def test_publication_failure_replaces_the_waiting_for_publish_state() -> None:
-    """Show an explicit failed terminal result when CSV or SQLite publication fails."""
+    """Show an explicit failed terminal result when CSV or PostgreSQL publication fails."""
 
     # ready_state 是全部分类完成后、正式发布前的 GUI 状态。
     ready_state = GuiProgressState(

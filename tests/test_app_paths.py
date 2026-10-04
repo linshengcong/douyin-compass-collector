@@ -93,4 +93,4 @@ def test_packaged_config_moves_runtime_paths_outside_the_application(
     config = config_module.load_config(config_path)
 
     assert config.browser_for("compass").profile_dir == portable_runtime / "browser-profile"
-    assert config.database.path == portable_runtime / "data" / "collector.db"
+    assert config.database.url_env == "COMPASS_DATABASE_URL"

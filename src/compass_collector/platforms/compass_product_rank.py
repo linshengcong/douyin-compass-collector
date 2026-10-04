@@ -256,7 +256,7 @@ def parse_page_entries(
 ) -> list[ProductRankEntry]:
     """Parse all product rows from one already validated page response."""
 
-    # 领域记录最终受 SQLite page_no >= 1 约束，解析入口提前保持一致。
+    # 领域记录最终受 PostgreSQL page_no >= 1 约束，解析入口提前保持一致。
     if type(page_no) is not int or page_no < 1:
         raise ValueError("page_no must be a positive integer")
     # 页级契约已确认该路径为数组。

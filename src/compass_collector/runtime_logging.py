@@ -67,7 +67,7 @@ EventSink = Callable[[dict[str, Any]], None]
 class LogContext:
     """Identify one task attempt in every task-scoped log entry."""
 
-    # 业务批次 ID 连接 SQLite、raw、分类分页和正式发布结果。
+    # 业务批次 ID 连接 PostgreSQL、raw、分类分页和正式发布结果。
     batch_id: str | None = None
     # 执行批次 ID 连接一次多任务运行及其批次汇总通知。
     execution_batch_id: str | None = None

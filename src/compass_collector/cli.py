@@ -226,7 +226,7 @@ def _dispatch_configured_command(
         # 只在同时获得 Scheduler 和采集锁后执行白名单删除。
         cleanup_summary = clear_local_data_with_locks(
             runtime_root(),
-            config.database.path,
+            config.database.url,
             **({"platform": selected_platform, "task_ids": tuple(task.id for task in config.tasks)}
                if selected_platform is not None else {}),
         )
@@ -264,6 +264,11 @@ def run_packaged_smoke_test() -> int:
 
     # RuntimeLogger 同时验证 Windows tzdata 和 windowed 事件文件传输。
     runtime_logger = RuntimeLogger(RUNTIME_LOG_DIRECTORY)
+    from compass_collector.database_connection import database_engine
+
+    # 创建 Engine 只加载 PostgreSQL 二进制驱动，不访问网络或创建数据库。
+    smoke_engine = database_engine("postgresql+psycopg://localhost/packaged_smoke")
+    smoke_engine.dispose()
     # Playwright driver 在启动时验证 PyInstaller 已收集 Node 与 driver 资源。
     from playwright.sync_api import sync_playwright
 

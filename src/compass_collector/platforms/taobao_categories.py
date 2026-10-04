@@ -42,10 +42,19 @@ def parse_category_tree(payload: dict, selection) -> CategoryDiscoveryResult:
         node = (identity, name.strip(), flag, parent)
         children[parent].append(node)
         by_id[identity].append(node)
-    # 目标根必须是唯一的一级节点，不能扩大到其他根。
-    roots = by_id.get(selection.root_category_id, [])
-    if len(roots) != 1 or roots[0][3] != "0":
-        raise ResponseContractError("Configured Taobao root is invalid", category="invalid_configured_category")
+    # 主根保留全量语义，追加根只展开明确指定的二级分支。
+    configured_roots = [(selection.root_category_id, ())] + [
+        (root.root_category_id, tuple(root.level2_category_ids))
+        for root in selection.additional_roots
+    ]
+    # 所有配置根必须是唯一的一级节点；先验证再构造任何采集计划。
+    roots = []
+    for root_id, level2_ids in configured_roots:
+        # 不能将二级或重复身份误当作一级根节点。
+        candidates = by_id.get(root_id, [])
+        if len(candidates) != 1 or candidates[0][3] != "0":
+            raise ResponseContractError("Configured Taobao root is invalid", category="invalid_configured_category")
+        roots.append((candidates[0], level2_ids))
     # visited 拒绝目标前三层的重复身份；更深节点不会被访问。
     visited = set()
     scopes = []
@@ -72,9 +81,25 @@ def parse_category_tree(payload: dict, selection) -> CategoryDiscoveryResult:
         for child in children.get(identity, []):
             visit(child, next_path, next_ids)
 
-    visit(roots[0], (), ())
-    if not scopes:
-        raise ResponseContractError("Taobao root has no third-level categories", category="invalid_configured_category")
+    for root, level2_ids in roots:
+        # 每个配置根都必须贡献三级分类，不能静默忽略无效追加范围。
+        root_start = len(scopes)
+        if not level2_ids:
+            visit(root, (), ())
+        else:
+            visited.add(root[0])
+            for level2_id in level2_ids:
+                # 二级分类必须唯一且直属于当前配置根，不接受跨根或三级 ID。
+                branches = by_id.get(level2_id, [])
+                if len(branches) != 1 or branches[0][3] != root[0]:
+                    raise ResponseContractError("Configured Taobao branch is invalid", category="invalid_configured_category")
+                # 任一指定分支为空时整批报错，避免将遗漏误报为采集完成。
+                branch_start = len(scopes)
+                visit(branches[0], (root[1],), (root[0],))
+                if len(scopes) == branch_start:
+                    raise ResponseContractError("Taobao branch has no third-level categories", category="invalid_configured_category")
+        if len(scopes) == root_start:
+            raise ResponseContractError("Taobao root has no third-level categories", category="invalid_configured_category")
     if selection.mode == "selected":
         # 指定列表全部先验证，再按用户配置顺序重新编号。
         candidates = {scope.key: scope for scope in scopes}
@@ -85,4 +110,9 @@ def parse_category_tree(payload: dict, selection) -> CategoryDiscoveryResult:
                             candidates[identity].platform_metadata)
             for index, identity in enumerate(selection.targets, 1)
         ]
-    return CategoryDiscoveryResult(roots[0][0], roots[0][1], tuple(scopes))
+    # 多根批次没有单一根身份，每个分类仍保存自己的完整路径和根 ID。
+    return CategoryDiscoveryResult(
+        roots[0][0][0] if len(roots) == 1 else None,
+        roots[0][0][1] if len(roots) == 1 else None,
+        tuple(scopes),
+    )

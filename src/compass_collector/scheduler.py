@@ -65,7 +65,7 @@ def apply_scheduler_control_requests(
 
 
 def aware_checkpoint(value: datetime) -> datetime:
-    """Restore SQLite wall-clock checkpoints to Beijing-aware datetimes."""
+    """Restore PostgreSQL wall-clock checkpoints to Beijing-aware datetimes."""
 
     return value.replace(tzinfo=SHANGHAI_TIMEZONE)
 
@@ -244,9 +244,9 @@ def reconcile_scheduler_once(
 
     # 测试可注入时间，真实运行固定使用北京时间。
     current_time = now or datetime.now(SHANGHAI_TIMEZONE)
-    upgrade_database(config.database.path, platform=config.execution_platform())
+    upgrade_database(config.database.url, platform=config.execution_platform())
     # 一次 reconcile 使用短生命周期数据库连接。
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     # missed 事件写入与采集一致的安全 JSONL。
     # GUI 子进程可复用同一个日志器，默认路径保持既有终端行为。
     active_logger = runtime_logger or RuntimeLogger(PlatformRuntime(RUNTIME_ROOT, config.execution_platform()).logs, platform=config.execution_platform())
@@ -411,9 +411,9 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
                 planned_at = planned_at_for_task(
                     grouped_tasks[0], actual_at.date() - timedelta(days=1)
                 )
-            upgrade_database(config.database.path, platform=config.execution_platform())
+            upgrade_database(config.database.url, platform=config.execution_platform())
             # cron 回调使用独立数据库处理终态和宽限规则。
-            callback_database = Database(config.database.path)
+            callback_database = Database(config.database.url)
             try:
                 handle_occurrence(
                     config,
@@ -451,9 +451,9 @@ def _run_scheduler_unlocked(config: AppConfig) -> int:
             return
         # APScheduler 提供的 scheduled_run_time 是准确计划时刻。
         recorded_at = datetime.now(SHANGHAI_TIMEZONE)
-        upgrade_database(config.database.path, platform=config.execution_platform())
+        upgrade_database(config.database.url, platform=config.execution_platform())
         # missed listener 使用独立短事务数据库。
-        missed_database = Database(config.database.path)
+        missed_database = Database(config.database.url)
         try:
             mark_missed_tasks(
                 missed_database,
