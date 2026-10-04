@@ -1,5 +1,7 @@
 """Stage-three category raw files, failure artifacts, and Manifest sync tests."""
 
+from pg_support import pg_url, pg_config
+
 import gzip
 import json
 from datetime import date, datetime
@@ -19,7 +21,7 @@ from compass_collector.persistence import Database, upgrade_database
 from compass_collector.raw_storage import BatchStorage
 
 
-# 固定批次时间用于 Manifest 和 SQLite 的可重复断言。
+# 固定批次时间用于 Manifest 和 PostgreSQL 的可重复断言。
 PLANNED_AT = datetime(2026, 7, 17, 14, 0)
 # raw 与状态迁移使用独立时间，便于识别字段来源。
 CAPTURED_AT = datetime(2026, 7, 17, 14, 0, 2)
@@ -40,8 +42,8 @@ def prepare_storage_and_database(
         mode="normal",
         started_at=PLANNED_AT,
     )
-    # SQLite 使用临时迁移数据库作为 Manifest 的权威状态源。
-    database_path = tmp_path / "runtime" / "data" / "collector.db"
+    # PostgreSQL 使用临时迁移数据库作为 Manifest 的权威状态源。
+    database_path = pg_url(tmp_path / "runtime" / "data" / "collector.db")
     upgrade_database(database_path)
     database = Database(database_path)
     database.create_batch(
@@ -55,7 +57,7 @@ def prepare_storage_and_database(
         manifest_path=storage.manifest_path,
         started_at=PLANNED_AT,
     )
-    # 分类树先原子落盘，再分别登记 SQLite 与 Manifest。
+    # 分类树先原子落盘，再分别登记 PostgreSQL 与 Manifest。
     category_tree_path = storage.write_category_tree({"data": {"cate_list": []}})
     database.record_category_tree_raw(
         batch_id=storage.batch_id,
@@ -169,7 +171,7 @@ def test_manifest_sync_uses_one_authoritative_snapshot_and_can_retry(
 ) -> None:
     """Keep the old Manifest intact on write failure and retry the same snapshot."""
 
-    # SQLite 状态与 BatchStorage 初始 Manifest 都已完成分类登记。
+    # PostgreSQL 状态与 BatchStorage 初始 Manifest 都已完成分类登记。
     storage, database, category_run_plans = prepare_storage_and_database(tmp_path)
     try:
         category_run_id = category_run_plans[0].category_run_id

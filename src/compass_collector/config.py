@@ -1,5 +1,6 @@
 """Strict YAML configuration models for the collector."""
 
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -13,6 +14,10 @@ from compass_collector.platforms.compass_config import (
     FiltersConfig,
     RankConfig,
     DateConfig,
+)
+
+from compass_collector.platforms.taobao_config import (
+    TaobaoCategoryScopeConfig, TaobaoFiltersConfig, TaobaoRankConfig, TaobaoDateConfig,
 )
 
 
@@ -38,6 +43,10 @@ class BrowserConfig(BrowserSettings):
 
     # 每个会话使用已解析的平台 Profile，不共享账号目录。
     profile_dir: Path
+    # 仅选定平台可启用已验证的 webdriver 原型兼容方式。
+    webdriver_compatibility: bool = False
+    # 仅平台显式开启时，在独立 Profile 内补充会话 Cookie 的跨重启恢复。
+    persist_session_cookies: bool = False
 
 
 class PlatformConfig(StrictModel):
@@ -45,6 +54,25 @@ class PlatformConfig(StrictModel):
 
     # 罗盘继续复用旧目录，未来平台必须声明自己的独立目录。
     profile_dir: Path
+    # 多平台指定不同数据库连接环境变量，凭证不进入 YAML。
+    database_env: str | None = Field(default=None, pattern=r"^[A-Z][A-Z0-9_]*$")
+    # 默认关闭，避免为淘宝排查改变抖音浏览器环境。
+    webdriver_compatibility: bool = False
+    # 默认关闭，防止改变已有罗盘登录生命周期。
+    persist_session_cookies: bool = False
+    # 同一平台所有任务共用分类名称黑名单，父级命中时跳过其全部待采子分类。
+    category_blacklist: list[str] = Field(default_factory=list)
+
+    @field_validator("category_blacklist")
+    @classmethod
+    def validate_category_blacklist(cls, value: list[str]) -> list[str]:
+        """去掉名称首尾空白并去重，拒绝无法辨识的空分类名称。"""
+
+        # 保留首次出现顺序，方便配置快照和人工维护核对。
+        names = list(dict.fromkeys(name.strip() for name in value))
+        if any(not name for name in names):
+            raise ValueError("category_blacklist names must not be blank")
+        return names
 
 
 class IntervalConfig(StrictModel):
@@ -72,7 +100,7 @@ class IntervalConfig(StrictModel):
 class CollectionConfig(StrictModel):
     """Configure bounded, interruptible serial page operations."""
 
-    # 重试必须先恢复页面状态，不能重复盲点下一页。
+    # 罗盘页内重试必须先恢复页面状态；淘宝只在首轮后按分类补采。
     network_retry_attempts: int = Field(ge=0, le=3, default=2)
     # 页面操作之间的间隔，沿用已有低频范围。
     request_interval_seconds: IntervalConfig = Field(
@@ -105,9 +133,21 @@ class RetentionConfig(StrictModel):
 
 
 class DatabaseConfig(StrictModel):
-    """Configure the local SQLite database managed by Alembic."""
+    """Reference a PostgreSQL DSN without storing credentials in configuration."""
 
-    path: Path
+    # 连接地址由环境或项目 .env 提供，只支持 PostgreSQL。
+    url_env: str = Field(pattern=r"^[A-Z][A-Z0-9_]*$")
+
+    @property
+    def url(self):
+        """Resolve and validate the DSN only when a database operation is requested."""
+        from compass_collector.database_connection import database_url
+
+        # 缺少连接时立即失败，不静默回退历史 SQLite。
+        value = os.environ.get(self.url_env)
+        if not value:
+            raise ValueError(f"database environment variable {self.url_env} is required")
+        return database_url(value)
 
 
 class SchedulerConfig(StrictModel):
@@ -129,11 +169,36 @@ class TaskConfig(StrictModel):
     enabled: bool = True
     display_name: str = Field(min_length=1)
     schedule: str = Field(min_length=1)
-    rank: RankConfig = Field(default_factory=RankConfig)
+    rank: RankConfig | TaobaoRankConfig = Field(default_factory=RankConfig)
     # 分类范围每次任务从平台分类树动态发现。
-    category_scope: CategoryScopeConfig
-    filters: FiltersConfig
-    date: DateConfig
+    category_scope: CategoryScopeConfig | TaobaoCategoryScopeConfig
+    filters: FiltersConfig | TaobaoFiltersConfig
+    date: DateConfig | TaobaoDateConfig
+
+    @model_validator(mode="before")
+    @classmethod
+    def select_platform_models(cls, value):
+        """Parse business fields with the declared platform, never union guessing."""
+        if not isinstance(value, dict):
+            return value
+        # 拷贝配置，不在验证期间改变 YAML 或调用方传入的字典。
+        selected = dict(value)
+        # 显式选择四个业务类型，阻止抖音和淘宝字段组合被联合模型接受。
+        platform = selected.get("platform", "compass")
+        if platform not in {"compass", "taobao"}:
+            raise ValueError("platform adapter is not registered")
+        # 罗盘维持必填的历史契约；淘宝字段可使用已确认的默认条件。
+        business_models = (
+            {"rank": RankConfig, "category_scope": CategoryScopeConfig, "filters": FiltersConfig, "date": DateConfig}
+            if platform == "compass" else
+            {"rank": TaobaoRankConfig, "category_scope": TaobaoCategoryScopeConfig, "filters": TaobaoFiltersConfig, "date": TaobaoDateConfig}
+        )
+        for field_name, business_model in business_models.items():
+            if field_name in selected:
+                selected[field_name] = business_model.model_validate(selected[field_name])
+            elif platform == "taobao":
+                selected[field_name] = business_model()
+        return selected
 
     @field_validator("schedule")
     @classmethod
@@ -168,6 +233,37 @@ class AppConfig(StrictModel):
     retention: RetentionConfig
     tasks: list[TaskConfig] = Field(min_length=1)
 
+    def for_platform(self, platform: str) -> "AppConfig":
+        """Select one platform without enabling disabled tasks or changing its Profile."""
+        # 使用真实平台字段筛选，避免任务ID前缀被当作平台归属。
+        selected_tasks = [task for task in self.tasks if task.platform == platform]
+        if platform not in self.platforms or not selected_tasks:
+            raise ValueError("selected platform is not configured")
+        # 公开主任务必须仍在所选配置内；淘宝不会更新罗盘兼容索引。
+        primary_task_id = self.publication.web_primary_task_id
+        if primary_task_id not in {task.id for task in selected_tasks}:
+            primary_task_id = selected_tasks[0].id
+        return self.model_copy(update={
+            "tasks": selected_tasks,
+            "platforms": {platform: self.platforms[platform]},
+            "database": self.database.model_copy(update={
+                "url_env": self.platforms[platform].database_env or self.database.url_env,
+            }),
+            "publication": self.publication.model_copy(update={"web_primary_task_id": primary_task_id}),
+        })
+
+    def execution_platform(self, task_id: str | None = None) -> str:
+        """Resolve one task platform or the only enabled platform, never a mixed run."""
+        # 显式任务可运行禁用任务，沿用手动任务选择语义。
+        candidates = [task for task in self.tasks if task.id == task_id] if task_id else [task for task in self.tasks if task.enabled]
+        if task_id and not candidates:
+            raise ValueError("selected task is not configured")
+        # 单平台没有启用任务时仍允许登录、状态和空闲GUI。
+        names = {task.platform for task in candidates} or set(self.platforms)
+        if len(names) != 1:
+            raise ValueError("multiple platforms require explicit --platform")
+        return next(iter(names))
+
     def browser_for(self, platform: str) -> BrowserConfig:
         """Resolve the selected platform's Chrome configuration."""
         if platform not in self.platforms:
@@ -175,12 +271,14 @@ class AppConfig(StrictModel):
         return BrowserConfig(
             **self.browser.model_dump(),
             profile_dir=self.platforms[platform].profile_dir,
+            webdriver_compatibility=self.platforms[platform].webdriver_compatibility,
+            persist_session_cookies=self.platforms[platform].persist_session_cookies,
         )
 
     @model_validator(mode="after")
     def validate_platforms(self):
         """Reject unsupported platforms and profile aliasing before Chrome starts."""
-        # 目前仅有经过真实验收的罗盘适配器。
+        # 只接受显式注册的实现；注册并不代表真实平台验收已经完成。
         from compass_collector.platforms.registry import registered_platforms
 
         if set(self.platforms) - registered_platforms():
@@ -193,6 +291,14 @@ class AppConfig(StrictModel):
         ]
         if len(profiles) != len(set(profiles)):
             raise ValueError("platform profiles must be distinct")
+        # 多平台保留独立数据库，环境变量别名不能代替真实归属检查。
+        if len(self.platforms) > 1:
+            if any(platform.database_env is None for platform in self.platforms.values()):
+                raise ValueError("multiple platforms require independent database_env values")
+            # 此处只检查变量名；连接后 runtime_platform 再验证真实数据库归属。
+            database_names = [platform.database_env for platform in self.platforms.values()]
+            if len(database_names) != len(set(database_names)):
+                raise ValueError("platform database environment variables must be distinct")
         if self.publication.web_primary_task_id not in {task.id for task in self.tasks}:
             raise ValueError("primary publication task is not configured")
         return self
@@ -230,16 +336,17 @@ def load_config(config_path: Path) -> AppConfig:
             return value
         return active_runtime_root.joinpath(*value.parts[1:])
 
-    return config.model_copy(
+    # 映射后再次校验，避免相对runtime路径与显式便携绝对路径变成同一资源。
+    resolved_config = config.model_copy(
         update={
             "platforms": {
                 name: platform.model_copy(
-                    update={"profile_dir": resolve_runtime_value(platform.profile_dir)}
+                    update={
+                        "profile_dir": resolve_runtime_value(platform.profile_dir),
+                    }
                 )
                 for name, platform in config.platforms.items()
             },
-            "database": config.database.model_copy(
-                update={"path": resolve_runtime_value(config.database.path)}
-            ),
         }
     )
+    return AppConfig.model_validate(resolved_config.model_dump(mode="python"))

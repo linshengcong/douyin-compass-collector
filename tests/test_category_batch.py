@@ -1,5 +1,7 @@
 """Stage-two category-tree orchestration tests without ranking requests."""
 
+from pg_support import pg_url, pg_config
+
 import gzip
 import json
 from datetime import date, datetime
@@ -34,7 +36,7 @@ FIXTURE_PATH = Path("tests/fixtures/category_tree.json")
 SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 # 固定业务日期用于核对 runtime 目录结构。
 BUSINESS_DATE = date(2026, 7, 17)
-# 固定计划时间用于 Manifest 和 SQLite 断言。
+# 固定计划时间用于 Manifest 和 PostgreSQL 断言。
 PLANNED_AT = datetime(2026, 7, 17, 14, 0, tzinfo=SHANGHAI_TIMEZONE)
 
 
@@ -49,7 +51,7 @@ def create_database(tmp_path: Path) -> Database:
     """Create one migrated test database under the isolated runtime root."""
 
     # 数据库文件不触碰仓库真实 runtime。
-    database_path = tmp_path / "runtime" / "data" / "collector.db"
+    database_path = pg_url(tmp_path / "runtime" / "data" / "collector.db")
     upgrade_database(database_path)
     return Database(database_path)
 
@@ -168,7 +170,7 @@ def test_prepare_category_batch_persists_and_prints_all_categories(
     task = load_config(Path("config/tasks.yaml")).tasks[0]
     # HTTP 假客户端只允许一次分类树请求。
     client = SuccessfulCategoryClient(load_category_payload())
-    # SQLite、Manifest、raw 和日志全部隔离到 pytest 目录。
+    # PostgreSQL、Manifest、raw 和日志全部隔离到 pytest 目录。
     database = create_database(tmp_path)
     logger = RuntimeLogger(tmp_path / "runtime" / "logs")
     try:
@@ -360,9 +362,9 @@ def test_category_tree_process_interruption_closes_running_batch(
     interruption: BaseException,
     expected_type: type[BaseException],
 ) -> None:
-    """Close SQLite and Manifest before preserving a process interruption."""
+    """Close PostgreSQL and Manifest before preserving a process interruption."""
 
-    # 中止客户端在 SQLite running 批次创建后、分类树返回前终止流程。
+    # 中止客户端在 PostgreSQL running 批次创建后、分类树返回前终止流程。
     client = InterruptedCategoryClient(interruption)
     # 真实任务配置保留食品饮料根和全部生产参数契约。
     task = load_config(Path("config/tasks.yaml")).tasks[0]
@@ -372,7 +374,7 @@ def test_category_tree_process_interruption_closes_running_batch(
         with pytest.raises(expected_type) as error_info:
             prepare_category_batch(
                 runtime_root=tmp_path / "runtime",
-                batch_id="batch-category-process-interruption",
+                batch_id="batch-process-interruption",
                 task=task,
                 business_date=BUSINESS_DATE,
                 planned_at=PLANNED_AT,
@@ -385,7 +387,7 @@ def test_category_tree_process_interruption_closes_running_batch(
             # 新 Session 必须看到不再 running 的 interrupted 权威终态。
             batch = session.get(
                 CollectionBatch,
-                "batch-category-process-interruption",
+                "batch-process-interruption",
             )
             # 分类树未返回时不允许创建任何三级分类运行记录。
             category_count = session.scalar(
@@ -395,7 +397,7 @@ def test_category_tree_process_interruption_closes_running_batch(
             manifest_path = Path(batch.manifest_path or "") if batch else Path()
     finally:
         database.close()
-    # Manifest 是 SQLite 终态的本地审计镜像。
+    # Manifest 是 PostgreSQL 终态的本地审计镜像。
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     assert error_info.value is interruption
@@ -435,7 +437,7 @@ def test_empty_discovery_keeps_multi_root_scope_without_synthetic_root(tmp_path:
                 runtime_logger=RuntimeLogger(tmp_path / "runtime" / "logs"),
             )
         with database.session_factory() as session:
-            # SQLite 不得制造不存在的“全部行业”根分类。
+            # PostgreSQL 不得制造不存在的“全部行业”根分类。
             batch = session.get(CollectionBatch, "batch-category-empty")
     finally:
         database.close()
@@ -498,7 +500,7 @@ def test_stop_after_http_preserves_the_received_category_tree(tmp_path: Path) ->
         with pytest.raises(CategoryBatchPreparationError) as error_info:
             prepare_category_batch(
                 runtime_root=tmp_path / "runtime",
-                batch_id="batch-category-stop-after-response",
+                batch_id="batch-stop-after-response",
                 task=task,
                 business_date=BUSINESS_DATE,
                 planned_at=PLANNED_AT,
@@ -510,7 +512,7 @@ def test_stop_after_http_preserves_the_received_category_tree(tmp_path: Path) ->
             )
         with database.session_factory() as session:
             # interrupted 批次仍必须索引已经保存的分类树 raw。
-            batch = session.get(CollectionBatch, "batch-category-stop-after-response")
+            batch = session.get(CollectionBatch, "batch-stop-after-response")
             # 停止发生在解析前，不应创建任何 pending 分类。
             category_count = session.scalar(
                 select(func.count()).select_from(CategoryRun)
@@ -556,7 +558,7 @@ def test_initial_log_failure_is_wrapped_and_does_not_leave_running_batch(
                 ),
             )
         with database.session_factory() as session:
-            # SQLite 必须从 running 收口为稳定失败终态。
+            # PostgreSQL 必须从 running 收口为稳定失败终态。
             batch = session.get(CollectionBatch, "batch-category-log-failure")
     finally:
         database.close()

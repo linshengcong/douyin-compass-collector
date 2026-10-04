@@ -58,7 +58,7 @@ def build_application(project_root: Path, target: str) -> Path:
         "--icon",
         str(icon_path),
         "--add-data",
-        add_data_argument(project_root / "migrations", "migrations"),
+        add_data_argument(project_root / "migrations_postgresql", "migrations_postgresql"),
         "--add-data",
         add_data_argument(project_root / "alembic.ini", "."),
         "--add-data",
@@ -70,6 +70,11 @@ def build_application(project_root: Path, target: str) -> Path:
         # GUI 和迁移链路含有延迟导入，显式收集避免桌面版运行时缺少模块。
         "--collect-submodules",
         "compass_collector",
+        # psycopg 的二进制实现需要随桌面程序一起分发。
+        "--collect-all",
+        "psycopg",
+        "--collect-all",
+        "psycopg_binary",
         # tzdata supplies IANA zones for Windows where ZoneInfo has no system database.
         "--collect-data",
         "tzdata",

@@ -23,6 +23,10 @@ CSV_HEADERS = (
     "成交件数",
     "首次上榜",
 )
+# 淘宝以接口原始区间展示，商品跳转链接独立成列。
+TAOBAO_CSV_HEADERS = (
+    "分类", "排名", "商品缩略图", "商品", "商品链接", "店铺名称", "支付买家数", "访客数",
+)
 # 中文紧凑展示使用万和亿两个量级。
 TEN_THOUSAND = Decimal(10_000)
 HUNDRED_MILLION = Decimal(100_000_000)
@@ -131,6 +135,10 @@ class CsvExporter:
                 "invalid task_id for CSV path",
                 category="csv_path_error",
             )
+        if platform not in {"compass", "taobao"}:
+            raise PublicationError("unsupported CSV platform", category="csv_format_error")
+        # 平台决定展示契约；路径隔离不能替代字段隔离。
+        headers = TAOBAO_CSV_HEADERS if platform == "taobao" else CSV_HEADERS
         # 业务日期和任务目录共同隔离同名、同计划时间的不同任务。
         export_directory = (
             self.export_root / platform / planned_at.date().isoformat() / task_id
@@ -152,7 +160,7 @@ class CsvExporter:
             ) as file_handle:
                 # CSV writer 由标准库处理逗号、换行和引号转义。
                 writer = csv.writer(file_handle)
-                writer.writerow(CSV_HEADERS)
+                writer.writerow(headers)
                 # 分类按照接口发现顺序输出，不依赖调用方传入顺序。
                 sorted_category_runs = sorted(
                     category_runs,
@@ -167,18 +175,32 @@ class CsvExporter:
                     for entry in sorted_entries:
                         # 店铺名称严格按接口原始顺序拼接。
                         shop_names = " | ".join(shop.shop_name for shop in entry.shops)
-                        writer.writerow(
-                            (
-                                category_run.plan.category.display_path,
-                                entry.rank,
-                                entry.image_url or "",
-                                entry.product_name,
+                        # 共有信息保持相同顺序，业务指标按平台选择。
+                        common_values = (
+                            category_run.plan.category.display_path,
+                            entry.rank,
+                            entry.image_url or "",
+                            entry.product_name,
+                        )
+                        if platform == "taobao":
+                            if entry.pay_amount is not None or entry.pay_combo_count is not None or entry.newly_on_ranking is not None:
+                                raise PublicationError("Compass metrics in Taobao CSV", category="csv_format_error")
+                            writer.writerow(common_values + (
+                                entry.product_url or "",
+                                shop_names,
+                                entry.pay_buyer_count_raw if entry.pay_buyer_count_raw is not None else "",
+                                entry.visitor_count_raw if entry.visitor_count_raw is not None else "",
+                            ))
+                        else:
+                            if entry.pay_amount is None or entry.pay_combo_count is None or entry.newly_on_ranking is None:
+                                raise PublicationError("missing Compass metrics", category="csv_format_error")
+                            writer.writerow(common_values + (
                                 shop_names,
                                 format_metric_range(entry.pay_amount),
                                 format_metric_range(entry.pay_combo_count),
                                 "true" if entry.newly_on_ranking else "false",
-                            )
-                        )
+                            ))
+
         except BaseException as error:
             # batch_id 唯一临时路径属于本次导出，中止信号也必须先完成补偿。
             if temporary_path.exists():

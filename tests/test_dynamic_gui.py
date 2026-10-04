@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from compass_collector import gui as gui_module
+from compass_collector.config import load_config
 from compass_collector.gui import (
     GuiProgressState,
     _business_batch_id,
@@ -159,7 +160,7 @@ def test_batch_skipped_clears_loading_progress() -> None:
 def test_gui_batch_display_ignores_notification_execution_identity() -> None:
     """Keep the visible batch ID tied to a real task batch during notification."""
 
-    # business_event 带 task_id，可定位到真实 SQLite/raw 任务批次。
+    # business_event 带 task_id，可定位到真实 PostgreSQL/raw 任务批次。
     business_event = {"batch_id": "task-batch", "task_id": "food-task"}
     # legacy_notification 模拟升级前通知复用 batch_id 的安全事件。
     legacy_notification = {
@@ -236,7 +237,7 @@ def test_terminal_category_failure_overrides_the_continue_message() -> None:
 
 
 def test_publication_failure_replaces_the_waiting_for_publish_state() -> None:
-    """Show an explicit failed terminal result when CSV or SQLite publication fails."""
+    """Show an explicit failed terminal result when CSV or PostgreSQL publication fails."""
 
     # ready_state 是全部分类完成后、正式发布前的 GUI 状态。
     ready_state = GuiProgressState(
@@ -395,7 +396,7 @@ def test_latest_published_csv_uses_published_at_and_skips_missing_files(
             # database_path 仅用于证明 GUI 传入配置中的路径。
             self.database_path = database_path
 
-        def recent_status(self, limit: int) -> list[SimpleNamespace]:
+        def recent_status(self, limit: int, *, platform: str | None = None) -> list[SimpleNamespace]:
             """Return the prepared newest-first batch summaries."""
 
             assert limit == 100
@@ -407,9 +408,9 @@ def test_latest_published_csv_uses_published_at_and_skips_missing_files(
             database_closed.append(True)
 
     # config 只提供 latest_published_csv 所需的数据库路径边界。
-    config = SimpleNamespace(database=SimpleNamespace(path=tmp_path / "collector.db"))
+    config = load_config(Path("config/tasks.yaml")).for_platform("compass")
     # 测试不执行 Alembic，只验证 GUI 的发布筛选规则。
-    monkeypatch.setattr(gui_module, "upgrade_database", lambda database_path: None)
+    monkeypatch.setattr(gui_module, "upgrade_database", lambda database_path, **kwargs: None)
     monkeypatch.setattr(gui_module, "Database", FakeDatabase)
 
     assert latest_published_csv(config) == partial_csv  # type: ignore[arg-type]

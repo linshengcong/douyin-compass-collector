@@ -1,5 +1,7 @@
 """Stage-two batch creation and atomic category-run persistence tests."""
 
+from pg_support import pg_url, pg_config
+
 from datetime import date, datetime
 from pathlib import Path
 
@@ -20,7 +22,7 @@ from compass_collector.persistence import (
 )
 
 
-# 固定时间让 SQLite 墙上时间断言稳定。
+# 固定时间让 PostgreSQL 墙上时间断言稳定。
 PLANNED_AT = datetime(2026, 7, 17, 14, 0)
 # 批次开始时间与计划时间分开，便于验证字段映射。
 STARTED_AT = datetime(2026, 7, 17, 13, 59, 30)
@@ -29,10 +31,10 @@ FINISHED_AT = datetime(2026, 7, 17, 14, 0, 5)
 
 
 def create_database(tmp_path: Path) -> Database:
-    """Create one migrated SQLite database below the pytest temp root."""
+    """Create one migrated PostgreSQL database below the pytest temp root."""
 
     # 每个测试使用独立数据库，避免影响工程 runtime。
-    database_path = tmp_path / "runtime" / "data" / "collector.db"
+    database_path = pg_url(tmp_path / "runtime" / "data" / "collector.db")
     upgrade_database(database_path)
     return Database(database_path)
 
@@ -189,7 +191,7 @@ def test_category_run_insert_failure_rolls_back_batch_discovery_fields(
             category_id="301",
             category_name="重复分类",
         )
-        # 事务输入本身保持计划与 discovery 一致，让 SQLite 唯一约束负责回滚。
+        # 事务输入本身保持计划与 discovery 一致，让 PostgreSQL 唯一约束负责回滚。
         invalid_discovery = CategoryDiscoveryResult(
             root_category_id=discovery.root_category_id,
             root_category_name=discovery.root_category_name,

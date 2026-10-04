@@ -1,12 +1,11 @@
 .venv/
 .pytest_cache/
+.ruff_cache/
 .DS_Store
 __pycache__/
 *.py[cod]
 runtime/
 .env
-web/node_modules/
-web/dist/
 build/
 dist/
 release/

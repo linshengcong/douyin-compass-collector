@@ -193,6 +193,62 @@ def test_summary_reports_partial_failure_and_never_exposes_csv_path() -> None:
     assert len(markdown.encode("utf-8")) <= MAX_MARKDOWN_BYTES
 
 
+@pytest.mark.parametrize("status,title_text", [
+    (TaskNotificationStatus.SUCCESS, "淘宝采集成功"),
+    (TaskNotificationStatus.FAILED, "淘宝采集失败"),
+    (TaskNotificationStatus.INTERRUPTED, "淘宝采集已中止"),
+])
+def test_taobao_task_config_reaches_signed_notification(tmp_path, monkeypatch, status, title_text) -> None:
+    """Carry platform identity from the real task builder to one mocked webhook POST."""
+    from compass_collector.config import load_config
+    from compass_collector.runner import build_task_notification_result
+
+    # 从实际淘宝配置构建结果，不依赖任务ID包含taobao或直接设置通知平台。
+    task = load_config(Path("config/taobao-poc.yaml")).tasks[0]
+    # 外发只允许CSV文件名；消息中的任务状态和时间必须保留。
+    summary = _summary(build_task_notification_result(task, status, csv_path=Path("/private/local/result.csv")))
+    # 假凭证和MockTransport确保回归不向真实群发送消息。
+    requests = []
+    # 事件回调同时验证GUI使用的通知发送状态。
+    events = []
+
+    def handle_request(request: httpx.Request) -> httpx.Response:
+        """Capture exactly one notification without accessing the network."""
+        requests.append(request)
+        return httpx.Response(200, json={"errcode": 0, "errmsg": "ok"})
+
+    monkeypatch.setenv("DINGTALK_ENABLED", "true")
+    monkeypatch.setenv("DINGTALK_WEBHOOK_URL", FAKE_WEBHOOK)
+    monkeypatch.setenv("DINGTALK_SECRET", FAKE_SECRET)
+    # 使用生产通知边界执行配置读取、标题渲染和加签发送。
+    result = deliver_batch_notification(summary, RuntimeLogger(tmp_path / "logs", event_sink=events.append),
+                                        transport=httpx.MockTransport(handle_request))
+    assert result.status is NotificationDeliveryStatus.SUCCEEDED
+    assert len(requests) == 1
+    # 请求正文只在测试内解析，不输出Webhook或签名凭证。
+    payload = json.loads(requests[0].content)
+    assert title_text in payload["markdown"]["title"]
+    assert task.display_name in payload["markdown"]["text"]
+    assert f"`{status.value}`" in payload["markdown"]["text"]
+    assert "开始：" in payload["markdown"]["text"] and "结束：" in payload["markdown"]["text"]
+    assert "result.csv" in payload["markdown"]["text"] and "/private/local" not in payload["markdown"]["text"]
+    assert "sign" in parse_qs(urlparse(str(requests[0].url)).query)
+    assert [event["event"] for event in events] == ["notification_pending", "notification_succeeded"]
+
+
+def test_mixed_platform_notification_uses_generic_title() -> None:
+    """A combined scheduled group must not be labelled as only one platform."""
+    # 默认平台兼容原罗盘调用，淘宝必须通过显式平台字段区分。
+    summary = _summary(
+        TaskNotificationResult("compass-task", "罗盘任务", TaskNotificationStatus.SUCCESS),
+        TaskNotificationResult("taobao-task", "淘宝任务", TaskNotificationStatus.SUCCESS, platform="taobao"),
+    )
+    # 两个平台的任务明细与批次标题必须同时存在。
+    title, markdown = render_batch_markdown(summary)
+    assert title == "✅ 电商采集成功"
+    assert "罗盘任务" in markdown and "淘宝任务" in markdown
+
+
 def test_summary_renders_signed_csv_url_only_as_a_dingtalk_link() -> None:
     """Keep the temporary OSS URL out of local paths while making CSV downloadable."""
 
@@ -470,6 +526,27 @@ def test_notify_test_returns_nonzero_when_notification_is_disabled(
     exit_code = run_notification_test(RuntimeLogger(tmp_path / "logs"))
 
     assert exit_code == 1
+
+
+@pytest.mark.parametrize("platform,title", [("compass", "罗盘采集器通知测试"), ("taobao", "淘宝采集器通知测试")])
+def test_notification_test_keeps_requested_platform(tmp_path, monkeypatch, platform, title):
+    """The compact notify entrypoint must identify the chosen platform in its real payload."""
+    # 只发送到MockTransport，禁止使用本机配置触发外部消息。
+    monkeypatch.setenv("DINGTALK_ENABLED", "true")
+    monkeypatch.setenv("DINGTALK_WEBHOOK_URL", FAKE_WEBHOOK)
+    monkeypatch.setenv("DINGTALK_SECRET", FAKE_SECRET)
+    # 保留实际HTTP正文，验证CLI新增平台参数到消息标题的传递。
+    requests = []
+
+    def accept(request):
+        """Capture the signed POST and return the success contract locally."""
+        requests.append(request)
+        return httpx.Response(200, json={"errcode": 0})
+
+    assert run_notification_test(RuntimeLogger(tmp_path / "logs"), platform=platform,
+                                 transport=httpx.MockTransport(accept)) == 0
+    assert len(requests) == 1
+    assert title in json.loads(requests[0].content)["markdown"]["title"]
 
 
 @pytest.mark.parametrize(

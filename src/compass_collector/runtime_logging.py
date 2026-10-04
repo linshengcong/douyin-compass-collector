@@ -67,7 +67,7 @@ EventSink = Callable[[dict[str, Any]], None]
 class LogContext:
     """Identify one task attempt in every task-scoped log entry."""
 
-    # 业务批次 ID 连接 SQLite、raw、分类分页和正式发布结果。
+    # 业务批次 ID 连接 PostgreSQL、raw、分类分页和正式发布结果。
     batch_id: str | None = None
     # 执行批次 ID 连接一次多任务运行及其批次汇总通知。
     execution_batch_id: str | None = None
@@ -86,6 +86,7 @@ class RuntimeLogger:
         event_sink: EventSink | None = None,
         *,
         execution_batch_id: str | None = None,
+        platform: str | None = None,
     ) -> None:
         """Create the daily log directory without opening a long-lived handle."""
 
@@ -96,6 +97,10 @@ class RuntimeLogger:
         self.event_sink = event_sink
         # execution_batch_id 让无须逐层传参的任务日志仍归属同一次运行。
         self.execution_batch_id = execution_batch_id
+        # 平台来自运行边界，不能通过自由详情覆盖。
+        if platform not in {None, "compass", "taobao"}:
+            raise ValueError("unsupported log platform")
+        self.platform = platform
 
     def _log_path(self, captured_at: datetime) -> Path:
         """Return the natural daily-rotation path for one event timestamp."""
@@ -138,6 +143,7 @@ class RuntimeLogger:
         captured_at = datetime.now(SHANGHAI_TIMEZONE)
         # 无任务上下文的系统事件显式输出 null，不伪造分类运行 ID。
         payload: dict[str, Any] = {
+            "platform": self.platform,
             "timestamp": captured_at.isoformat(),
             "level": level,
             "event": event,

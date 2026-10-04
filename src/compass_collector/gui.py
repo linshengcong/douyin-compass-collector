@@ -1,7 +1,6 @@
 """PySide6 desktop control console for manual runs and an owned Scheduler."""
 
 import json
-import sys
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
@@ -38,12 +37,14 @@ from PySide6.QtWidgets import (
 )
 
 from compass_collector.config import AppConfig, load_config
+from compass_collector.qt_application import ensure_qt_application
 from compass_collector.local_data import clear_local_data_with_locks
 from compass_collector.notifier import BatchSource
 from compass_collector.persistence import Database, upgrade_database
 from compass_collector.run_control import CollectionControl
 from compass_collector.runner import run_collection
 from compass_collector.runtime_locks import ProcessLock, RuntimeLockBusy, lock_is_held
+from compass_collector.platform_runtime import PlatformRuntime
 from compass_collector.runtime_logging import (
     EVENT_STREAM_PREFIX,
     EVENT_STREAM_PATH_ENV,
@@ -60,6 +61,23 @@ from compass_collector.scheduler_control import (
 RUNTIME_ROOT = runtime_root()
 # GUI 日志表限制内存事件数，持久记录仍以 JSONL 为准。
 MAX_VISIBLE_EVENTS = 2000
+
+
+def category_scope_summary(task) -> str:
+    """Display the selected platform's category contract without foreign fields."""
+    if task.platform == "taobao":
+        # 主范围沿用旧展示，追加分支明确显示，避免跨根任务仍被描述为单根。
+        summary = (", ".join(task.category_scope.targets)
+                   or f"cateId={task.category_scope.root_category_id} 下全部三级分类")
+        for root in task.category_scope.additional_roots:
+            summary += (f"；追加 cateId={root.root_category_id} 下二级分类 "
+                        f"{', '.join(root.level2_category_ids)} 的全部三级分类")
+        return summary
+    return (", ".join(f"{target.industry_id}:{target.category_id}"
+                      for target in task.category_scope.targets)
+            or (f"industry_id={task.category_scope.industry_id} 下全部三级分类"
+                if task.category_scope.industry_id is not None
+                else "自动发现全部三级分类"))
 
 
 def read_scheduler_event_file(
@@ -95,7 +113,7 @@ def read_scheduler_event_file(
 class RunMode(str, Enum):
     """Represent stable manual collection modes shown in the GUI."""
 
-    # 正式采集会发布 SQLite 和 CSV。
+    # 正式采集会发布 PostgreSQL 和 CSV。
     OFFICIAL = "official"
     # 试运行只采集和校验，不发布正式数据。
     DRY_RUN = "dry_run"
@@ -109,14 +127,16 @@ class GuiLaunchRequest:
     config_path: Path
     # task_id 限定当前控制台管理的任务。
     task_id: str | None
-    # auto_start 区分 make app 与 make run/dry-run/force。
+    # auto_start 区分等待手动开始和启动后立即采集。
     auto_start: bool
-    # dry_run 保留 SQLite 审计，但不发布正式商品和 CSV。
+    # dry_run 保留 PostgreSQL 审计，但不发布正式商品和 CSV。
     dry_run: bool = False
     # force 对应忽略当天成功幂等记录的高级开关。
     force: bool = False
     # lock_mode 让命令启动的 GUI 不允许临时切换模式。
     lock_mode: bool = False
+    # 单平台Make入口需在工作线程重读配置及GUI启动调度时保持平台范围。
+    platform: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -674,7 +694,7 @@ class CollectionWorker(QObject):
         super().__init__()
         # request 保存配置和任务入口，不包含认证值。
         self.request = request
-        # mode 决定是否发布正式商品和 CSV，dry-run 仍保留 SQLite 审计。
+        # mode 决定是否发布正式商品和 CSV，dry-run 仍保留 PostgreSQL 审计。
         self.mode = mode
         # force 只影响正式运行幂等版本分配。
         self.force = force
@@ -688,6 +708,8 @@ class CollectionWorker(QObject):
         try:
             # 每次点击开始都重新读取只读配置，确保展示与执行边界清晰。
             config = load_config(self.request.config_path)
+            if self.request.platform is not None:
+                config = config.for_platform(self.request.platform)
             # runner 在本工作线程创建并关闭 Playwright、HTTPX 和数据库资源。
             exit_code = run_collection(
                 config,
@@ -740,16 +762,19 @@ def _local_event(*, level: str, event: str, message: str, stage: str) -> dict[st
     }
 
 
-def latest_published_csv(config: AppConfig) -> Path | None:
-    """Return the newest existing formally published CSV from SQLite metadata."""
+def latest_published_csv(config: AppConfig, platform: str | None = None) -> Path | None:
+    """Return the newest existing formally published CSV from PostgreSQL metadata."""
 
+    # 查询入口也必须解析平台及数据库，不读取另一个平台的历史。
+    platform = platform or config.execution_platform()
+    config = config.for_platform(platform)
     # GUI 初次打开允许初始化数据库结构，但不会创建采集记录。
-    upgrade_database(config.database.path)
-    # 短生命周期查询避免 GUI 长期占用 SQLite 连接。
-    database = Database(config.database.path)
+    upgrade_database(config.database.url, platform=platform or config.execution_platform())
+    # 短生命周期查询避免 GUI 长期占用 PostgreSQL 连接。
+    database = Database(config.database.url)
     try:
         # 多取少量记录以跳过已经被人工移动的旧 CSV。
-        status_rows = database.recent_status(limit=100)
+        status_rows = database.recent_status(limit=100, platform=platform) if platform else database.recent_status(limit=100)
     finally:
         database.close()
     for row in status_rows:
@@ -774,6 +799,8 @@ class CollectorWindow(QMainWindow):
         self.config = config
         # request 记录 CLI 启动语义。
         self.request = request
+        # 窗口拥有唯一平台运行边界，状态检测与采集使用同一套路径。
+        self.runtime_scope = PlatformRuntime(RUNTIME_ROOT, request.platform or config.execution_platform(request.task_id))
         # 当前工作线程为空表示没有 GUI 手动采集。
         self.collection_thread: QThread | None = None
         # worker 必须保留强引用直到 QThread 完成。
@@ -799,7 +826,7 @@ class CollectorWindow(QMainWindow):
         # 事件文件最后的半行留给下一次轮询补全。
         self.scheduler_event_buffer = ""
         # 当前或最近已发布 CSV 是打开按钮的唯一目标。
-        self.current_csv_path = latest_published_csv(config)
+        self.current_csv_path = latest_published_csv(config, request.platform)
         # progress_state 让事件处理逻辑可以脱离真实 Qt 窗口单独验证。
         self.progress_state = GuiProgressState(csv_path=self.current_csv_path)
         # 所有展示事件只保存在内存，超过上限丢弃最旧项。
@@ -832,7 +859,7 @@ class CollectorWindow(QMainWindow):
     def _build_ui(self) -> None:
         """Create the confirmed single-window status, log, and action layout."""
 
-        self.setWindowTitle("抖音罗盘采集控制台")
+        self.setWindowTitle("淘宝采集控制台" if self.runtime_scope.platform == "taobao" else "抖音罗盘采集控制台")
         self.resize(1080, 720)
         # central_widget 承载所有状态和操作区，不创建额外业务窗口。
         central_widget = QWidget(self)
@@ -863,21 +890,13 @@ class CollectorWindow(QMainWindow):
             f"当前 Profile：{self.config.browser_for(selected_task.platform).profile_dir}"
         )
         self.host_label = QLabel(selected_task.platform)
+        # 淘宝的目标是单分类 ID，不能读取抖音专用的行业/组合字段。
+        scope_summary = category_scope_summary(selected_task)
         self.interval_label = QLabel(
             f"{self.config.collection.request_interval_seconds.min:g}–"
             f"{self.config.collection.request_interval_seconds.max:g} 秒 / "
             f"页面串行采集 / {selected_task.category_scope.mode} / "
-            + (
-                ", ".join(
-                    f"{target.industry_id}:{target.category_id}"
-                    for target in selected_task.category_scope.targets
-                )
-                or (
-                    f"industry_id={selected_task.category_scope.industry_id} 下全部三级分类"
-                    if selected_task.category_scope.industry_id is not None
-                    else "自动发现全部三级分类"
-                )
-            )
+            + scope_summary
         )
         self.schedule_label = QLabel(selected_task.schedule)
         self.run_status_label = QLabel("空闲")
@@ -986,10 +1005,10 @@ class CollectorWindow(QMainWindow):
             RunMode.DRY_RUN.value,
         )
         self.force_checkbox = QCheckBox("每次自动新版本")
-        # 命令启动的 GUI 锁定对应模式，make app 才允许选择。
+        # run 命令锁定对应模式，直接CLI app入口才允许选择。
         initial_mode = RunMode.DRY_RUN if self.request.dry_run else RunMode.OFFICIAL
         self.mode_combo.setCurrentIndex(1 if initial_mode is RunMode.DRY_RUN else 0)
-        self.force_checkbox.setChecked(True)
+        self.force_checkbox.setChecked(self.request.force if self.request.lock_mode else True)
         self.mode_combo.setEnabled(not self.request.lock_mode)
         self.force_checkbox.setEnabled(False)
         self.start_button = QPushButton("开始采集")
@@ -1028,7 +1047,7 @@ class CollectorWindow(QMainWindow):
         """Restore the last batch's tail without creating another log source."""
 
         # 历史事件来自现有安全 JSONL，最多恢复已确认的 500 条。
-        persisted_events = read_latest_batch_events(RUNTIME_ROOT / "logs", limit=500)
+        persisted_events = read_latest_batch_events(self.runtime_scope.logs, limit=500)
         for event in persisted_events:
             self._append_event(event, render=False)
         # 倒序恢复最近一个通知终态，不重发任何 Webhook。
@@ -1043,8 +1062,8 @@ class CollectorWindow(QMainWindow):
 
         if self.collecting:
             return
-        # GUI 手动开始始终生成新版本，保证用户主动更新时会进入 Chrome 采集链路。
-        force = True
+        # 命令锁定时遵循显式normal/force；空闲旧GUI保留手动更新新版本语义。
+        force = self.request.force if self.request.lock_mode else True
         # control 的事件回调只发 Qt Signal，不直接操作控件。
         self.collection_control = CollectionControl(keep_browser_open=True)
         # worker 绑定当前模式，运行期间界面不允许修改。
@@ -1103,8 +1122,11 @@ class CollectorWindow(QMainWindow):
             self.open_csv_button.setText("打开本次 CSV")
         if event_name == "manual_inspection_ready":
             self.collecting = True
-            self.inspection_ready = True
-            self.run_status_label.setText("等待检查 Chrome")
+            # 已确认退出时继续收尾，不能被迟到的检查事件重新切回人工等待。
+            self.inspection_ready = not self.pending_close
+            self.run_status_label.setText("正在关闭 Chrome" if self.pending_close else "等待检查 Chrome")
+            if self.pending_close and self.collection_control is not None:
+                self.collection_control.request_browser_close()
             self._update_action_states()
         elif event_name == "scheduled_group_started":
             self.scheduler_job_active = True
@@ -1323,7 +1345,7 @@ class CollectorWindow(QMainWindow):
                 self.scheduler_control.request_shutdown()
             return
         # 外部 Scheduler 只读展示，永远不从 GUI 终止。
-        scheduler_lock_path = RUNTIME_ROOT / "locks" / "scheduler.lock"
+        scheduler_lock_path = self.runtime_scope.lock_path("scheduler")
         if lock_is_held(scheduler_lock_path, "scheduler"):
             self._refresh_scheduler_status()
             return
@@ -1333,7 +1355,7 @@ class CollectorWindow(QMainWindow):
         scheduler_control_id = uuid4().hex
         # GUI 和子进程通过相同运行目录解析本次控制文件。
         self.scheduler_control = SchedulerControlFiles(
-            RUNTIME_ROOT / "controls",
+            self.runtime_scope.controls,
             scheduler_control_id,
         )
         process_environment.insert(SCHEDULER_CONTROL_ID_ENV, scheduler_control_id)
@@ -1345,6 +1367,8 @@ class CollectorWindow(QMainWindow):
         scheduler_program, scheduler_arguments = scheduler_process_command(
             self.request.config_path
         )
+        if self.request.platform is not None:
+            scheduler_arguments.extend(["--platform", self.request.platform])
         self.scheduler_process.setWorkingDirectory(str(Path.cwd()))
         self.scheduler_process.setProgram(scheduler_program)
         self.scheduler_process.setArguments(scheduler_arguments)
@@ -1444,7 +1468,7 @@ class CollectorWindow(QMainWindow):
             return
         # advisory lock 是外部实例真相，锁文件中的旧 PID 不参与判断。
         external_running = lock_is_held(
-            RUNTIME_ROOT / "locks" / "scheduler.lock",
+            self.runtime_scope.lock_path("scheduler"),
             "scheduler",
         )
         self.scheduler_status_label.setText(
@@ -1462,7 +1486,7 @@ class CollectorWindow(QMainWindow):
                 False
                 if self.owned_scheduler
                 else lock_is_held(
-                    RUNTIME_ROOT / "locks" / "scheduler.lock", "scheduler"
+                    self.runtime_scope.lock_path("scheduler"), "scheduler"
                 )
             )
         self.start_button.setEnabled(not self.collecting)
@@ -1494,7 +1518,7 @@ class CollectorWindow(QMainWindow):
 
         # 当前文件不存在时重新查询最近仍存在的正式发布 CSV。
         if self.current_csv_path is None or not self.current_csv_path.exists():
-            self.current_csv_path = latest_published_csv(self.config)
+            self.current_csv_path = latest_published_csv(self.config, self.request.platform)
             self.progress_state = replace(
                 self.progress_state,
                 csv_path=self.current_csv_path,
@@ -1521,7 +1545,7 @@ class CollectorWindow(QMainWindow):
         """Open the permanent CSV output directory in Finder."""
 
         # 输出目录允许在首次正式采集前为空。
-        output_directory = RUNTIME_ROOT / "exports"
+        output_directory = RUNTIME_ROOT / "exports" / self.runtime_scope.platform
         output_directory.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(output_directory.resolve())))
 
@@ -1531,7 +1555,7 @@ class CollectorWindow(QMainWindow):
 
         # 按钮状态之外再做一次实时检查，覆盖 Scheduler 竞态窗口。
         scheduler_running = self.owned_scheduler or lock_is_held(
-            RUNTIME_ROOT / "locks" / "scheduler.lock",
+            self.runtime_scope.lock_path("scheduler"),
             "scheduler",
         )
         if self.collecting or self.scheduler_job_active or scheduler_running:
@@ -1544,11 +1568,8 @@ class CollectorWindow(QMainWindow):
         # 确认文案显式列出删除与保留边界。
         answer = QMessageBox.question(
             self,
-            "确认清除本地采集数据",
-            "此操作不可恢复，将删除 SQLite、CSV、原始响应、"
-            "失败材料和 JSONL 日志。\n\n"
-            "会保留 Chrome 登录态、.env、配置、运行锁和备份。\n\n"
-            "确认继续吗？",
+            "确认清除当前平台采集数据",
+            "此操作不可恢复，将删除配置的 PostgreSQL 数据库中当前平台的批次及其本地产物，保留旧 SQLite 归档、另一平台数据、日志及登录态。\n\n确认继续吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1559,7 +1580,8 @@ class CollectorWindow(QMainWindow):
         try:
             cleanup_summary = clear_local_data_with_locks(
                 RUNTIME_ROOT,
-                self.config.database.path,
+                self.config.database.url,
+                platform=self.runtime_scope.platform, task_ids=tuple(task.id for task in self.config.tasks),
             )
         except RuntimeLockBusy:
             QMessageBox.warning(
@@ -1592,6 +1614,7 @@ class CollectorWindow(QMainWindow):
         self.open_csv_button.setText("打开最近已发布 CSV")
         # 完成弹窗只展示删除计数和失败数量。
         result_message = (
+            f"已删除批次 {cleanup_summary.database_batches} 个，"
             f"已删除数据库文件 {cleanup_summary.database_files} 个，"
             f"清空数据目录 {cleanup_summary.runtime_directories} 个，"
             f"失败 {cleanup_summary.failures} 项。\n"
@@ -1606,29 +1629,15 @@ class CollectorWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         """Require explicit cleanup of active collection and owned Scheduler work."""
 
-        if self.collecting:
-            answer = QMessageBox.question(
-                self,
-                "采集仍在运行",
-                "退出会中止本次采集、关闭 Chrome 并等待资源清理，是否继续？",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                event.ignore()
-                return
-            self.pending_close = True
-            if self.collection_control is not None:
-                self.collection_control.request_stop()
-                self.collection_control.request_browser_close()
-            self.run_status_label.setText("正在清理后退出")
+        # 一次确认覆盖本窗口拥有的全部工作；等待期间不重复弹框。
+        if self.pending_close and (self.collecting or self.owned_scheduler):
             event.ignore()
             return
-        if self.owned_scheduler:
+        if self.collecting or self.owned_scheduler:
             answer = QMessageBox.question(
                 self,
-                "Scheduler 仍在运行",
-                "退出会优雅停止 GUI 启动的 Scheduler，是否继续？",
+                "确认退出采集控制台",
+                "退出会中止本次采集、关闭 Chrome，并停止本窗口启动的 Scheduler，等待资源清理。是否继续？",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -1636,10 +1645,14 @@ class CollectorWindow(QMainWindow):
                 event.ignore()
                 return
             self.pending_close = True
-            self.scheduler_status_label.setText("停止中，等待当前批次完成")
-            # 退出窗口与按钮停止使用相同的等待式跨平台协议。
-            if self.scheduler_control is not None:
+            if self.collecting and self.collection_control is not None:
+                self.collection_control.request_stop()
+                self.collection_control.request_browser_close()
+            # 只停止本窗口持有实例UUID的Scheduler，不操作外部或另一平台。
+            if self.owned_scheduler and self.scheduler_control is not None:
                 self.scheduler_control.request_shutdown()
+                self.scheduler_status_label.setText("停止中，等待当前批次完成")
+            self.run_status_label.setText("正在清理后退出")
             event.ignore()
             return
         event.accept()
@@ -1649,10 +1662,16 @@ def run_gui(config: AppConfig, request: GuiLaunchRequest) -> int:
     """Run one process-wide PySide6 console protected by a GUI instance lock."""
 
     # QApplication 必须先存在，第二实例才能显示可见提示。
-    application = QApplication.instance() or QApplication(sys.argv)
+    application = ensure_qt_application()
     application.setApplicationName("抖音罗盘采集控制台")
     # GUI 锁只约束窗口实例，不阻止 --no-gui 状态查询。
-    gui_lock = ProcessLock(RUNTIME_ROOT / "locks" / "gui.lock", "gui")
+    # 从请求或旧CLI配置推导唯一平台，拒绝旧全局进程并隔离窗口实例。
+    platform = request.platform or config.execution_platform(request.task_id)
+    config = config.for_platform(platform)
+    request = replace(request, platform=platform)
+    scope = PlatformRuntime(RUNTIME_ROOT, platform)
+    scope.reject_legacy_operations()
+    gui_lock = ProcessLock(scope.lock_path("gui"), "gui")
     try:
         gui_lock.acquire()
     except RuntimeLockBusy:

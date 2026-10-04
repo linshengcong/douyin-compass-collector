@@ -1,7 +1,8 @@
 """Historical migration, platform publication and legacy retention regressions."""
 
 import json
-import sqlite3
+from sqlalchemy import text
+from pg_support import pg_url
 from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,78 +19,20 @@ from test_stage_four_persistence import prepare_collected_batch, prepare_staged_
 
 
 def test_migration_backups_preserve_history_relationships_and_display(tmp_path):
-    """Back up a populated old revision, then preserve counts and display units."""
-    # Build a real published batch before reconstructing the legacy revision.
-    database, batch = prepare_collected_batch(
-        tmp_path, category_statuses=("success",), mode="normal"
-    )
-    staged = prepare_staged_csv(tmp_path)
-    database.publish_collected_batch(
-        collected_batch=batch,
-        version=1,
-        staged_csv=staged,
-        published_at=datetime(2026, 7, 17, 14, 5),
-    )
-    path = tmp_path / "runtime/data/collector.db"
-    database.close()
-    config = Config("alembic.ini")
-    config.set_main_option("sqlalchemy.url", f"sqlite:///{path}")
-    command.downgrade(config, "0004_product_image_url")
-    with sqlite3.connect(path) as connection:
-        tables = (
-            "collection_batches",
-            "category_runs",
-            "raw_responses",
-            "product_rank_entries",
-            "product_rank_entry_shops",
-        )
-        counts = {
-            table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-            for table in tables
-        }
-        old = connection.execute(
-            "SELECT pay_amount_min_value,pay_amount_max_value,pay_combo_count_min_value,pay_combo_count_max_value FROM product_rank_entries"
-        ).fetchone()
-    upgrade_database(path)
-    backups = list((path.parent / "backups").glob("*.db"))
-    assert len(backups) == 1
-    with sqlite3.connect(backups[0]) as backup:
-        assert (
-            backup.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-            == "0004_product_image_url"
-        )
-    with sqlite3.connect(path) as connection:
-        assert counts == {
-            table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-            for table in tables
-        }
-        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
-        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
-        new = connection.execute(
-            "SELECT pay_amount_min_value,pay_amount_max_value,pay_combo_count_min_value,pay_combo_count_max_value,pay_amount_unit,pay_combo_count_unit FROM product_rank_entries"
-        ).fetchone()
-        snapshot = json.loads(
-            connection.execute(
-                "SELECT config_snapshot FROM collection_batches"
-            ).fetchone()[0]
-        )
-        assert snapshot["requested_selection"] is None
-        assert (
-            connection.execute("SELECT platform FROM collection_batches").fetchone()[0]
-            == "compass"
-        )
-        assert json.loads(
-            connection.execute("SELECT scope_path FROM category_runs").fetchone()[0]
-        ) == ["食品饮料", "二级分类1", "三级分类1"]
-    assert tuple(Decimal(str(value)) for value in new[:4]) == tuple(
-        Decimal(str(value)) / scale for value, scale in zip(old, [100, 100, 10, 10])
-    )
-    assert new[4:] == ("CNY", "count")
-    assert format_metric_range(
-        MetricRange(new[0], new[1], "CNY")
-    ) == format_metric_range(
-        MetricRange(Decimal(old[0]) / 100, Decimal(old[1]) / 100, "CNY")
-    )
+    """Repeated PG initialization preserves official data and historical SQLite files."""
+    # 旧 SQLite 文件只作为归档保留，不进入新运行路径。
+    archive = tmp_path / "collector.db"
+    archive.write_bytes(b"archived SQLite")
+    database, batch = prepare_collected_batch(tmp_path, category_statuses=("success",), mode="normal")
+    try:
+        database.publish_collected_batch(batch, 1, prepare_staged_csv(tmp_path), datetime(2026, 7, 17, 14, 5))
+        upgrade_database(database.engine.url)
+        with database.engine.connect() as connection:
+            assert connection.execute(text("SELECT count(*) FROM product_rank_entries")).scalar_one() == 1
+            assert connection.execute(text("SELECT count(*) FROM product_rank_entry_shops")).scalar_one() == 1
+        assert archive.read_bytes() == b"archived SQLite"
+    finally:
+        database.close()
 
 
 def test_task_indexes_are_isolated_and_only_primary_updates_root(tmp_path):
@@ -220,7 +163,7 @@ def test_shared_collection_accepts_one_level_non_compass_adapter(tmp_path):
 
     config = load_config(Path("config/tasks.yaml"))
     task = config.tasks[0].model_copy(update={"platform": "test_platform"})
-    path = tmp_path / "db.sqlite"
+    path = pg_url(tmp_path / "db")
     upgrade_database(path)
     database = Database(path)
     adapter = OtherAdapter()
@@ -246,16 +189,8 @@ def test_shared_collection_accepts_one_level_non_compass_adapter(tmp_path):
         assert len(collected.category_runs[0].entries) == 1
         assert prepared.storage.manifest["categories"][0]["scope_path"] == ["单层类目"]
         assert prepared.storage.manifest["platform"] == "test_platform"
-        with sqlite3.connect(path) as connection:
-            assert json.loads(
-                connection.execute("SELECT safe_params FROM raw_responses").fetchone()[
-                    0
-                ]
-            ) == {"cursor": "start"}
-            assert json.loads(
-                connection.execute(
-                    "SELECT platform_metadata FROM category_runs"
-                ).fetchone()[0]
-            ) == {"native_id": "key"}
+        with database.engine.connect() as connection:
+            assert connection.execute(text("SELECT safe_params FROM raw_responses")).scalar_one() == {"cursor": "start"}
+            assert connection.execute(text("SELECT platform_metadata FROM category_runs")).scalar_one() == {"native_id": "key"}
     finally:
         database.close()

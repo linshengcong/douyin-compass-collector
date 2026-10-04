@@ -1,5 +1,7 @@
 """Dynamic-category runner integration and publication lifecycle tests."""
 
+from pg_support import pg_url, pg_config
+
 import json
 from datetime import datetime
 from pathlib import Path
@@ -45,15 +47,9 @@ PLANNED_AT = datetime(2026, 7, 17, 14, 0, tzinfo=SHANGHAI_TIMEZONE)
 
 
 def temporary_config(tmp_path: Path) -> AppConfig:
-    """Point the checked-in task at an isolated SQLite database."""
-
-    # 真实配置仅替换数据库路径，业务参数保持生产契约。
-    config = load_config(Path("config/tasks.yaml"))
-    # Pydantic 不可变复制避免污染其他测试。
-    database_config = config.database.model_copy(
-        update={"path": tmp_path / "runtime" / "data" / "collector.db"}
-    )
-    return config.model_copy(update={"database": database_config})
+    """Keep task settings while isolating each platform in PostgreSQL."""
+    # 所有真实连接指向测试 schema，不触碰工程运行库。
+    return pg_config(load_config(Path("config/tasks.yaml")), tmp_path)
 
 
 def build_rank_payload(category_id: str) -> dict[str, Any]:
@@ -269,7 +265,7 @@ def test_same_day_skip_and_force_publish_distinct_versions(tmp_path, monkeypatch
         == 0
     )
     # 读取最终数据库状态，核对两个版本及各自的 CSV 仍然存在。
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         # 发布快照按执行时间倒序返回，版本号负责稳定身份。
         rows = database.recent_status(limit=5)
@@ -308,7 +304,7 @@ def test_official_runner_publishes_dynamic_categories_and_chinese_csv(
 
     exit_code = run_fake_collection(config=config, dry_run=False)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         # 正式商品表只在发布事务中写入三个成功分类商品。
         status_rows = database.recent_status(limit=5)
@@ -326,7 +322,7 @@ def test_official_runner_publishes_dynamic_categories_and_chinese_csv(
     status_exit_code = run_status(config, limit=5)
     status_output = capsys.readouterr().out
     # runtime_events 验证 runner 把任务日志归入通知使用的同一执行批次。
-    log_path = next((tmp_path / "runtime" / "logs").glob("*.jsonl"))
+    log_path = next((tmp_path / "runtime" / "logs" / "compass").glob("*.jsonl"))
     runtime_events = [
         json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()
     ]
@@ -401,8 +397,8 @@ def test_same_display_name_and_planned_time_use_task_isolated_csv_directories(
         planned_at_overrides=planned_at_overrides,
     )
 
-    # SQLite 中的完整 csv_path 用于核对两个正式文件的任务目录边界。
-    database = Database(config.database.path)
+    # PostgreSQL 中的完整 csv_path 用于核对两个正式文件的任务目录边界。
+    database = Database(config.database.url)
     try:
         status_by_task = {row.task_id: row for row in database.recent_status(limit=10)}
     finally:
@@ -455,7 +451,7 @@ def test_partial_success_is_published_warned_and_returns_zero(
 
     exit_code = run_fake_collection(config=config, dry_run=False)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         status_rows = database.recent_status(limit=5)
         with database.session_factory() as session:
@@ -504,7 +500,7 @@ def test_dry_run_keeps_sqlite_raw_audit_without_csv_or_product_rows(
 
     exit_code = run_fake_collection(config=config, dry_run=True)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         status_rows = database.recent_status(limit=5)
         with database.session_factory() as session:
@@ -541,11 +537,11 @@ def test_dry_run_finalize_keyboard_interrupt_closes_running_batch(
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        """Raise before finalize_dry_run can change the running SQLite batch."""
+        """Raise before finalize_dry_run can change the running PostgreSQL batch."""
 
         raise KeyboardInterrupt
 
-    # 采集保持真实，只把 dry-run SQLite 终结入口改为提交前中止。
+    # 采集保持真实，只把 dry-run PostgreSQL 终结入口改为提交前中止。
     config = temporary_config(tmp_path)
     client = FakeCompassClient()
     _, notifications = install_runner_fakes(
@@ -561,9 +557,9 @@ def test_dry_run_finalize_keyboard_interrupt_closes_running_batch(
 
     exit_code = run_fake_collection(config=config, dry_run=True)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
-        # SQLite 必须从 running 原子进入 interrupted。
+        # PostgreSQL 必须从 running 原子进入 interrupted。
         status_row = database.recent_status(limit=1)[0]
     finally:
         database.close()
@@ -589,7 +585,7 @@ def test_committed_result_survives_return_boundary_keyboard_interrupt(
     dry_run: bool,
     expected_published: bool,
 ) -> None:
-    """Use SQLite success when interruption happens after commit but before return."""
+    """Use PostgreSQL success when interruption happens after commit but before return."""
 
     # 真实数据库方法先提交，再由包装器模拟返回赋值前的 KeyboardInterrupt。
     if dry_run:
@@ -636,9 +632,9 @@ def test_committed_result_survives_return_boundary_keyboard_interrupt(
 
     exit_code = run_fake_collection(config=config, dry_run=dry_run)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
-        # SQLite 是提交是否成功的唯一权威来源。
+        # PostgreSQL 是提交是否成功的唯一权威来源。
         status_row = database.recent_status(limit=1)[0]
     finally:
         database.close()
@@ -663,7 +659,7 @@ def test_committed_result_survives_notification_assignment_interrupt(
 ) -> None:
     """Recover success when interruption hits committed-result assignment."""
 
-    # 原始构造器在第二次恢复调用时生成 SQLite 权威成功通知。
+    # 原始构造器在第二次恢复调用时生成 PostgreSQL 权威成功通知。
     original_builder = runner_module._build_committed_task_result
     # build_attempts 证明首次赋值被中断、保护区内随后完成一次恢复。
     build_attempts: list[str] = []
@@ -692,9 +688,9 @@ def test_committed_result_survives_notification_assignment_interrupt(
 
     exit_code = run_fake_collection(config=config, dry_run=dry_run)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
-        # SQLite 成功终态必须与恢复后的通知和正式 CSV 保持一致。
+        # PostgreSQL 成功终态必须与恢复后的通知和正式 CSV 保持一致。
         status_row = database.recent_status(limit=1)[0]
     finally:
         database.close()
@@ -737,7 +733,7 @@ def test_committed_result_survives_manifest_sync_keyboard_interrupt(
             raise KeyboardInterrupt
         original_sync(storage, snapshot)
 
-    # 采集和 SQLite 提交保持真实，只中止终态 Manifest 投影。
+    # 采集和 PostgreSQL 提交保持真实，只中止终态 Manifest 投影。
     config = temporary_config(tmp_path)
     client = FakeCompassClient()
     _, notifications = install_runner_fakes(
@@ -753,9 +749,9 @@ def test_committed_result_survives_manifest_sync_keyboard_interrupt(
 
     exit_code = run_fake_collection(config=config, dry_run=dry_run)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
-        # Manifest 中止不能反向改写已提交的 SQLite 状态。
+        # Manifest 中止不能反向改写已提交的 PostgreSQL 状态。
         status_row = database.recent_status(limit=1)[0]
     finally:
         database.close()
@@ -814,9 +810,9 @@ def test_persisted_success_survives_terminal_log_failure(
 
     exit_code = run_fake_collection(config=config, dry_run=dry_run)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
-        # 最近批次是 SQLite 权威终态，不能被非权威日志异常回滚或改写。
+        # 最近批次是 PostgreSQL 权威终态，不能被非权威日志异常回滚或改写。
         status_row = database.recent_status(limit=1)[0]
     finally:
         database.close()
@@ -859,7 +855,7 @@ def test_publication_failure_closes_running_batch_without_csv(
 
     exit_code = run_fake_collection(config=config, dry_run=False)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         status_rows = database.recent_status(limit=5)
         with database.session_factory() as session:
@@ -910,7 +906,7 @@ def test_publication_keyboard_interrupt_closes_batch_and_removes_csv(
 
     exit_code = run_fake_collection(config=config, dry_run=False)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         status_rows = database.recent_status(limit=5)
         with database.session_factory() as session:
@@ -1001,7 +997,7 @@ def test_browser_failure_persists_safe_page_diagnostics_in_new_batch_storage(
 
     exit_code = run_fake_collection(config=config, dry_run=False)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         # 唯一失败批次提供实际 batch_id，用于定位新目录结构。
         status_row = database.recent_status(limit=1)[0]
@@ -1030,3 +1026,27 @@ def test_browser_failure_persists_safe_page_diagnostics_in_new_batch_storage(
     assert failure_summary["page_title"] == "电商罗盘"
     assert failure_summary["screenshot_saved"] is True
     assert notifications[0].tasks[0].status is TaskNotificationStatus.FAILED
+
+
+def test_unconfirmed_publication_does_not_overwrite_committed_batch(tmp_path, monkeypatch):
+    """Runner preserves database success and CSV when publication confirmation fails."""
+    # 真实提交后模拟结果暂不可确认，runner 不得再把成功批次终止为 failed。
+    config = temporary_config(tmp_path)
+    client = FakeCompassClient()
+    install_runner_fakes(monkeypatch=monkeypatch, tmp_path=tmp_path, client=client)
+    original_publish = Database.publish_collected_batch
+
+    def publish_then_unconfirmed(self, *args, **kwargs):
+        """Commit the actual data before returning an unconfirmed-outcome error."""
+        original_publish(self, *args, **kwargs)
+        raise PublicationError("Synthetic verification outage", category="publication_unconfirmed")
+
+    monkeypatch.setattr(Database, "publish_collected_batch", publish_then_unconfirmed)
+    assert run_fake_collection(config=config, dry_run=False) == 1
+    database = Database(config.database.url)
+    try:
+        row = database.recent_status(limit=1)[0]
+        assert row.status == "success" and row.published_at is not None
+        assert Path(row.csv_path).exists()
+    finally:
+        database.close()

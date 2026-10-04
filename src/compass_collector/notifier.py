@@ -145,6 +145,8 @@ class TaskNotificationResult:
     error_category: str | None = None
     # category_issues 仅包含本任务中失败或已跳过的分类明细。
     category_issues: tuple[CategoryNotificationIssue, ...] = ()
+    # 平台来自任务配置；默认罗盘兼容旧调用，渲染时仅映射固定中文标签。
+    platform: str = "compass"
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,7 +322,7 @@ def _escape_markdown_cell(value: str) -> str:
     return value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
-def _batch_title(status: BatchNotificationStatus, *, test: bool = False) -> str:
+def _batch_title(status: BatchNotificationStatus, *, test: bool = False, platform_label: str = "罗盘") -> str:
     """Map stable batch states to concise DingTalk Markdown titles."""
 
     if test:
@@ -337,7 +339,7 @@ def _batch_title(status: BatchNotificationStatus, *, test: bool = False) -> str:
         BatchNotificationStatus.SKIPPED: "ℹ️ 罗盘采集已跳过",
         BatchNotificationStatus.NOT_COLLECTED: "⚠️ 罗盘计划未采集",
     }
-    return titles[status]
+    return titles[status].replace("罗盘", platform_label)
 
 
 def render_batch_markdown(summary: BatchNotificationSummary) -> tuple[str, str]:
@@ -361,7 +363,13 @@ def render_batch_markdown(summary: BatchNotificationSummary) -> tuple[str, str]:
     )
     # 分钟向上取整，让不足一分钟的有效执行不会显示为零耗时。
     duration_minutes = max(1, ceil(duration_seconds / 60))
-    title = _batch_title(summary.status)
+    # 单平台明确展示名称，混合批次使用通用标题；不从任务ID或自由文本猜测平台。
+    platforms = {task.platform for task in summary.tasks}
+    # 中文标签采用白名单，不将未知配置值拼入外发标题。
+    platform_label = {frozenset({"compass"}): "罗盘", frozenset({"taobao"}): "淘宝"}.get(
+        frozenset(platforms), "电商"
+    ) if platforms else "罗盘"
+    title = _batch_title(summary.status, platform_label=platform_label)
     # 必须保留的头部不包含本机路径或认证信息。
     lines = [
         f"### {title}",
@@ -381,7 +389,7 @@ def render_batch_markdown(summary: BatchNotificationSummary) -> tuple[str, str]:
     task_lines: list[str] = []
     omitted_count = 0
     for task_index, task in enumerate(summary.tasks):
-        # 下载链接仅写入钉钉正文，不写入运行时日志、Manifest 或 SQLite。
+        # 下载链接仅写入钉钉正文，不写入运行时日志、Manifest 或 PostgreSQL。
         if task.csv_filename and task.csv_download_url:
             result_text = (
                 f"[{_escape_markdown_cell(task.csv_filename)}]"
@@ -562,7 +570,7 @@ def deliver_batch_notification(
 ) -> NotificationDeliveryResult:
     """Send one batch summary and emit safe lifecycle events without raising."""
 
-    # 通知汇总批次不伪装成可定位 SQLite/raw 的任务业务批次。
+    # 通知汇总批次不伪装成可定位 PostgreSQL/raw 的任务业务批次。
     log_context = LogContext(execution_batch_id=summary.batch_id)
     try:
         # 配置、渲染和网络 Adapter 都收口在通知边界内。
@@ -646,18 +654,18 @@ def deliver_website_notification(
     site_url: str | None,
     error_category: str | None = None,
 ) -> NotificationDeliveryResult:
-    """Send the second DingTalk message for website deployment success or failure."""
+    """Send the second DingTalk message for public data updates and website access."""
 
-    # 第二条消息使用执行批次关联，但不伪装成 SQLite 业务批次。
+    # 第二条消息使用执行批次关联，但不伪装成 PostgreSQL 业务批次。
     log_context = LogContext(execution_batch_id=execution_batch_id)
     succeeded = site_url is not None and error_category is None
-    title = "✅ 罗盘网页部署成功" if succeeded else "⚠️ 罗盘网页未更新"
+    title = "✅ 罗盘网页数据已更新" if succeeded else "⚠️ 罗盘网页未更新"
     lines = [f"### {title}", "", f"- 执行批次：`{execution_batch_id}`"]
     if succeeded:
         # site_url 来自受控环境配置，作为公开入口允许进入钉钉正文。
         lines.append(f"- 网站：[打开最新榜单]({site_url})")
     else:
-        # 只发送稳定错误分类，不能暴露 OSS、Vercel 或网络响应正文。
+        # 只发送稳定错误分类，不能暴露 OSS 或网络响应正文。
         lines.append(f"- 原因：`{error_category or 'website_notification_error'}`")
     markdown = "\n".join(lines)
     try:
@@ -706,6 +714,7 @@ def run_notification_test(
     runtime_logger: RuntimeLogger,
     *,
     transport: httpx.BaseTransport | None = None,
+    platform: str = "compass",
 ) -> int:
     """Send one explicit real-or-mocked test message and return delivery status."""
 
@@ -726,7 +735,7 @@ def run_notification_test(
         return 1
     # 测试消息只包含固定标题和北京时间，不暴露运行环境。
     current_time = datetime.now(SHANGHAI_TIMEZONE)
-    title = _batch_title(BatchNotificationStatus.SUCCESS, test=True)
+    title = "🧪 淘宝采集器通知测试" if platform == "taobao" else _batch_title(BatchNotificationStatus.SUCCESS, test=True)
     markdown = (
         f"### {title}\n\n"
         f"- 时间：{current_time:%Y-%m-%d %H:%M:%S}\n"

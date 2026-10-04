@@ -1,5 +1,7 @@
 """Stage-six GUI routing, safe events, cancellation, and lock tests."""
 
+from pg_support import pg_url, pg_config
+
 import json
 import sys
 from datetime import date, datetime
@@ -51,7 +53,7 @@ def test_cli_run_defaults_to_gui_and_no_gui_is_explicit() -> None:
         ["app", "--task", "product_hot_sale_food_level3"]
     )
     # 清理命令必须由调用方显式提供 --yes。
-    clear_arguments = build_parser().parse_args(["clear-data", "--yes"])
+    clear_arguments = build_parser().parse_args(["clear-data", "--platform", "compass", "--yes"])
 
     assert default_arguments.no_gui is False
     assert terminal_arguments.no_gui is True
@@ -64,7 +66,7 @@ def test_cli_clear_data_refuses_missing_explicit_confirmation() -> None:
     """Stop the destructive CLI path before cleanup when --yes is absent."""
 
     # 未确认参数不得进入任何清理或锁操作。
-    arguments = build_parser().parse_args(["clear-data"])
+    arguments = build_parser().parse_args(["clear-data", "--platform", "compass"])
     # 只加载仓库静态配置，不访问 runtime。
     config = load_config(Path("config/tasks.yaml"))
 
@@ -323,8 +325,8 @@ def test_pre_requested_stop_creates_interrupted_manifest_without_http(
 
             raise AssertionError("HTTP should not be called")
 
-    # 新动态链路的 dry-run 和正式运行都必须先建立 SQLite 审计批次。
-    database_path = tmp_path / "runtime" / "data" / "collector.db"
+    # 新动态链路的 dry-run 和正式运行都必须先建立 PostgreSQL 审计批次。
+    database_path = pg_url(tmp_path / "runtime" / "data" / "collector.db")
     upgrade_database(database_path)
     database = Database(database_path)
     try:
@@ -340,7 +342,7 @@ def test_pre_requested_stop_creates_interrupted_manifest_without_http(
                 mode="normal",
             )
         with database.session_factory() as session:
-            # SQLite 与 Manifest 必须共享同一个 interrupted 终态。
+            # PostgreSQL 与 Manifest 必须共享同一个 interrupted 终态。
             batch = session.get(CollectionBatch, "batch-interrupted")
     finally:
         database.close()
@@ -357,7 +359,7 @@ def test_skipped_busy_is_a_terminal_status_without_csv(tmp_path: Path) -> None:
     """Persist a busy Scheduler occurrence without publishing or retrying it."""
 
     # 临时数据库隔离正式 runtime 数据。
-    database_path = tmp_path / "runtime" / "data" / "collector.db"
+    database_path = pg_url(tmp_path / "runtime" / "data" / "collector.db")
     upgrade_database(database_path)
     database = Database(database_path)
     # 固定计划时间便于核对终态幂等。
@@ -393,12 +395,9 @@ def test_scheduled_lock_conflict_records_once_and_sends_one_summary(
 ) -> None:
     """Exercise the top-level busy branch without opening Chrome or retrying."""
 
-    # 真实任务配置只替换 SQLite 路径，Scheduler 业务参数保持生产契约。
+    # 真实任务配置只替换 PostgreSQL 路径，Scheduler 业务参数保持生产契约。
     base_config = load_config(Path("config/tasks.yaml"))
-    database_config = base_config.database.model_copy(
-        update={"path": tmp_path / "runtime" / "data" / "collector.db"}
-    )
-    config = base_config.model_copy(update={"database": database_config})
+    config = pg_config(base_config, tmp_path)
     # Runner 日志和锁目录全部进入 pytest 临时 runtime。
     monkeypatch.setattr("compass_collector.runner.RUNTIME_ROOT", tmp_path / "runtime")
 
@@ -421,14 +420,14 @@ def test_scheduled_lock_conflict_records_once_and_sends_one_summary(
     first_exit_code = run_scheduled_collection(config, [task], planned_at)
     second_exit_code = run_scheduled_collection(config, [task], planned_at)
 
-    database = Database(config.database.path)
+    database = Database(config.database.url)
     try:
         # 唯一状态行必须来自第一次锁冲突，第二次不得重复登记。
         status_rows = database.recent_status(limit=5)
     finally:
         database.close()
     # JSONL 只读取稳定事件字段，不依赖控制台文案。
-    log_path = next((tmp_path / "runtime" / "logs").glob("*.jsonl"))
+    log_path = next((tmp_path / "runtime" / "logs" / "compass").glob("*.jsonl"))
     log_events = [
         json.loads(line)
         for line in log_path.read_text(encoding="utf-8").splitlines()
@@ -460,10 +459,10 @@ def test_makefile_exposes_one_parameterized_collection_command() -> None:
     # Makefile 是日常执行入口的公开契约。
     makefile = Path("Makefile").read_text(encoding="utf-8")
 
-    assert "app:" in makefile
+    assert "START ?= yes" in makefile
     assert "run:" in makefile
-    assert "MODE ?= normal" in makefile
+    assert "MODE ?= force" in makefile
     assert "GUI ?= yes" in makefile
-    assert "notify-test:" in makefile
-    assert "clear-data:" in makefile
+    assert "notify:" in makefile
+    assert "clean:" in makefile
     assert "--no-gui" in makefile

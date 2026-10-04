@@ -1,5 +1,7 @@
 """Stage-four dry-run and official publication transaction tests."""
 
+from pg_support import pg_url, pg_config
+
 import os
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -34,7 +36,7 @@ from compass_collector.persistence import (
 from compass_collector.raw_storage import BatchStorage
 
 
-# 批次和分类时间均使用 SQLite 可直接比较的北京时间墙上时间。
+# 批次和分类时间均使用 PostgreSQL 可直接比较的北京时间墙上时间。
 BATCH_STARTED_AT = datetime(2026, 7, 17, 14, 0)
 # 分类开始时间在批次之后，避免生命周期字段混淆。
 CATEGORY_STARTED_AT = datetime(2026, 7, 17, 14, 0, 1)
@@ -86,7 +88,7 @@ def prepare_collected_batch(
 ) -> tuple[Database, CollectedCategoryBatch]:
     """Create authoritative category states and their matching in-memory result."""
 
-    # 每个测试使用独立批次目录和 SQLite 文件。
+    # 每个测试使用独立批次目录和 PostgreSQL 文件。
     runtime_root = tmp_path / "runtime"
     # BatchStorage 只用于提供领域对象要求的批次存储和真实 raw 路径。
     storage = BatchStorage(
@@ -99,7 +101,7 @@ def prepare_collected_batch(
         started_at=BATCH_STARTED_AT,
     )
     # 数据库通过正式迁移建立当前 Schema。
-    database_path = runtime_root / "data" / "collector.db"
+    database_path = pg_url(runtime_root / "data" / "collector.db")
     upgrade_database(database_path)
     database = Database(database_path)
     database.create_batch(
@@ -142,7 +144,7 @@ def prepare_collected_batch(
         root_category_name="食品饮料",
         categories=categories,
     )
-    # category_run_id 跨 SQLite、raw 和内存结果保持一致。
+    # category_run_id 跨 PostgreSQL、raw 和内存结果保持一致。
     category_run_plans = tuple(
         CategoryRunPlan(
             category_run_id=f"category-run-{category.discovery_order}",
@@ -162,7 +164,7 @@ def prepare_collected_batch(
         zip(category_statuses, category_run_plans, strict=True),
         start=1,
     ):
-        # 每个分类使用独立时间，便于精确匹配 SQLite 生命周期。
+        # 每个分类使用独立时间，便于精确匹配 PostgreSQL 生命周期。
         category_started_at = CATEGORY_STARTED_AT + timedelta(seconds=category_index)
         category_finished_at = CATEGORY_FINISHED_AT + timedelta(seconds=category_index)
         database.start_category_run(
@@ -288,7 +290,7 @@ def test_dry_run_finalizes_without_official_rows_or_csv(
 def test_dry_run_derives_partial_success_from_sqlite(tmp_path: Path) -> None:
     """Finalize one-success one-failure dry-run as partial_success."""
 
-    # 内存失败计数必须与 SQLite 的 failed 分类完全一致。
+    # 内存失败计数必须与 PostgreSQL 的 failed 分类完全一致。
     database, collected_batch = prepare_collected_batch(
         tmp_path,
         mode="dry_run",
@@ -507,7 +509,7 @@ class RollbackAlwaysFailsCsv:
 def test_publish_failure_rolls_back_csv_product_rows_and_batch_state(
     tmp_path: Path,
 ) -> None:
-    """Compensate an already-moved CSV and rollback all flushed SQLite rows."""
+    """Compensate an already-moved CSV and rollback all flushed PostgreSQL rows."""
 
     # 一条 success 商品会在 CSV publish 前完成事务内 flush。
     database, collected_batch = prepare_collected_batch(
@@ -615,7 +617,7 @@ def test_publish_boundary_interruption_preserves_committed_csv_and_database(
 ) -> None:
     """Preserve a committed CSV when begin exits with a process interruption."""
 
-    # 成功与部分成功分别验证两个正式 SQLite 终态都能保护已发布 CSV。
+    # 成功与部分成功分别验证两个正式 PostgreSQL 终态都能保护已发布 CSV。
     database, collected_batch = prepare_collected_batch(
         tmp_path,
         mode="normal",
@@ -728,7 +730,7 @@ def test_publish_error_surfaces_safe_csv_cleanup_failure(tmp_path: Path) -> None
                 PUBLISHED_AT,
             )
         with database.session_factory() as session:
-            # 清理失败不能阻止 SQLite 事务回滚为采集完成前状态。
+            # 清理失败不能阻止 PostgreSQL 事务回滚为采集完成前状态。
             batch = session.get(CollectionBatch, collected_batch.batch_id)
             # 正式商品计数用于证明发布事务没有部分提交。
             product_count = session.scalar(
@@ -771,7 +773,7 @@ def test_rejects_no_success_or_missing_success_result_and_cleans_staging(
             )
     finally:
         failed_database.close()
-    # 两个 SQLite success 分类但内存故意遗漏第二分类。
+    # 两个 PostgreSQL success 分类但内存故意遗漏第二分类。
     missing_database, complete_batch = prepare_collected_batch(
         tmp_path / "missing-success",
         mode="normal",
@@ -797,3 +799,56 @@ def test_rejects_no_success_or_missing_success_result_and_cleans_staging(
     assert not failed_staged_csv.final_path.exists()
     assert not missing_staged_csv.temporary_path.exists()
     assert not missing_staged_csv.final_path.exists()
+
+
+def test_confirmed_commit_recovers_ordinary_connection_boundary_error(tmp_path, monkeypatch):
+    """A known committed publication returns success despite a boundary error."""
+    # 用真实事务提交后异常模拟连接返回边界，不伪造数据库成功状态。
+    database, batch = prepare_collected_batch(tmp_path, mode="normal", category_statuses=("success",))
+    staged = prepare_staged_csv(tmp_path)
+    original_begin = database.session_factory.begin
+
+    @contextmanager
+    def commit_then_error():
+        """Complete the actual commit before raising a connection-like error."""
+        with original_begin() as session:
+            yield session
+        raise ConnectionError("synthetic connection loss")
+
+    monkeypatch.setattr(database.session_factory, "begin", commit_then_error)
+    try:
+        result = database.publish_collected_batch(batch, 1, staged, PUBLISHED_AT)
+        assert result.snapshot.status == "success"
+        assert staged.final_path.exists()
+    finally:
+        database.close()
+
+
+def test_unconfirmed_commit_keeps_csv_for_reconciliation(tmp_path, monkeypatch):
+    """A failed post-commit verification cannot delete the possibly committed CSV."""
+    # 提交后查询也失败时只能标记待核对，不能补偿删除文件。
+    database, batch = prepare_collected_batch(tmp_path, mode="normal", category_statuses=("success",))
+    staged = prepare_staged_csv(tmp_path)
+    original_begin = database.session_factory.begin
+
+    @contextmanager
+    def commit_then_error():
+        """Commit for real and fail at the response boundary."""
+        with original_begin() as session:
+            yield session
+        raise ConnectionError("synthetic connection loss")
+
+    def verification_unavailable(**kwargs):
+        """Emulate a database that cannot currently confirm the outcome."""
+        raise ConnectionError("synthetic verification outage")
+
+    monkeypatch.setattr(database.session_factory, "begin", commit_then_error)
+    monkeypatch.setattr(database, "_official_publication_is_committed", verification_unavailable)
+    try:
+        with pytest.raises(PublicationError) as result:
+            database.publish_collected_batch(batch, 1, staged, PUBLISHED_AT)
+        assert result.value.category == "publication_unconfirmed"
+        assert staged.final_path.exists()
+        assert database.collection_snapshot(batch.batch_id).status == "success"
+    finally:
+        database.close()

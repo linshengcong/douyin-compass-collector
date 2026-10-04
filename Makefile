@@ -1,97 +1,131 @@
-# 默认任务 ID 可在命令行通过 TASK=... 覆盖。
-TASK ?= compass_household_cleaning_realtime
-# uv 命令可在不同安装环境中通过 UV=/absolute/path/uv 覆盖。
-UV ?= uv
-# 登录和清除认证按平台选择独立 Profile。
-PLATFORM ?= compass
-# 采集模式统一通过 MODE 选择：normal、dry-run 或 force。
-MODE ?= normal
-# GUI 统一通过 GUI 选择：yes 为桌面窗口，no 为终端模式。
-GUI ?= yes
-# LaunchAgent 操作统一通过 ACTION 选择：check、install、status 或 uninstall。
-ACTION ?= check
-# 本地前端默认读取当前公开榜单索引；更换环境时可通过命令行覆盖。
-WEB_DATA_INDEX_URL ?= https://e-commerce-data.oss-cn-shanghai.aliyuncs.com/compass/web/latest.json
-# 所有运行命令使用锁定依赖，避免后台或调试时隐式更新环境。
-PYTHON := $(UV) run --frozen python
-
-# MODE 只映射采集器现有互斥参数，避免新增重复 Make 目标。
-ifeq ($(MODE),normal)
-RUN_MODE_OPTION :=
-else ifeq ($(MODE),dry-run)
-RUN_MODE_OPTION := --dry-run
-else ifeq ($(MODE),force)
-RUN_MODE_OPTION := --force
-else
-$(error MODE must be normal, dry-run, or force)
+# 平台是显式必填参数，tt映射抖音罗盘，tb映射淘宝。
+PLATFORM ?=
+# 当前命令集合用于仅校验实际使用的参数，help/install/start不需要平台。
+COMMANDS := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),help)
+# start启动两个平台；其余业务入口必须明确选择一个平台。
+PLATFORM_COMMANDS := run login status clean schedule notify check
+ifneq ($(filter $(PLATFORM_COMMANDS),$(COMMANDS)),)
+ifneq ($(words $(PLATFORM)),1)
+$(error 必须指定 PLATFORM=tt 或 PLATFORM=tb，例如 make run PLATFORM=tb)
+endif
+ifeq ($(filter tt tb,$(PLATFORM)),)
+$(error PLATFORM 只允许 tt 或 tb)
+endif
 endif
 
-# GUI=no 显式回退终端，其他值在 Make 阶段立即拒绝。
-ifeq ($(GUI),yes)
-RUN_GUI_OPTION :=
-else ifeq ($(GUI),no)
-RUN_GUI_OPTION := --no-gui
-else
-$(error GUI must be yes or no)
+# 配置、任务和平台标识统一映射，登录/运行/状态/调度共用同一配置。
+COLLECTOR_PLATFORM = $(if $(filter tb,$(PLATFORM)),taobao,compass)
+# 抖音保持既有主配置，允许通过CONFIG显式覆盖。
+TT_CONFIG ?= config/tasks.yaml
+# 当前 PostgreSQL 配置为默认入口；历史验收配置只作归档。
+TB_CONFIG ?= config/taobao.yaml
+# 最终配置是全部平台入口的唯一配置来源。
+CONFIG ?= $(if $(filter tb,$(PLATFORM)),$(TB_CONFIG),$(TT_CONFIG))
+# 默认任务按平台选择，显式TASK仍由CLI核验平台归属。
+TASK ?= $(if $(filter tb,$(PLATFORM)),taobao_household_cleaning_realtime,compass_household_cleaning_realtime)
+# 安装依赖使用uv，执行命令使用统一解释器，可在命令行覆盖。
+UV ?= uv
+PYTHON ?= .venv/bin/python
+# 每次执行立即在GUI创建新批次并通知，可显式选择其他行为。
+MODE ?= force
+GUI ?= yes
+START ?= yes
+NOTIFY ?= yes
+# ACTION由对应命令设置默认值；清理必须显式指定data或login。
+ACTION ?=
+# 环境注入只影响本次进程，不修改.env或真实凭证。
+NOTIFY_ENABLED = $(if $(filter yes,$(NOTIFY)),true,false)
+RUN_MODE_OPTION = $(if $(filter force,$(MODE)),--force,$(if $(filter dry-run,$(MODE)),--dry-run))
+RUN_GUI_OPTION = $(if $(filter no,$(GUI)),--no-gui)
+# 动作只在对应命令解析，check不继承服务安装动作，clean没有隐式默认值。
+VALID_ACTIONS_clean := data login
+VALID_ACTIONS_schedule := run check install status uninstall
+VALID_ACTIONS_check := test all
+# 用于Make读取阶段的默认动作，目标内默认值保持相同语义。
+DEFAULT_ACTION_schedule := run
+DEFAULT_ACTION_check := all
+ifneq ($(filter clean schedule check,$(COMMANDS)),)
+ifneq ($(strip $(ACTION)),)
+ifneq ($(words $(ACTION)),1)
+$(error ACTION 必须是一个动作)
+endif
+endif
+$(foreach command,$(filter clean schedule check,$(COMMANDS)),$(if $(filter $(if $(strip $(ACTION)),$(ACTION),$(DEFAULT_ACTION_$(command))),$(VALID_ACTIONS_$(command))),,$(error $(command) 的 ACTION 可选值为 $(VALID_ACTIONS_$(command)))))
+endif
+
+ifneq ($(filter run start,$(COMMANDS)),)
+ifneq ($(words $(MODE)),1)
+$(error MODE 只允许 force、normal 或 dry-run)
+endif
+ifeq ($(filter force normal dry-run,$(MODE)),)
+$(error MODE 只允许 force、normal 或 dry-run)
+endif
+ifneq ($(filter-out yes no,$(GUI) $(START)),)
+$(error GUI 和 START 只允许 yes 或 no)
+endif
+ifneq ($(words $(GUI)),1)
+$(error GUI 和 START 只允许 yes 或 no)
+endif
+ifneq ($(words $(START)),1)
+$(error GUI 和 START 只允许 yes 或 no)
+endif
+ifeq ($(GUI)$(START),nono)
+$(error START=no 只能与 GUI=yes 一起使用)
+endif
+endif
+ifneq ($(filter run start schedule notify,$(COMMANDS)),)
+ifneq ($(words $(NOTIFY)),1)
+$(error NOTIFY 只允许 yes 或 no)
+endif
+ifeq ($(filter yes no,$(NOTIFY)),)
+$(error NOTIFY 只允许 yes 或 no)
+endif
 endif
 
 .DEFAULT_GOAL := help
+.PHONY: help install start run login status clean schedule notify check
 
-.PHONY: help install login app run notify-test clear-data clear-login status scheduler web-dev web-build test check service
+help: ## 帮助；单平台命令须带PLATFORM=tt|tb（install/start除外）
+	@awk 'BEGIN {FS = ":.*## "; print "用法：make start [参数] 或 make <command> PLATFORM=tt|tb [参数]\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@echo "run 默认：GUI=yes START=yes MODE=force NOTIFY=yes；tt与tb可并行，同平台互斥"
+	@echo "示例：make start（同时启动两平台）；make run PLATFORM=tb；make clean PLATFORM=tb ACTION=data"
 
-help: ## 显示所有快捷命令
-	@awk 'BEGIN {FS = ":.*## "; printf "用法：make <command> [TASK=task_id]\n\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
-
-install: ## 按 uv.lock 安装依赖
+install: ## 按uv.lock安装依赖
 	$(UV) sync --frozen
 
-login: ## 打开独立 Chrome，人工登录
-	$(PYTHON) -m compass_collector login --platform $(PLATFORM)
+start: ## 同时启动抖音和淘宝独立GUI；沿用run的MODE/GUI/START/NOTIFY参数
+	@# tt_pid/tb_pid仅等待各自子命令；start_exit_code保留失败码，一个窗口结束不停止另一个。
+	@$(MAKE) run PLATFORM=tt CONFIG="$(TT_CONFIG)" TASK=compass_household_cleaning_realtime & tt_pid=$$!; \
+	$(MAKE) run PLATFORM=tb CONFIG="$(TB_CONFIG)" TASK=taobao_household_cleaning_realtime & tb_pid=$$!; \
+	start_exit_code=0; \
+	wait "$$tt_pid" || start_exit_code=$$?; \
+	wait "$$tb_pid" || start_exit_code=$$?; \
+	exit "$$start_exit_code"
 
-app: ## 打开空闲 PySide6 采集控制台
-	$(PYTHON) -m compass_collector app --task $(TASK)
+run: ## 立即GUI采集；MODE=force|normal|dry-run GUI=yes|no START=yes|no NOTIFY=yes|no
+	DINGTALK_ENABLED=$(NOTIFY_ENABLED) PYTHONPATH=src $(PYTHON) -m compass_collector run --config "$(CONFIG)" --platform $(COLLECTOR_PLATFORM) --task "$(TASK)" $(RUN_MODE_OPTION) $(RUN_GUI_OPTION) $(if $(filter no,$(START)),--idle)
 
-run: ## 采集：MODE=normal|dry-run|force，GUI=yes|no
-	$(PYTHON) -m compass_collector run --task $(TASK) $(RUN_MODE_OPTION) $(RUN_GUI_OPTION)
+login: ## 登录所选平台的采集Profile
+	PYTHONPATH=src $(PYTHON) -m compass_collector login --config "$(CONFIG)" --platform $(COLLECTOR_PLATFORM)
 
-notify-test: ## 真实发送一条钉钉配置测试消息
-	$(PYTHON) -m compass_collector notify-test
+status: ## 查看所选平台最近批次
+	PYTHONPATH=src $(PYTHON) -m compass_collector status --config "$(CONFIG)" --platform $(COLLECTOR_PLATFORM)
 
-clear-data: ## 清除本地采集数据，保留 Chrome 登录态
-	$(PYTHON) -m compass_collector clear-data --yes
+clean: ## 必须指定ACTION=data（采集数据）或login（登录态）
+	@case "$(ACTION)" in data|login) ;; *) echo "用法：make clean PLATFORM=$(PLATFORM) ACTION=data|login" >&2; exit 2;; esac
+	PYTHONPATH=src $(PYTHON) -m compass_collector $(if $(filter login,$(ACTION)),clear-auth,clear-data) --config "$(CONFIG)" --platform $(COLLECTOR_PLATFORM) --yes
 
-clear-login: ## 清除 Chrome 登录态，保留本地采集数据
-	$(PYTHON) -m compass_collector clear-auth --platform $(PLATFORM) --yes
+schedule: ACTION = run
+schedule: ## ACTION=run|check|install|status|uninstall；默认前台调度
+	@case "$(ACTION)" in run|check|install|status|uninstall) ;; *) echo "ACTION只允许run、check、install、status、uninstall" >&2; exit 2;; esac
+	$(if $(filter run,$(ACTION)),DINGTALK_ENABLED=$(NOTIFY_ENABLED) PYTHONPATH=src $(PYTHON) -m compass_collector scheduler --config "$(CONFIG)" --platform $(COLLECTOR_PLATFORM),COLLECTOR_PLATFORM=$(COLLECTOR_PLATFORM) COLLECTOR_CONFIG="$(CONFIG)" COLLECTOR_NOTIFY=$(NOTIFY_ENABLED) ./scripts/$(if $(filter status,$(ACTION)),status_launchd,$(if $(filter uninstall,$(ACTION)),uninstall_launchd,install_launchd)).sh $(if $(filter check,$(ACTION)),--dry-run))
 
-status: ## 查看最近运行状态
-	$(PYTHON) -m compass_collector status
+notify: ## 真实发送所选平台钉钉测试消息
+	DINGTALK_ENABLED=$(NOTIFY_ENABLED) PYTHONPATH=src $(PYTHON) -m compass_collector notify-test --platform $(COLLECTOR_PLATFORM)
 
-scheduler: ## 前台启动 Scheduler，按 Ctrl-C 停止
-	$(PYTHON) -m compass_collector scheduler
-
-web-dev: ## 启动网站本地开发服务
-	VITE_DATA_INDEX_URL="$(WEB_DATA_INDEX_URL)" npm --prefix web run dev -- --host 127.0.0.1 --port 5175
-
-web-build: ## 构建网站静态文件
-	npm --prefix web run build
-
-test: ## 执行全部自动化测试
-	$(PYTHON) -m pytest
-
-check: test service ## 执行测试和 LaunchAgent 无副作用检查
-	@echo "全部检查通过"
-
-service: ## LaunchAgent：ACTION=check|install|status|uninstall
-ifeq ($(ACTION),check)
-	bash -n scripts/install_launchd.sh scripts/uninstall_launchd.sh scripts/status_launchd.sh
-	plutil -lint launchd/com.zhuanz1.douyin-compass-collector.plist.template
-	./scripts/install_launchd.sh --dry-run
-else ifeq ($(ACTION),install)
-	./scripts/install_launchd.sh
-else ifeq ($(ACTION),status)
-	./scripts/status_launchd.sh
-else ifeq ($(ACTION),uninstall)
-	./scripts/uninstall_launchd.sh
-else
-$(error ACTION must be check, install, status, or uninstall)
-endif
+check: ACTION = all
+check: ## ACTION=test|all；默认后端测试及所选平台服务无副作用检查
+	@case "$(ACTION)" in test|all) ;; *) echo "ACTION只允许test或all" >&2; exit 2;; esac
+	PYTHONPATH=src $(PYTHON) -m pytest
+	$(if $(filter all,$(ACTION)),bash -n scripts/install_launchd.sh scripts/uninstall_launchd.sh scripts/status_launchd.sh,@true)
+	$(if $(filter all,$(ACTION)),COLLECTOR_PLATFORM=$(COLLECTOR_PLATFORM) COLLECTOR_CONFIG="$(CONFIG)" ./scripts/install_launchd.sh --dry-run,@true)
