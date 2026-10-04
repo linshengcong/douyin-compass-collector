@@ -142,12 +142,13 @@ def test_platform_cleanup_rejects_symlinked_parent_before_database_mutation(tmp_
     databases = create_both_platforms(tmp_path)
     for database in databases.values():
         database.close()
-    # 创建新的web-publication父目录别名，其余真实数据不移动。
+    # 创建新的 raw 父目录别名，其余真实数据不移动。
     external = tmp_path / "external"
     external.mkdir()
     root = tmp_path / "alias-runtime"
     root.mkdir()
     (root / "raw").symlink_to(external, target_is_directory=True)
-    with pytest.raises(ValueError, match="outside runtime|symlink"):
+    # 路径越界和符号链接检查均会在数据库删除前拒绝，接受两种有效诊断。
+    with pytest.raises(ValueError, match="outside (?:platform )?runtime|symlink"):
         clear_local_data_with_locks(root, pg_url(tmp_path / "runtime/data/taobao.db"), platform="taobao")
     assert (tmp_path / "runtime/raw/taobao").is_dir() and external.is_dir()
