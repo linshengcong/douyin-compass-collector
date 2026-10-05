@@ -294,6 +294,14 @@ class WebPublisher:
                 )
         except OssUploadError as error:
             raise WebPublicationError(error.category) from None
+        # 业务库同步在 OSS 完整发布后执行；失败不撤销已完成的采集，可通过历史同步命令重试。
+        from compass_collector.ranking_sync import sync_published_index
+        try:
+            sync_published_index(index_path)
+        except Exception as error:
+            # 只记录异常类型，避免 HTTP 请求头或数据库连接信息泄漏。
+            import logging
+            logging.getLogger(__name__).warning("ranking_sync_failed: %s; retry scripts/sync_ranking_history.py", type(error).__name__)
         return WebPublicationResult(
             index_url=index_url,
             data_url=data_url,
