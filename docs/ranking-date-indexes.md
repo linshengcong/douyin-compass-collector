@@ -18,4 +18,4 @@ PYTHONPATH=src .venv/bin/python scripts/backfill_ranking_dates.py --runtime-root
 
 `scripts/sync_ranking_history.py --env-file .env` 从采集 PostgreSQL 读取正式商品记录，只读核对本地发布批次；追加 `--sync` 才发送到业务 API。配置 `RANKING_API_URL` 和仅服务端共享的 `RANKING_SYNC_TOKEN` 后，每次网页发布完成会同步商品与历史关联。配置沿用 `COMPASS_DATABASE_URL` / `TAOBAO_DATABASE_URL`，不会迁移或删除采集库。
 
-同步保留原 `source_record_id`，不改变历史选品、评分或来源日期。业务 API 在一个事务里写入商品、批次和历史记录，相同批次可幂等重试，不同内容拒绝覆盖。同步失败写入 `ranking_sync_failed` 日志，可用上述命令补同步；不会撤销已完成的 OSS 发布。成功回执在批次目录 `ranking-sync.json`，不含任何密钥。
+同步保留原 `source_record_id`，不改变历史选品、评分或来源日期。业务 API 在一个事务里写入商品、批次和历史记录，相同批次可幂等重试，不同内容拒绝覆盖。同步失败写入 `ranking_sync_failed` 日志，并沿现有发布反馈报告 `web_ranking_sync_failed`，不会误报网站已更新；可用上述命令补同步，不会撤销已完成的 OSS 发布。成功回执在批次目录 `ranking-sync.json`，不含任何密钥。

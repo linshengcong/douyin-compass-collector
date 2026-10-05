@@ -98,6 +98,28 @@ def test_upload_failure_does_not_replace_previous_latest(tmp_path, failure):
     assert key not in uploader.keys
 
 
+def test_business_sync_failure_preserves_data_but_does_not_report_website_success(tmp_path, monkeypatch):
+    """数据库同步失败仍保留 OSS/CSV，但必须进入现有网站发布失败反馈链。"""
+    from compass_collector import ranking_sync
+    # 假边界禁止真实上传，只检验 OSS 完成之后调用业务同步的顺序。
+    uploader = MemoryUploader()
+    publisher = WebPublisher(WebPublicationSettings(enabled=True), uploader, runtime_root=tmp_path)
+    csv_path = write_taobao_csv(tmp_path)
+
+    def fail_sync(index_path):
+        """模拟业务 API 暂时失败，此时公开日期索引已经存在。"""
+        assert index_path.exists()
+        assert uploader.keys[-1].endswith("/latest.json")
+        raise ValueError("synthetic_sync_unavailable")
+
+    monkeypatch.setattr(ranking_sync, "sync_published_index", fail_sync)
+    with pytest.raises(WebPublicationError) as error:
+        publisher.publish(**arguments(csv_path))
+    assert error.value.category == "web_ranking_sync_failed"
+    assert csv_path.exists()
+    assert any(key.endswith("/dates/2026-10-01.json") for key in uploader.keys)
+
+
 @pytest.mark.parametrize("changes", [{"update_legacy_index": True}, {"item_count": 2}, {"started_at": None}, {"finished_at": datetime(2026, 10, 1, 13)}])
 def test_invalid_identity_window_or_count_never_uploads(tmp_path, changes):
     """Reject contract mistakes before publishing any public object."""

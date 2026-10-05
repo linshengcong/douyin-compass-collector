@@ -302,6 +302,8 @@ class WebPublisher:
             # 只记录异常类型，避免 HTTP 请求头或数据库连接信息泄漏。
             import logging
             logging.getLogger(__name__).warning("ranking_sync_failed: %s; retry scripts/sync_ranking_history.py", type(error).__name__)
+            # 业务前端依赖数据库，同步失败必须沿现有失败提示返回，不能误报网站已更新。
+            raise WebPublicationError("web_ranking_sync_failed") from None
         return WebPublicationResult(
             index_url=index_url,
             data_url=data_url,
