@@ -868,6 +868,9 @@ def _run_collection_unlocked(
             # 人工显式命令的幂等跳过也发送一次 skipped 汇总。
             if manual:
                 send_batch_notification_once()
+            if not dry_run:
+                from compass_collector.collection_completion import notify_collection_finished
+                notify_collection_finished(execution_batch_id, batch_started_at.date(), datetime.now(SHANGHAI_TIMEZONE), selected_tasks, task_results, [], RUNTIME_ROOT)
             return 0
         # 每个顶层 TaskExecutionPlan 预分配独立 collection batch ID。
         task_batch_ids = {plan.task.id: uuid4().hex for plan in task_plans}
@@ -1349,6 +1352,14 @@ def _run_collection_unlocked(
                 execution_batch_id=execution_batch_id,
                 runtime_logger=runtime_logger,
             )
+            # 在手工检查浏览器之前发送结束屏障；失败不会改写采集终态。
+            from compass_collector.collection_completion import notify_collection_finished
+            if not dry_run:
+                notify_collection_finished(
+                    execution_batch_id, batch_started_at.date(), datetime.now(SHANGHAI_TIMEZONE),
+                    selected_tasks, task_results, website_publication_candidates, RUNTIME_ROOT,
+                    task_dates={plan.task.id:plan.business_date for plan in task_plans},
+                )
             # 仅最后操作的平台页面用于手动检查，不参与采集数据流。
             browser_session = getattr(adapter, "session", None) if adapters else None
             if (
@@ -1405,6 +1416,10 @@ def _run_collection_unlocked(
                 )
             has_failures = True
             send_batch_notification_once()
+            # Terminal browser failures also acknowledge the barrier without claiming successful data.
+            if not dry_run:
+                from compass_collector.collection_completion import notify_collection_finished
+                notify_collection_finished(execution_batch_id, batch_started_at.date(), datetime.now(SHANGHAI_TIMEZONE), selected_tasks, task_results, website_publication_candidates, RUNTIME_ROOT, task_dates={plan.task.id:plan.business_date for plan in task_plans})
             if (
                 manual
                 and config.browser.keep_open_after_manual_run
