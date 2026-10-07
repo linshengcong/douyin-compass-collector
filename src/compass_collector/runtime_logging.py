@@ -35,6 +35,10 @@ SAFE_DETAIL_FIELDS = {
     "saved_items",
     "status_code",
     "target_pages",
+    # 补采轮次、最大轮数及本轮分类总量，仅传递进度计数。
+    "retry_round",
+    "retry_rounds",
+    "round_category_count",
     "version",
     # 发布完成事件只记录布尔结果。
     "uploaded",

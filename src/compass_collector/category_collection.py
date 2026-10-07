@@ -435,7 +435,8 @@ def _category_attempts(plans, failed_ids, platform):
         # 首轮遍历所有计划，后续只保留当前失败分类。
         pending = [plan for plan in plans if retry_round == 0 or plan.category_run_id in failed_ids]
         for plan in pending:
-            yield plan, retry_round
+            # 本轮快照数量不会随消费方移除失败分类而缩小。
+            yield plan, retry_round, len(pending)
 
 
 def collect_category_batch(
@@ -446,13 +447,17 @@ def collect_category_batch(
     database: Database,
     runtime_logger: RuntimeLogger,
     control: CollectionControl | None = None,
+    # --continue 加载原批次的成功结果，采集循环直接跳过这些分类。
+    completed_runs: tuple[CollectedCategoryRun, ...] = (),
 ) -> CollectedCategoryBatch:
     """Collect planned categories and stop before publication."""
 
     if task.id != prepared_batch.task_id:
         raise ValueError("task does not match prepared category batch")
     # 成功列表只接收完整验证并已标记 success 的分类。
-    completed_category_runs: list[CollectedCategoryRun] = []
+    completed_category_runs: list[CollectedCategoryRun] = list(completed_runs)
+    # 跳过集合固定于本轮开始，后续新失败仍按既有整轮补采规则处理。
+    completed_ids = {run.plan.category_run_id for run in completed_runs}
     # 普通失败计数用于部分成功发布汇总，不再因少量异常中止任务。
     failed_category_count = 0
     # 最终失败按分类去重，补采成功时移除，不能累计失败尝试次数。
@@ -461,9 +466,12 @@ def collect_category_batch(
     last_ordinary_failure: tuple[CategoryRunPlan, _CategoryAttemptFailed] | None = None
     # 连续三次平台暂时不可用终止本批，不增加页面请求压力。
     consecutive_platform_unavailable_failures = 0
+    # 当前已通知的补采轮次，确保同一轮仅重置一次 GUI 进度。
+    announced_retry_round = 0
 
-    for plan, retry_round in _category_attempts(
-        prepared_batch.category_run_plans, failed_category_ids, task.platform
+    # round_category_count 是当前轮固定的待采分类数。
+    for plan, retry_round, round_category_count in _category_attempts(
+        tuple(plan for plan in prepared_batch.category_run_plans if plan.category_run_id not in completed_ids), failed_category_ids, task.platform
     ):
         if control is not None and control.stop_requested():
             _interrupt_before_next_category(
@@ -472,6 +480,22 @@ def collect_category_batch(
                 runtime_logger=runtime_logger,
                 completed_category_runs=completed_category_runs,
             )
+        if retry_round > announced_retry_round:
+            _safe_emit(
+                runtime_logger,
+                level="INFO",
+                event="category_retry_round_started",
+                message=(f"[{task.id}] 开始补采第 {retry_round}/{TAOBAO_CATEGORY_RETRY_ROUNDS} 轮，"
+                         f"待补采 {round_category_count} 个分类"),
+                stage="category_collection",
+                context=LogContext(batch_id=prepared_batch.batch_id, task_id=task.id),
+                details={
+                    "retry_round": retry_round,
+                    "retry_rounds": TAOBAO_CATEGORY_RETRY_ROUNDS,
+                    "round_category_count": round_category_count,
+                },
+            )
+            announced_retry_round = retry_round
         try:
             # 同步函数完整结束一个分类后才会进入下一个分类。
             collected_run = _collect_category_run(

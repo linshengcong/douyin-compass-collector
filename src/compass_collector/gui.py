@@ -137,6 +137,8 @@ class GuiLaunchRequest:
     lock_mode: bool = False
     # 单平台Make入口需在工作线程重读配置及GUI启动调度时保持平台范围。
     platform: str | None = None
+    # --continue 是额外运行策略，与平台选择及自动启动分别传递。
+    continue_run: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,8 +169,12 @@ class GuiProgressState:
     progress_text: str = "分类 0 / 0 · 第 0 / 0 页"
     # category_index 是当前处理的三级分类发现序号。
     category_index: int = 0
-    # category_total 来自本次分类树动态发现结果。
+    # category_total 首轮来自分类树，补采时只包含当前轮待补采分类。
     category_total: int = 0
+    # retry_round 为零表示首轮采集，大于零表示当前自动补采轮次。
+    retry_round: int = 0
+    # retry_rounds 来自采集循环的实际补采上限，仅用于展示。
+    retry_rounds: int = 0
     # page_no 是当前分类最后成功保存或失败的页码。
     page_no: int = 0
     # target_pages 是当前分类根据实时 total 计算出的页数。
@@ -185,6 +191,19 @@ class GuiProgressState:
     category_progress: tuple[CategoryProgress, ...] = ()
     # completed_category_count 是成功和失败分类之和，构成准确总体分类进度。
     completed_category_count: int = 0
+
+    @property
+    def collection_action(self) -> str:
+        """按当前轮次统一生成采集或补采文案。"""
+        return "补采" if self.retry_round else "采集"
+
+    @property
+    def collection_status(self) -> str:
+        """展示运行状态，补采时同时显示轮次及上限。"""
+        return (
+            f"补采中（第 {self.retry_round}/{self.retry_rounds} 轮）"
+            if self.retry_round else "采集中"
+        )
 
 
 def _event_non_negative_int(
@@ -263,6 +282,8 @@ def _reduce_gui_progress_legacy(
             progress_text="正在发现配置范围内的三级分类",
             category_index=0,
             category_total=0,
+            retry_round=0,
+            retry_rounds=0,
             page_no=0,
             target_pages=0,
             category_path=None,
@@ -282,11 +303,34 @@ def _reduce_gui_progress_legacy(
             progress_text=f"已发现 {category_total} 个三级分类",
             category_index=0,
             category_total=category_total,
+            retry_round=0,
+            retry_rounds=0,
             page_no=0,
             target_pages=0,
             category_path=None,
             result_text="分类发现完成，准备串行采集",
             indeterminate=False,
+        )
+    if event_name == "category_retry_round_started":
+        # 新轮次独立计数，保留正式 CSV，清空上一轮分类和分页状态。
+        state = replace(
+            state,
+            retry_round=_event_non_negative_int(event, "retry_round", 0),
+            retry_rounds=_event_non_negative_int(event, "retry_rounds", 0),
+            category_total=_event_non_negative_int(event, "round_category_count", 0),
+            category_index=0,
+            page_no=0,
+            target_pages=0,
+            category_path=None,
+            category_progress=(),
+            completed_category_count=0,
+            indeterminate=False,
+        )
+        return replace(
+            state,
+            stage_text=f"阶段：{state.collection_status}",
+            progress_text=f"完成 0 / {state.category_total} 个分类",
+            result_text=state.collection_status,
         )
     if event_name == "category_collection_started":
         # category_index 来自分类树的稳定发现顺序。
@@ -295,6 +339,9 @@ def _reduce_gui_progress_legacy(
             "discovery_order",
             state.category_index,
         )
+        if state.retry_round:
+            # 补采序号使用本轮处理位置，不使用原分类树中的全局序号。
+            category_index = state.completed_category_count + 1
         # raw_category_path 只接受非空字符串，避免展示 None 或容器文本。
         raw_category_path = event.get("category_path")
         # category_path 缺失时沿用上一条安全路径。
@@ -306,7 +353,8 @@ def _reduce_gui_progress_legacy(
         return replace(
             state,
             stage_text=(
-                f"阶段：{category_path}" if category_path else "阶段：采集三级分类"
+                (f"阶段：补采 · {category_path}" if state.retry_round else f"阶段：{category_path}")
+                if category_path else f"阶段：{state.collection_action}三级分类"
             ),
             progress_text=_category_progress_text(
                 category_index,
@@ -318,7 +366,7 @@ def _reduce_gui_progress_legacy(
             page_no=0,
             target_pages=0,
             category_path=category_path,
-            result_text="采集中",
+            result_text=state.collection_status,
             indeterminate=False,
         )
     if event_name == "category_page_saved":
@@ -365,7 +413,7 @@ def _reduce_gui_progress_legacy(
             ),
             page_no=completed_page,
             target_pages=target_pages,
-            result_text="采集中",
+            result_text=state.collection_status,
             indeterminate=False,
         )
     if event_name == "category_collection_failed":
@@ -387,7 +435,7 @@ def _reduce_gui_progress_legacy(
             ),
             progress_text=f"{failed_progress} · 失败",
             page_no=failed_page,
-            result_text="当前分类采集失败，继续执行后续分类",
+            result_text=f"当前分类{state.collection_action}失败，继续执行后续分类",
             indeterminate=False,
         )
     if event_name == "category_discovery_failed":
@@ -421,23 +469,23 @@ def _reduce_gui_progress_legacy(
         )
     if event_name == "category_batch_collection_ready":
         # category_total 以批次汇总事件补充或校正发现数量。
-        category_total = _event_non_negative_int(
+        category_total = state.category_total if state.retry_round else _event_non_negative_int(
             event,
             "discovered_category_count",
             state.category_total,
         )
         return replace(
             state,
-            stage_text="阶段：分类采集完成，等待发布",
+            stage_text=f"阶段：分类{state.collection_action}完成，等待发布",
             progress_text=(
-                f"分类 {category_total} / {category_total} · 采集完成，等待发布"
+                f"分类 {category_total} / {category_total} · {state.collection_action}完成，等待发布"
             ),
             category_index=category_total,
             category_total=category_total,
             page_no=0,
             target_pages=0,
             category_path=None,
-            result_text="分类采集完成，等待发布",
+            result_text=f"分类{state.collection_action}完成，等待发布",
             indeterminate=False,
         )
     if event_name == "batch_skipped":
@@ -718,6 +766,7 @@ class CollectionWorker(QObject):
                 dry_run=self.mode is RunMode.DRY_RUN,
                 control=self.control,
                 run_source=BatchSource.GUI,
+                **({"continue_run": True} if self.request.continue_run else {}),
             )
         except RuntimeLockBusy:
             # 锁冲突只输出固定安全摘要，不读取其他进程命令行。
@@ -891,11 +940,15 @@ class CollectorWindow(QMainWindow):
         )
         self.host_label = QLabel(selected_task.platform)
         # 淘宝的目标是单分类 ID，不能读取抖音专用的行业/组合字段。
-        scope_summary = category_scope_summary(selected_task)
+        scope_summary = ("接口配置 · 新批次开始时读取"
+            if self.config.platforms[selected_task.platform].category_config_source == "remote"
+            else category_scope_summary(selected_task))
+        # YAML 模式保留原摘要，remote 模式明确接口来源。
+        scope_mode = "remote" if self.config.platforms[selected_task.platform].category_config_source == "remote" else selected_task.category_scope.mode
         self.interval_label = QLabel(
             f"{self.config.collection.request_interval_seconds.min:g}–"
             f"{self.config.collection.request_interval_seconds.max:g} 秒 / "
-            f"页面串行采集 / {selected_task.category_scope.mode} / "
+            f"页面串行采集 / {scope_mode} / "
             + scope_summary
         )
         self.schedule_label = QLabel(selected_task.schedule)
@@ -919,6 +972,8 @@ class CollectorWindow(QMainWindow):
 
         # 进度区展示准确分类完成度和固定槽位的并发分类明细。
         progress_group = QGroupBox("采集进度")
+        # 保存进度区控件，使补采换轮时可同步更新标题。
+        self.progress_group = progress_group
         progress_layout = QVBoxLayout(progress_group)
         self.stage_label = QLabel(self.progress_state.stage_text)
         progress_layout.addWidget(self.stage_label)
@@ -1013,6 +1068,9 @@ class CollectorWindow(QMainWindow):
         self.force_checkbox.setEnabled(False)
         self.start_button = QPushButton("开始采集")
         self.start_button.clicked.connect(self.start_collection)
+        # 补录使用同一个工作线程，后台决定继续原批次或全量重跑。
+        self.continue_button = QPushButton("补录 / 重新采集")
+        self.continue_button.clicked.connect(self.continue_collection)
         self.abort_button = QPushButton("中止本次采集")
         self.abort_button.clicked.connect(self.abort_current_collection)
         self.close_chrome_button = QPushButton("完成检查并关闭 Chrome")
@@ -1028,6 +1086,7 @@ class CollectorWindow(QMainWindow):
         action_layout.addWidget(self.mode_combo)
         action_layout.addWidget(self.force_checkbox)
         action_layout.addWidget(self.start_button)
+        action_layout.addWidget(self.continue_button)
         action_layout.addWidget(self.abort_button)
         action_layout.addWidget(self.close_chrome_button)
         action_layout.addWidget(self.scheduler_button)
@@ -1035,6 +1094,8 @@ class CollectorWindow(QMainWindow):
         action_layout.addWidget(self.open_output_button)
         action_layout.addWidget(self.clear_data_button)
         root_layout.addLayout(action_layout)
+        # 切换试运行/正式模式时同步补录按钮，避免试运行误触正式恢复入口。
+        self.mode_combo.currentIndexChanged.connect(lambda _: self._update_action_states())
         self._update_action_states()
 
     def _selected_mode(self) -> RunMode:
@@ -1057,7 +1118,7 @@ class CollectorWindow(QMainWindow):
         self._render_events()
 
     @Slot()
-    def start_collection(self) -> None:
+    def start_collection(self, *, continue_run: bool | None = None) -> None:
         """Validate mode confirmation and start one QThread collection worker."""
 
         if self.collecting:
@@ -1068,7 +1129,8 @@ class CollectorWindow(QMainWindow):
         self.collection_control = CollectionControl(keep_browser_open=True)
         # worker 绑定当前模式，运行期间界面不允许修改。
         worker = CollectionWorker(
-            self.request,
+            # 显式补录按钮只覆盖运行策略，不修改启动请求的平台和任务。
+            replace(self.request, continue_run=continue_run) if continue_run is not None else self.request,
             self._selected_mode(),
             force,
             self.collection_control,
@@ -1088,7 +1150,7 @@ class CollectorWindow(QMainWindow):
         self.collection_thread = thread
         self.collecting = True
         self.inspection_ready = False
-        self.run_status_label.setText("运行中")
+        self.run_status_label.setText("采集中")
         self.notification_label.setText("等待批次结果")
         # progress_state 每次运行都清空上次分类和分页位置，但保留已发布 CSV。
         self.progress_state = GuiProgressState(
@@ -1101,6 +1163,11 @@ class CollectorWindow(QMainWindow):
         self._apply_progress_state()
         self._update_action_states()
         thread.start()
+
+    @Slot()
+    def continue_collection(self) -> None:
+        """追加补录策略，复用启动、进度、中止和关闭的现有状态流。"""
+        self.start_collection(continue_run=True)
 
     @Slot(dict)
     def handle_event(self, event: dict[str, Any]) -> None:
@@ -1117,6 +1184,16 @@ class CollectorWindow(QMainWindow):
         # 纯归约器统一处理动态分类、分页、发布和失败文案。
         self.progress_state = reduce_gui_progress(self.progress_state, event)
         self._apply_progress_state()
+        if event_name in {"category_batch_started", "category_retry_round_started"}:
+            # 已申请中止或退出时保留控制状态，避免迟到的轮次事件覆盖提示。
+            if not self.pending_close and not (
+                self.collection_control is not None and self.collection_control.stop_requested()
+            ):
+                self.run_status_label.setText(self.progress_state.collection_status)
+        elif event_name == "category_batch_collection_ready":
+            self.run_status_label.setText("等待发布")
+        elif event_name == "publication_succeeded":
+            self.run_status_label.setText("发布完成")
         if event_name == "publication_succeeded" and self.current_csv_path is not None:
             # 本次正式发布后按钮立即指向新 CSV，无需等待 Chrome 关闭。
             self.open_csv_button.setText("打开本次 CSV")
@@ -1138,6 +1215,11 @@ class CollectorWindow(QMainWindow):
     def _apply_progress_state(self) -> None:
         """Render the pure progress state into the existing Qt controls."""
 
+        self.progress_group.setTitle(
+            f"补采进度（第 {self.progress_state.retry_round}/{self.progress_state.retry_rounds} 轮）"
+            if self.progress_state.retry_round else "采集进度"
+        )
+        self.category_progress_label.setText("本轮补采" if self.progress_state.retry_round else "总体分类")
         self.stage_label.setText(self.progress_state.stage_text)
         self.progress_text.setText(
             f"完成 {self.progress_state.completed_category_count} / "
@@ -1191,7 +1273,9 @@ class CollectorWindow(QMainWindow):
                 category_bar.setValue(0)
                 page_label.setText("空闲")
                 continue
-            category_label.setText(f"进行中 · {category.category_path or '三级分类'}")
+            category_label.setText(
+                f"{self.progress_state.collection_action}中 · {category.category_path or '三级分类'}"
+            )
             if category.target_pages > 0:
                 category_bar.setRange(0, category.target_pages)
                 category_bar.setValue(min(category.page_no, category.target_pages))
@@ -1284,7 +1368,7 @@ class CollectorWindow(QMainWindow):
         self.collecting = False
         self.inspection_ready = False
         self.run_status_label.setText("完成" if exit_code == 0 else "未成功")
-        if exit_code != 0 and self.result_label.text() == "采集中":
+        if exit_code != 0 and self.result_label.text() == self.progress_state.collection_status:
             # error_type 只包含稳定 Python 类型名。
             self.result_label.setText(
                 f"运行未成功：{error_type or 'collection_failed'}"
@@ -1490,6 +1574,10 @@ class CollectorWindow(QMainWindow):
                 )
             )
         self.start_button.setEnabled(not self.collecting)
+        self.continue_button.setEnabled(
+            not self.collecting and not self.scheduler_job_active
+            and self._selected_mode() is RunMode.OFFICIAL
+        )
         self.mode_combo.setEnabled(not self.collecting and not self.request.lock_mode)
         self.force_checkbox.setEnabled(
             not self.collecting and not self.request.lock_mode

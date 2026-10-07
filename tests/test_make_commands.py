@@ -21,7 +21,7 @@ def make_output(*arguments):
     """Expand the production Makefile using an environment free of developer overrides."""
     # 清理可影响默认值的进程变量，保留PATH以调用真实make。
     environment = os.environ.copy()
-    for name in ("PLATFORM", "MODE", "GUI", "START", "NOTIFY", "ACTION", "CONFIG", "TASK", "MAKEFLAGS"):
+    for name in ("PLATFORM", "MODE", "GUI", "START", "CONTINUE", "NOTIFY", "ACTION", "CONFIG", "TASK", "MAKEFLAGS"):
         environment.pop(name, None)
     return subprocess.run(["make", "-n", *arguments], capture_output=True, text=True, env=environment)
 
@@ -42,8 +42,8 @@ def test_missing_or_invalid_platform_stops_before_any_recipe(command, platform):
     ("tt", "compass", "config/tasks.yaml", "compass_household_cleaning_realtime"),
     ("tb", "taobao", "config/taobao.yaml", "taobao_household_cleaning_realtime"),
 ])
-def test_platform_resources_and_immediate_gui_defaults(platform, internal, config, task):
-    """Login, run and status share one configuration and the default run creates a batch."""
+def test_platform_resources_and_idle_gui_defaults(platform, internal, config, task):
+    """默认只打开GUI，平台资源映射及手动开始后的正式模式不变。"""
     for command in ("login", "run", "status"):
         # 覆盖最终CONFIG避免依赖当前机器是否存在忽略的验收文件。
         result = make_output(command, f"PLATFORM={platform}", f"CONFIG={config}")
@@ -53,7 +53,7 @@ def test_platform_resources_and_immediate_gui_defaults(platform, internal, confi
         if command == "run":
             assert f'--task "{task}"' in result.stdout
             assert "--force" in result.stdout and "DINGTALK_ENABLED=true" in result.stdout
-            assert "--no-gui" not in result.stdout and "--idle" not in result.stdout
+            assert "--no-gui" not in result.stdout and "--idle" in result.stdout
 
 
 @pytest.mark.parametrize("arguments,expected", [
@@ -112,7 +112,16 @@ def test_start_expands_both_independent_platform_defaults():
     assert '--config "config/tasks.yaml"' in result.stdout
     assert '--config "config/taobao.yaml"' in result.stdout
     assert result.stdout.count("DINGTALK_ENABLED=true") == 2
-    assert "--no-gui" not in result.stdout and "--idle" not in result.stdout
+    assert "--no-gui" not in result.stdout and result.stdout.count("--idle") == 2
+
+
+@pytest.mark.parametrize("command", ["run", "start"])
+def test_explicit_start_retains_immediate_execution(command):
+    """默认空闲后，显式 START=yes 仍能立即开始采集。"""
+    # 只展开命令，避免测试启动真实 GUI 或浏览器。
+    result = make_output(command, "PLATFORM=tb", "START=yes")
+    assert result.returncode == 0, result.stderr
+    assert "--idle" not in result.stdout
 
 
 @pytest.mark.parametrize("failed_platform", ["none", "compass", "taobao"])

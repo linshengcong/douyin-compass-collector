@@ -1,5 +1,6 @@
 """Prepare one dynamic-category batch before any ranking page is requested."""
 
+import json
 from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
@@ -160,6 +161,8 @@ def prepare_category_batch(
     runtime_logger: RuntimeLogger,
     control: CollectionControl | None = None,
     category_blacklist: tuple[str, ...] = (),
+    # remote 在新批次内部读取；补录不会经过本方法。
+    category_config_source: str = "yaml",
 ) -> PreparedCategoryBatch:
     """Request one category tree and create all pending level-three runs."""
 
@@ -168,7 +171,7 @@ def prepare_category_batch(
     # 平台黑名单随批次固定，历史审计不依赖之后修改的配置文件。
     config_snapshot = {
         **task.model_dump(mode="json"),
-        "category_blacklist": list(category_blacklist),
+        "category_blacklist": list(category_blacklist) if category_config_source == "yaml" else [],
     }
     # BatchStorage 初始化只建立批次目录和单一运行中 Manifest。
     storage = BatchStorage(
@@ -226,7 +229,16 @@ def prepare_category_batch(
                 category="interrupted",
             )
         # 分类接口只使用三个已确认的固定业务参数。
-        category_response = client.discover_scopes(task)
+        # 先读取并固定规则，再允许平台浏览器打开；配置失败记录批次失败。
+        remote_config = None
+        if category_config_source == "remote":
+            from compass_collector.remote_categories import fetch_category_config, retry_catalog
+            remote_config = fetch_category_config(task.platform, task.id)
+            retry_catalog(task.platform, runtime_root, runtime_logger)
+            config_snapshot["remote_category_config"] = remote_config
+            database.record_category_config(batch_id=batch_id, config_snapshot=config_snapshot)
+            storage.record_category_config(config_snapshot)
+        category_response = client.discover_scopes(task, full_catalog=True) if remote_config else client.discover_scopes(task)
         # 完整响应只写入 runtime，不进入仓库 Fixture、日志或 Manifest。
         category_tree_path = storage.write_category_tree(category_response.payload)
         database.record_category_tree_raw(
@@ -245,8 +257,32 @@ def prepare_category_batch(
             )
         # 所有一级分类和目标三级分类只从当次 data.cate_list 动态解析。
         discovery = category_response.discovery
+        if remote_config:
+            from compass_collector.category_catalog import catalog_from_payload, scope_path
+            from compass_collector.category_rules import preview_rules, catalog_digest
+            from compass_collector.remote_categories import upload_catalog
+            # 全目录与原响应保存在同一批次，传输失败仅保留待同步标记。
+            nodes, full_discovery = catalog_from_payload(task.platform, category_response.payload)
+            (storage.batch_dir / "category-catalog.json").write_text(json.dumps(nodes, ensure_ascii=False), encoding="utf-8")
+            upload_catalog(task.platform, nodes, datetime.now(SHANGHAI_TIMEZONE), runtime_root, runtime_logger)
+            try:
+                # 校验依赖当次目录，不能依赖接口返回的旧目录猜测缺失分类。
+                preview = preview_rules(nodes, remote_config["rules"], task.id)
+            except ValueError as error:
+                raise CollectorError("远程分类规则无效", category="category_remote_invalid") from error
+            if not preview["valid"]:
+                raise CollectorError("远程分类规则与当次目录不一致或没有可采分类", category="category_remote_scope_invalid")
+            # 完整 ID 路径过滤不改变实际平台请求元数据。
+            scopes_by_path = {tuple(scope_path(scope)): scope for scope in full_discovery.categories}
+            discovery = replace(full_discovery, categories=tuple(
+                replace(scopes_by_path[tuple(item["path"])], discovery_order=index)
+                for index, item in enumerate(preview["included"], 1)))
+            remote_config["catalog_version"] = catalog_digest(nodes)
+            remote_config["effective_paths"] = [item["path"] for item in preview["included"]]
+            database.record_category_config(batch_id=batch_id, config_snapshot=config_snapshot)
+            storage.record_category_config(config_snapshot)
         # 路径中任一层级完整名称命中即跳过，不按子串或另一个平台名单过滤。
-        blocked_names = {name.strip() for name in category_blacklist}
+        blocked_names = {name.strip() for name in category_blacklist} if not remote_config else set()
         # 排除项没有 category_run，因此既不进入采集，也不进入失败补采。
         retained_categories = []
         for category in discovery.categories:

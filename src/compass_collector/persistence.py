@@ -1082,6 +1082,74 @@ class Database:
             snapshot = self._collection_snapshot_from_session(session, batch)
         return snapshot
 
+    def continuation_source(self, task_id: str, business_date: date, *, platform: str) -> tuple[BatchCollectionSnapshot | None, str]:
+        """只恢复当天未发布的正式任务；当天任一正式发布都会改走全量。"""
+        with self.session_factory() as session:
+            # 按业务日期查全部计划时间，避免调整 cron 后误恢复已经发布的一天。
+            batches = session.scalars(select(CollectionBatch).where(
+                CollectionBatch.task_id == task_id,
+                CollectionBatch.platform == platform,
+                CollectionBatch.business_date == business_date,
+                CollectionBatch.mode.in_(("normal", "force")),
+            ).order_by(CollectionBatch.started_at.desc(), CollectionBatch.id.desc())).all()
+            if any(batch.published_at is not None for batch in batches):
+                return None, "当天已经正式发布，本次全量采集当天数据"
+            for batch in batches:
+                if batch.discovered_category_count and batch.config_snapshot:
+                    return self._collection_snapshot_from_session(session, batch), "恢复当天未发布批次"
+        return None, "当天没有可恢复的分类快照，本次全量采集当天数据"
+
+    def batch_raw_pages(self, batch_id: str) -> dict[str, tuple[RawPageRecord, ...]]:
+        """只读取指定批次的分页索引，恢复逻辑负责验证原始文件完整性。"""
+        with self.session_factory() as session:
+            # 每批一次查询，避免逐分类查询数据库或加载正式商品表。
+            rows = session.scalars(select(RawResponse).join(CategoryRun).where(
+                CategoryRun.batch_id == batch_id,
+            ).order_by(RawResponse.page_no)).all()
+            # 分组只保存路径和采集时间，不把完整响应常驻内存。
+            grouped: dict[str, list[RawPageRecord]] = {}
+            for row in rows:
+                grouped.setdefault(row.category_run_id, []).append(RawPageRecord(
+                    row.page_no, Path(row.path), row.item_count, row.captured_at,
+                    dict(row.safe_params),
+                ))
+            return {key: tuple(pages) for key, pages in grouped.items()}
+
+    def restart_unpublished_batch(self, batch_id: str, completed_ids: set[str]) -> BatchCollectionSnapshot:
+        """保留校验成功分类，将其他分类重置为待采；调用方先归档其残缺材料。"""
+        with self.session_factory.begin() as session:
+            # 平台执行锁由 runner 持有，数据库再次拦截已发布或跨天批次。
+            batch = session.get(CollectionBatch, batch_id)
+            if (batch is None or batch.platform not in ("compass", "taobao") or batch.mode == "dry_run"
+                    or batch.published_at is not None
+                    or batch.business_date != datetime.now(ZoneInfo("Asia/Shanghai")).date()):
+                raise ValueError("only today's unpublished official batch can continue")
+            # 已发布商品不能被恢复操作删除；不确定发布状态应先核对事务结果。
+            categories = session.scalars(select(CategoryRun).where(CategoryRun.batch_id == batch_id)).all()
+            if not completed_ids <= {item.id for item in categories if item.status == "success"}:
+                raise ValueError("continued success categories do not match database")
+            self._ensure_no_product_entries(session, tuple(categories))
+            batch.status = "running"
+            batch.finished_at = None
+            batch.error_category = None
+            batch.version = None
+            batch.csv_path = None
+            for category in categories:
+                if category.id in completed_ids:
+                    continue
+                session.execute(delete(RawResponse).where(RawResponse.category_run_id == category.id))
+                category.status = "pending"
+                category.api_total = None
+                category.target_page_count = None
+                category.saved_page_count = 0
+                category.saved_item_count = 0
+                category.failed_page = None
+                category.error_category = None
+                category.started_at = None
+                category.finished_at = None
+            self._recalculate_batch_counts(session, batch)
+            return self._collection_snapshot_from_session(session, batch)
+
     def create_batch(
         self,
         *,
@@ -1160,6 +1228,15 @@ class Database:
                 raise RuntimeError("category tree has already been recorded")
             # 数据库只保存本地路径，不保存响应正文。
             batch.category_tree_raw_path = str(category_tree_raw_path)
+
+    def record_category_config(self, *, batch_id: str, config_snapshot: dict) -> None:
+        """发现阶段固定远程规则与最终清单，分类创建后禁止改写。"""
+        with self.session_factory.begin() as session:
+            # 运行行锁防止在已完成或已创建清单后改变快照。
+            batch = session.get(CollectionBatch, batch_id, with_for_update=True)
+            if batch is None or batch.status != "running" or batch.discovered_category_count:
+                raise RuntimeError("category config can only be recorded before category creation")
+            batch.config_snapshot = config_snapshot
 
     def create_category_runs(
         self,

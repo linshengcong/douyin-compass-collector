@@ -125,7 +125,7 @@ class TaobaoAdapter:
         if not login_only:
             self._authenticate()
 
-    def discover_scopes(self, task) -> DiscoveryCapture:
+    def discover_scopes(self, task, *, full_catalog=False) -> DiscoveryCapture:
         """Return a fully validated source tree before any category is collected."""
         self.open_session()
         # 分类来源仅来自当前页面的完整请求；没有材料时明确超时。
@@ -136,7 +136,12 @@ class TaobaoAdapter:
             if response is not None:
                 payload = read_completed_payload(response)
                 try:
-                    discovery = parse_category_tree(payload, task.category_scope)
+                    # 远程模式先读取全部目录，不应用旧 YAML 范围。
+                    if full_catalog:
+                        from compass_collector.category_catalog import catalog_from_payload
+                        _, discovery = catalog_from_payload("taobao", payload)
+                    else:
+                        discovery = parse_category_tree(payload, task.category_scope)
                 except ResponseContractError as error:
                     error.discovery_payload = payload
                     raise

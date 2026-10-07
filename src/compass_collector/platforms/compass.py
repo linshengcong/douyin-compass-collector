@@ -250,7 +250,7 @@ class CompassAdapter:
         self.session.page = self.page
         self._click(self.page.get_by_text("商品榜单", exact=True))
 
-    def discover_scopes(self, task) -> DiscoveryCapture:
+    def discover_scopes(self, task, *, full_catalog=False) -> DiscoveryCapture:
         """Read the page-generated category tree and validate configured IDs."""
         self.open_session()
         # 新任务使用已建立的分类树快照，不反复读取认证信息。
@@ -287,7 +287,7 @@ class CompassAdapter:
                     continue
                 self.category_tree = payload
                 try:
-                    scopes = select_scopes(discovery, task.category_scope)
+                    scopes = discovery if full_catalog else select_scopes(discovery, task.category_scope)
                 except ResponseContractError as error:
                     error.discovery_payload = payload
                     raise

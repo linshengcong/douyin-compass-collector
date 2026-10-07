@@ -8,6 +8,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol, Sequence
 from zoneinfo import ZoneInfo
+from uuid import uuid4
 
 
 # 所有运行时时间戳使用工程确认的北京时区。
@@ -274,6 +275,41 @@ class BatchStorage:
 
         _write_json_atomic(self.manifest_path, self.manifest)
 
+    @classmethod
+    def reopen(cls, runtime_root: Path, snapshot) -> "BatchStorage":
+        """从权威数据库恢复原批次存储，不调用会创建新目录的构造函数。"""
+        # 仅恢复已校验的身份段，目录布局继续与新采集完全相同。
+        for value in (snapshot.platform, snapshot.task_id, snapshot.batch_id):
+            _validate_path_segment(value, "batch identity")
+        # 重建存储句柄只补齐 Manifest，已成功的分页文件保持原样。
+        storage = cls.__new__(cls)
+        storage.batch_id = snapshot.batch_id
+        storage.task_id = snapshot.task_id
+        storage.business_date = snapshot.business_date
+        storage.batch_dir = runtime_root / "raw" / snapshot.platform / snapshot.business_date.isoformat() / snapshot.task_id / snapshot.batch_id
+        storage.categories_dir = storage.batch_dir / "categories"
+        storage.artifact_dir = runtime_root / "artifacts" / snapshot.platform / snapshot.business_date.isoformat() / snapshot.task_id / snapshot.batch_id
+        storage.category_tree_path = storage.batch_dir / "category-tree.json.gz"
+        storage.manifest_path = storage.batch_dir / "manifest.json"
+        storage.manifest = {"platform": snapshot.platform, "mode": snapshot.mode,
+                            "categories": [], "category_tree_captured_at": None}
+        try:
+            # 分类树采集时间只存在于 Manifest；可读时保留，损坏时由数据库重建其余状态。
+            previous_manifest = json.loads(storage.manifest_path.read_text(encoding="utf-8"))
+            if isinstance(previous_manifest, dict):
+                storage.manifest["category_tree_captured_at"] = previous_manifest.get("category_tree_captured_at")
+        except (OSError, ValueError):
+            pass
+        storage.sync_collection_snapshot(snapshot)
+        return storage
+
+    def record_category_config(self, config_snapshot: dict) -> None:
+        """在分类创建前更新与 PostgreSQL 相同的远程批次审计快照。"""
+        if self.manifest["status"] != "running" or self.manifest["categories"]:
+            raise RuntimeError("category config can only be recorded before category creation")
+        self.manifest["config_snapshot"] = config_snapshot
+        self._write_manifest()
+
     def _category_manifest(self, category_run_id: str) -> dict[str, Any]:
         """Return one registered category Manifest by its stable run ID."""
 
@@ -296,10 +332,10 @@ class BatchStorage:
         _write_gzip_json_atomic(self.category_tree_path, payload)
         return self.category_tree_path
 
-    def archive_category_attempt(self, category_run_id: str, retry_round: int) -> None:
+    def archive_category_attempt(self, category_run_id: str, retry_round: int | str) -> None:
         """补采前保存旧页和故障材料，让新尝试使用独立的空目录。"""
         self._category_manifest(category_run_id)
-        if retry_round not in (1, 2):
+        if retry_round not in (1, 2) and retry_round != "continue":
             raise ValueError("invalid category retry round")
         # 两轮补采分别归档各自上一轮；不删除审计材料，不覆盖已有归档。
         for source in (self.categories_dir / category_run_id, self.artifact_dir / category_run_id):
@@ -308,7 +344,8 @@ class BatchStorage:
                 destination = source.parent / "attempts" / category_run_id / str(retry_round)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if destination.exists():
-                    raise FileExistsError(destination)
+                    # 多次 --continue 后自动补采轮次会重复；保留每次历史而不覆盖。
+                    destination = destination.with_name(f"{retry_round}-{uuid4().hex}")
                 source.rename(destination)
 
     def write_category_page(

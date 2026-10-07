@@ -7,6 +7,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from compass_collector.config import AppConfig, load_config
+from compass_collector.errors import CollectorError
 from compass_collector.local_data import (
     clear_auth_data_with_locks,
     clear_local_data_with_locks,
@@ -88,10 +89,21 @@ def build_parser() -> argparse.ArgumentParser:
     # 空闲GUI替代旧Make app入口，仍保留用户选择的模式。
     run_parser.add_argument("--idle", action="store_true")
     run_parser.add_argument("--platform", choices=("compass", "taobao"))
+    # 独立追加开关，不参与平台选择，也不替代 --force 的现有语义。
+    run_parser.add_argument("--continue", dest="continue_run", action="store_true",
+                            help="continue today's unpublished batch on the selected platform; otherwise collect all")
     # --force 和 --dry-run 语义冲突，同一次命令只允许选择一个。
     run_mode = run_parser.add_mutually_exclusive_group()
     run_mode.add_argument("--force", action="store_true")
     run_mode.add_argument("--dry-run", action="store_true")
+
+    # 初始化目录和规则草稿，--refresh 只请求分类树，不采集商品。
+    category_parser = subparsers.add_parser("categories-init", help="upload category catalog and import YAML draft")
+    category_parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    category_parser.add_argument("--platform", choices=("compass", "taobao"), required=True)
+    category_parser.add_argument("--catalog", type=Path)
+    category_parser.add_argument("--refresh", action="store_true")
+    category_parser.add_argument("--directory-only", action="store_true")
 
     # status 命令只读取最近批次摘要，不启动 Chrome。
     status_parser = subparsers.add_parser("status", help="show recent task runs")
@@ -144,6 +156,10 @@ def main() -> None:
     except RuntimeLockBusy as error:
         print(f"启动失败：{error.role} 已被其他进程占用", file=sys.stderr)
         exit_code = 2
+    except CollectorError as error:
+        # 分类初始化失败提供受控错误分类，不打印底层响应或请求凭证。
+        print(f"运行失败：{error.category}", file=sys.stderr)
+        exit_code = 1
     except (OSError, ValueError, ValidationError) as error:
         print(f"启动失败：{error}", file=sys.stderr)
         exit_code = 2
@@ -180,8 +196,18 @@ def _dispatch_configured_command(
     PlatformRuntime(runtime_root(), selected_platform).reject_legacy_operations()
     if arguments.command == "run" and arguments.idle and arguments.no_gui:
         raise ValueError("--idle requires GUI")
+    if arguments.command == "run" and arguments.continue_run:
+        if arguments.dry_run:
+            raise ValueError("--continue 仅支持正式采集，不能与 --dry-run 一起使用")
 
-    if arguments.command == "login":
+    if arguments.command == "categories-init":
+        from compass_collector.category_bootstrap import initialize_categories
+        if arguments.catalog and arguments.refresh:
+            raise ValueError("--catalog 与 --refresh 不可同时使用")
+        print(initialize_categories(config, catalog_path=arguments.catalog,
+            refresh=arguments.refresh, directory_only=arguments.directory_only))
+        exit_code = 0
+    elif arguments.command == "login":
         exit_code = run_login(config, selected_platform)
     elif arguments.command == "app":
         # PySide6 延迟导入，status、login 和后台 Scheduler 不初始化 Qt。
@@ -203,6 +229,7 @@ def _dispatch_configured_command(
                 arguments.task_id,
                 force=arguments.force,
                 dry_run=arguments.dry_run,
+                **({"continue_run": True} if arguments.continue_run else {}),
             )
         else:
             # GUI 命令锁定 run/dry-run/force 的启动语义并自动执行。
@@ -218,6 +245,7 @@ def _dispatch_configured_command(
                     force=arguments.force,
                     lock_mode=True,
                     platform=selected_platform,
+                    continue_run=arguments.continue_run,
                 ),
             )
     elif arguments.command == "clear-data":

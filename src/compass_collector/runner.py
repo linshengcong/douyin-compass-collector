@@ -14,6 +14,7 @@ from compass_collector.category_batch import (
 )
 from compass_collector.category_collection import collect_category_batch
 from compass_collector.config import AppConfig, TaskConfig
+from compass_collector.continuation import continuation_task, prepare_continuation
 from compass_collector.errors import (
     AuthRequiredError,
     BrowserOperationError,
@@ -318,9 +319,21 @@ def collect_task(
     *,
     database: Database,
     mode: CollectionBatchMode,
+    # 非空时继续原批次，成功分类只加载供发布使用，不再次请求或落盘。
+    continuation=None,
 ) -> CollectedCategoryBatch:
     """Discover dynamic categories and collect every ranking before publication."""
 
+    if continuation is not None:
+        # 继续原批次只需恢复已完成结果，再调用同一个采集循环。
+        prepared_batch, completed_runs = prepare_continuation(
+            continuation, plan.task, database, RUNTIME_ROOT, runtime_logger, control
+        )
+        return collect_category_batch(
+            prepared_batch=prepared_batch, task=plan.task, client=client,
+            database=database, runtime_logger=runtime_logger, control=control,
+            completed_runs=completed_runs,
+        )
     # 阶段二为该顶层任务创建独立批次、分类树 raw 和 pending 分类。
     prepared_batch = prepare_category_batch(
         runtime_root=RUNTIME_ROOT,
@@ -334,6 +347,7 @@ def collect_task(
         runtime_logger=runtime_logger,
         control=control,
         category_blacklist=tuple(config.platforms[plan.task.platform].category_blacklist),
+        category_config_source=config.platforms[plan.task.platform].category_config_source,
     )
     # 同一适配器在创建它的线程中串行操作页面和分页。
     return collect_category_batch(
@@ -720,6 +734,8 @@ def _run_collection_unlocked(
     planned_at_overrides: dict[str, datetime] | None = None,
     control: CollectionControl | None = None,
     run_source: BatchSource = BatchSource.TERMINAL,
+    # 两平台人工正式入口均允许请求当天恢复；不改变定时采集策略。
+    continue_run: bool = False,
 ) -> int:
     """Run selected tasks and optionally publish PostgreSQL plus CSV snapshots."""
 
@@ -802,6 +818,29 @@ def _run_collection_unlocked(
     upgrade_database(config.database.url, platform=config.execution_platform())
     database = Database(config.database.url)
     try:
+        # 在执行锁内选来源，按原配置规划计划时间和版本，避免当前 YAML 改变旧批次。
+        continuations = {}
+        if continue_run:
+            planned_at_overrides = dict(planned_at_overrides or {})
+            for task_index, selected_task in enumerate(selected_tasks):
+                # 当天任一已发布记录优先于失败记录；无可恢复材料时全量。
+                source, decision = database.continuation_source(
+                    selected_task.id, batch_started_at.date(), platform=selected_task.platform
+                )
+                if source is not None:
+                    try:
+                        # 读取原配置不打开浏览器，也不修改原状态。
+                        recovered_task = continuation_task(source)
+                    except ValueError:
+                        decision = "原分类快照无法恢复，本次全量采集当天数据"
+                    else:
+                        continuations[selected_task.id] = source
+                        selected_tasks[task_index] = recovered_task
+                        planned_at_overrides[selected_task.id] = source.planned_at.replace(tzinfo=SHANGHAI_TIMEZONE)
+                        decision = f"继续当天未发布批次 {source.batch_id}，跳过校验完整的成功分类"
+                runtime_logger.emit(level="INFO", event="continuation_planned",
+                                    message=f"[{selected_task.id}] {decision}", stage="continuation",
+                                    context=LogContext(task_id=selected_task.id))
         # 幂等检查和版本分配在打开 Chrome 前完成。
         task_plans = prepare_task_plans(
             selected_tasks,
@@ -832,6 +871,8 @@ def _run_collection_unlocked(
             return 0
         # 每个顶层 TaskExecutionPlan 预分配独立 collection batch ID。
         task_batch_ids = {plan.task.id: uuid4().hex for plan in task_plans}
+        # 补录保持原批次身份；跨天或当天已发布的全量仍使用新批次。
+        task_batch_ids.update({task_id: source.batch_id for task_id, source in continuations.items()})
         # 手动 run 的 Chrome 在本次命令中统一复用。
         browser_session: BrowserSession | None = None
         # 每个平台独立会话，任务只顺序操作各自适配器。
@@ -874,6 +915,7 @@ def _run_collection_unlocked(
                         control,
                         database=database,
                         mode=collection_mode,
+                        **({"continuation": continuations[plan.task.id]} if plan.task.id in continuations else {}),
                     )
                 except (
                     CategoryBatchPreparationError,
@@ -1435,6 +1477,8 @@ def run_collection(
     planned_at_overrides: dict[str, datetime] | None = None,
     control: CollectionControl | None = None,
     run_source: BatchSource = BatchSource.TERMINAL,
+    # --continue 优先恢复当天未发布任务；其他情况下等同 force 全量新版本。
+    continue_run: bool = False,
 ) -> int:
     """Run one mutually exclusive Chrome-backed collection operation."""
 
@@ -1443,6 +1487,10 @@ def run_collection(
     if scheduled_tasks and any(task.platform != platform for task in scheduled_tasks):
         raise ValueError("scheduled collection must select one platform")
     config = config.for_platform(platform)
+    if continue_run:
+        if dry_run or not manual:
+            raise ValueError("--continue 仅支持当天正式人工采集，不能与 --dry-run 一起使用")
+        force = True
     # 执行锁持续覆盖采集及保留Chrome检查期。
     scope = PlatformRuntime(RUNTIME_ROOT, platform)
     with scope.operation("collection", config.browser_for(platform).profile_dir):
@@ -1456,6 +1504,7 @@ def run_collection(
             planned_at_overrides=planned_at_overrides,
             control=control,
             run_source=run_source,
+            continue_run=continue_run,
         )
 
 

@@ -30,9 +30,9 @@
 make                              # 帮助
 make help                         # 帮助
 make install                      # 安装锁定依赖
-make start                        # 同时启动两平台独立GUI，立即强制采集并通知
-make run PLATFORM=tt              # 抖音：GUI立即强制采集，结束后通知
-make run PLATFORM=tb              # 淘宝：GUI立即强制采集，结束后通知
+make start                        # 同时打开两平台独立GUI，等待手动开始
+make run PLATFORM=tt              # 抖音：打开GUI，等待手动开始
+make run PLATFORM=tb              # 淘宝：打开GUI，等待手动开始
 make login PLATFORM=tb            # 与采集相同Profile登录
 make status PLATFORM=tb           # 只查看淘宝批次
 make clean PLATFORM=tb ACTION=data   # 仅清理淘宝本地数据
@@ -47,17 +47,30 @@ make check PLATFORM=tb            # 后端测试及所选平台服务检查
 make check PLATFORM=tb ACTION=test # 仅完整后端测试
 ```
 
-`run` 默认 `GUI=yes START=yes MODE=force NOTIFY=yes`。可选参数保持明确语义：
+`run`、`start` 默认 `GUI=yes START=no MODE=force NOTIFY=yes`，只打开窗口，不立即采集。可选参数保持明确语义：
 
 ```bash
-make run PLATFORM=tb START=no       # 打开GUI，等待手动开始
+make run PLATFORM=tb START=yes      # 打开GUI并立即采集
 make run PLATFORM=tb GUI=no         # 终端立即采集
+make run PLATFORM=tb CONTINUE=yes   # 当天未发布则跳过成功分类，继续补录
 make run PLATFORM=tb MODE=normal    # 已有正式发布就跳过，否则新批次完整重采
 make run PLATFORM=tb MODE=dry-run NOTIFY=no # 试采，不发布正式商品/CSV，不通知
 make start START=no NOTIFY=no       # 同时打开两个GUI，等待手动开始
 ```
 
-`normal` 不是补录，已发布的部分成功结果也会跳过；分类级补录见TODO。`force` 每次创建新批次，新排名属于新版本，旧版本保留。`START=no` 只允许与 `GUI=yes` 一起使用。显式模式在GUI中锁定，避免普通采集被改成强制采集。
+`normal` 不是补录，已发布的部分成功结果也会跳过。`force` 每次创建新批次，新排名属于新版本，旧版本保留。`START=no` 只允许与 `GUI=yes` 一起使用；`GUI=no` 默认 `START=yes`，直接执行终端采集。显式模式在GUI中锁定，避免普通采集被改成强制采集。
+
+抖音和淘宝均支持补录，使用独立追加参数 `run --continue`，与 `--platform compass` 或 `--platform taobao`、`--no-gui`、`--force` 可同时使用；不支持 `--dry-run`。例如：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m compass_collector run --continue --platform taobao --config config/taobao.yaml
+make run PLATFORM=tb CONTINUE=yes GUI=no
+make run PLATFORM=tt CONTINUE=yes GUI=no   # 抖音补录，平台参数独立
+```
+
+Make 本身不接受自定义 `--continue` 选项，因此使用 `CONTINUE=yes` 传递；`PLATFORM` 仍独立决定配置和账号。GUI 也提供“补录 / 重新采集”按钮。默认打开窗口后点击该按钮补录；需要启动后立即补录时追加 `START=yes`。
+
+`--continue` 查找当前任务当天最近的、已有分类清单且未发布的正式批次，继续使用原批次 ID、配置与分类清单。成功分类校验后直接跳过，文件保持不变；其他分类的残缺页归档后从第一页重采。成功状态但缺页或文件损坏的分类也会重新采集。所有分类都完整时只重试发布，不启动 Chrome。当日已有正式发布（包括部分成功发布）、只有跨天旧批次或没有可恢复分类快照时，等同全量采集当天数据并发布新版本。正式发布以数据库 `published_at` 为准；已正式发布后发生的 OSS/网站更新失败不属于此补录范围。补录再次中断后可以重复执行同一命令。
 
 `start` 并行执行两个独立的 `run`，各自使用 `TT_CONFIG`、`TB_CONFIG` 和平台默认任务，公共运行参数同时传给两边。终端等待两个窗口各自结束；关闭或启动失败一个平台不会停止另一个，两边结束后返回失败状态（如有）。
 
@@ -197,7 +210,7 @@ make run PLATFORM=tt START=no
 - 查看当前或最近批次的钉钉发送状态。
 - 在采集和 Scheduler 均停止时清除本地采集数据。
 
-`make run PLATFORM=tt` 默认打开GUI立即强制采集并通知；`MODE=normal`、`MODE=dry-run`显式切换模式，`GUI=no`回退终端，`START=no`打开空闲GUI。
+`make run PLATFORM=tt` 默认打开空闲GUI，手动开始后正式采集并通知；`MODE=normal`、`MODE=dry-run`显式切换模式，`GUI=no`回退终端并立即执行，`START=yes`让GUI打开后立即执行。
 
 GUI 关闭时不会留下自己启动的 Scheduler 或 Chrome。运行中的采集会先确认，再在页面动作和响应等待的短检查点协作式中止。
 
@@ -359,13 +372,13 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 
 - 云主机和 systemd；
 - 重试策略与 Scheduler 逻辑后续重新梳理；
-- [ ] 分类级补录：针对失败或缺失分类，从第一页完整重采，按本次接口排名生成新版本；保留原版本及分类来源、采集时间，不按商品或缺失页插入旧榜单。版本合并与发布规则、排名变化验收待设计；
+- [x] 抖音和淘宝当天未发布批次补录：`run --continue` 跳过成功分类，其余从第一页重采；已发布或跨天时全量采集，不合并不同日期的榜单；
 - 以 PostgreSQL 权威状态重建 Manifest 和 raw 索引的崩溃恢复；
 - 以更多平台的页面和字段契约验证适配器扩展；
 - 多主机独立运行与监控；
 - 其他榜单 Adapter。
 
-当前 `normal` 模式仍为：同一任务、同一计划时间已有正式发布结果（含部分成功）则跳过；否则创建新批次完整重采。分类级补录尚未实现，不作为 `normal` 的现有行为。
+当前 `normal` 模式仍为：同一任务、同一计划时间已有正式发布结果（含部分成功）则跳过；否则创建新批次完整重采。补录必须显式追加 `--continue`（Make 使用 `CONTINUE=yes`），不改变普通 `normal` 运行的行为。
 
 ## 采集调用链与数据契约
 
@@ -424,3 +437,7 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q
 ## 工程职责
 
 本项目负责 RPA 采集、调度、原始材料、PostgreSQL 持久化、CSV 与 OSS 快照发布及通知。网站源码在独立 mall-web 工程，选品 API 在独立 mall-server 工程；本项目不包含前端构建、部署或业务 API。采集器通过 `WEB_SITE_URL` 通知固定网站入口。
+
+## 分类采集管理
+
+目标范围与黑名单支持通过 mall-web 管理。默认仍使用 YAML；首次导入、网页核对发布后，将实际入口的 `platforms.<平台>.category_config_source` 设置为 `remote`。新批次读取接口规则，补录沿用原快照。完整初始化、回滚和验证说明见 [分类采集管理](docs/分类采集管理.md)。

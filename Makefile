@@ -26,10 +26,12 @@ TASK ?= $(if $(filter tb,$(PLATFORM)),taobao_household_cleaning_realtime,compass
 # 安装依赖使用uv，执行命令使用统一解释器，可在命令行覆盖。
 UV ?= uv
 PYTHON ?= .venv/bin/python
-# 每次执行立即在GUI创建新批次并通知，可显式选择其他行为。
+# 默认打开空闲GUI；终端没有手动按钮，因此GUI=no仍默认立即运行。
 MODE ?= force
 GUI ?= yes
-START ?= yes
+START ?= $(if $(filter no,$(GUI)),yes,no)
+# 独立追加参数：CONTINUE=yes 仅给 run 传 --continue，不改变 PLATFORM。
+CONTINUE ?= no
 NOTIFY ?= yes
 # ACTION由对应命令设置默认值；清理必须显式指定data或login。
 ACTION ?=
@@ -37,6 +39,15 @@ ACTION ?=
 NOTIFY_ENABLED = $(if $(filter yes,$(NOTIFY)),true,false)
 RUN_MODE_OPTION = $(if $(filter force,$(MODE)),--force,$(if $(filter dry-run,$(MODE)),--dry-run))
 RUN_GUI_OPTION = $(if $(filter no,$(GUI)),--no-gui)
+# 补录开关独立校验，拼写错误不能静默退回全量采集。
+ifneq ($(filter run,$(COMMANDS)),)
+ifneq ($(words $(CONTINUE)),1)
+$(error CONTINUE 只允许 yes 或 no)
+endif
+ifeq ($(filter yes no,$(CONTINUE)),)
+$(error CONTINUE 只允许 yes 或 no)
+endif
+endif
 # 动作只在对应命令解析，check不继承服务安装动作，clean没有隐式默认值。
 VALID_ACTIONS_clean := data login
 VALID_ACTIONS_schedule := run check install status uninstall
@@ -87,7 +98,7 @@ endif
 
 help: ## 帮助；单平台命令须带PLATFORM=tt|tb（install/start除外）
 	@awk 'BEGIN {FS = ":.*## "; print "用法：make start [参数] 或 make <command> PLATFORM=tt|tb [参数]\n"} /^[a-zA-Z0-9_-]+:.*## / {printf "  %-12s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
-	@echo "run 默认：GUI=yes START=yes MODE=force NOTIFY=yes；tt与tb可并行，同平台互斥"
+	@echo "run/start 默认：GUI=yes START=no MODE=force NOTIFY=yes；START=yes立即执行，tt与tb可并行"
 	@echo "示例：make start（同时启动两平台）；make run PLATFORM=tb；make clean PLATFORM=tb ACTION=data"
 
 install: ## 按uv.lock安装依赖
@@ -102,8 +113,8 @@ start: ## 同时启动抖音和淘宝独立GUI；沿用run的MODE/GUI/START/NOTI
 	wait "$$tb_pid" || start_exit_code=$$?; \
 	exit "$$start_exit_code"
 
-run: ## 立即GUI采集；MODE=force|normal|dry-run GUI=yes|no START=yes|no NOTIFY=yes|no
-	DINGTALK_ENABLED=$(NOTIFY_ENABLED) PYTHONPATH=src $(PYTHON) -m compass_collector run --config "$(CONFIG)" --platform $(COLLECTOR_PLATFORM) --task "$(TASK)" $(RUN_MODE_OPTION) $(RUN_GUI_OPTION) $(if $(filter no,$(START)),--idle)
+run: ## 默认打开空闲GUI；START=yes立即执行 MODE=force|normal|dry-run GUI=yes|no NOTIFY=yes|no CONTINUE=yes|no
+	DINGTALK_ENABLED=$(NOTIFY_ENABLED) PYTHONPATH=src $(PYTHON) -m compass_collector run --config "$(CONFIG)" --platform $(COLLECTOR_PLATFORM) --task "$(TASK)" $(RUN_MODE_OPTION) $(RUN_GUI_OPTION) $(if $(filter no,$(START)),--idle) $(if $(filter yes,$(CONTINUE)),--continue)
 
 login: ## 登录所选平台的采集Profile
 	PYTHONPATH=src $(PYTHON) -m compass_collector login --config "$(CONFIG)" --platform $(COLLECTOR_PLATFORM)

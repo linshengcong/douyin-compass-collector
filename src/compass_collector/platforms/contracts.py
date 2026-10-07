@@ -39,7 +39,7 @@ class PlatformAdapter(Protocol):
     def open_session(self, *, login_only: bool = False) -> None:
         """Open the platform page and resolve authentication."""
 
-    def discover_scopes(self, task) -> DiscoveryCapture:
+    def discover_scopes(self, task, *, full_catalog=False) -> DiscoveryCapture:
         """Validate all configured targets before ranking collection."""
 
     def collect_scope(self, task, scope, business_date) -> Iterator[PageCapture]:

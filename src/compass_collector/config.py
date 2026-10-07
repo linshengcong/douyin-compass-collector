@@ -62,6 +62,8 @@ class PlatformConfig(StrictModel):
     persist_session_cookies: bool = False
     # 同一平台所有任务共用分类名称黑名单，父级命中时跳过其全部待采子分类。
     category_blacklist: list[str] = Field(default_factory=list)
+    # remote 只替换类目范围和黑名单，不改变本机运行配置。
+    category_config_source: Literal["yaml", "remote"] = "yaml"
 
     @field_validator("category_blacklist")
     @classmethod
