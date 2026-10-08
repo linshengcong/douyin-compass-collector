@@ -14,7 +14,7 @@ from compass_collector.category_batch import prepare_category_batch
 from compass_collector.category_catalog import catalog_from_payload, scope_path
 from compass_collector.category_rules import preview_rules
 from compass_collector.config import load_config
-from compass_collector.continuation import continuation_task
+from compass_collector.continuation import continuation_task, prepare_continuation
 from compass_collector.errors import CategoryBatchPreparationError, CollectorError
 from compass_collector.persistence import CollectionBatch, Database, upgrade_database
 from compass_collector.platforms.contracts import DiscoveryCapture
@@ -56,7 +56,7 @@ def scenario(tmp_path):
     rules = {"tasks": [{"id": task.id, "display_name": task.display_name, "targets": [target]}],
              "exclusions": [leaves[0]], "unresolved_names": []}
     # 模拟服务端已发布状态，版本必须写入批次快照。
-    response = {"schema_version": 1, "platform": "compass", "revision": 3, "published": True, "rules": rules}
+    response = {"schema_version": 1, "platform": "compass", "revision": 3, "published": True, "rules": rules, "product_filters": {"enabled": True, "conditions": {"pay_amount": {"enabled": True, "operator": "gte", "threshold": "20000"}, "pay_combo_count": {"enabled": True, "operator": "gt", "threshold": "300"}}}}
     # 北京时间沿用当前采集业务日期规则。
     planned = datetime.now(ZoneInfo("Asia/Shanghai"))
     # 阶段二仅准备分类，没有商品分页。
@@ -83,10 +83,37 @@ def test_remote_plan_snapshot_and_legacy_recovery(tmp_path, monkeypatch):
         with arguments["database"].session_factory() as session:
             snapshot = session.get(CollectionBatch, arguments["batch_id"])
             assert snapshot.config_snapshot["remote_category_config"]["revision"] == 3
+            assert snapshot.config_snapshot["remote_category_config"]["product_filters"] == response["product_filters"]
             assert snapshot.config_snapshot["remote_category_config"]["effective_paths"] == expected
             assert snapshot.config_snapshot["category_blacklist"] == []
             assert continuation_task(snapshot).id == arguments["task"].id
             assert result.storage.manifest["config_snapshot"] == snapshot.config_snapshot
+        # 远程配置变化之后，真实续采入口仍恢复原批次的完整配置审计。
+        response["revision"] = 4
+        response["product_filters"]["conditions"]["pay_combo_count"]["threshold"] = "999"
+        frozen = arguments["database"].collection_snapshot(arguments["batch_id"])
+        continued, _ = prepare_continuation(frozen, continuation_task(frozen), arguments["database"],
+            tmp_path, arguments["runtime_logger"])
+        assert continued.storage.manifest["config_snapshot"]["remote_category_config"]["revision"] == 3
+        assert continued.storage.manifest["config_snapshot"]["remote_category_config"]["product_filters"]["conditions"]["pay_combo_count"]["threshold"] == "300"
+        # 模拟已发布的空合成批次；补同步只能从数据库原快照取规则。
+        from compass_collector.ranking_sync import build_sync_payload
+        monkeypatch.setenv("COMPASS_DATABASE_URL", str(arguments["database"].engine.url.render_as_string(hide_password=False)))
+        with arguments["database"].session_factory.begin() as session:
+            # 合成发布状态同样满足生产数据库的完整性约束，时间沿用北京时间墙上时间。
+            published_snapshot = session.get(CollectionBatch, arguments["batch_id"])
+            published_snapshot.status = "success"
+            published_snapshot.successful_category_count = published_snapshot.discovered_category_count
+            published_snapshot.not_started_category_count = 0
+            published_snapshot.finished_at = arguments["planned_at"].replace(tzinfo=None)
+            published_snapshot.published_at = arguments["planned_at"].replace(tzinfo=None)
+            published_snapshot.version = 1
+            published_snapshot.csv_path = str(tmp_path / "synthetic-empty.csv")
+        # 补同步同样不能换用已经变化的远程配置。
+        payload = build_sync_payload({"platform": "compass", "task_id": arguments["task"].id,
+            "batch_id": arguments["batch_id"], "business_date": arguments["business_date"].isoformat(), "item_count": 0})
+        assert payload["collection_config"]["revision"] == 3
+        assert payload["collection_config"]["product_filters"]["conditions"]["pay_combo_count"]["threshold"] == "300"
     finally:
         arguments["database"].close()
 

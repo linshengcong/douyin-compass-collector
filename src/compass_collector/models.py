@@ -28,6 +28,9 @@ class ProductShop:
     # 店铺链接和卖家用户标识分别保存，不能混作店铺 ID。
     shop_url: str | None = None
     seller_user_id: str | None = None
+    # 店铺 logo 和严格布尔天猫状态随来源记录保存。
+    image_url: str | None = None
+    is_tmall: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)

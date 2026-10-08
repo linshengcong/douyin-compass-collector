@@ -1,5 +1,6 @@
 """Serial platform-neutral page persistence and category lifecycle orchestration."""
 
+from compass_collector.collection_limits import frozen_task, pagination_counts
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from compass_collector.category_batch import PreparedCategoryBatch
@@ -110,7 +111,9 @@ def _collect_category_run(
         snapshot = database.start_category_run(
             category_run_id=plan.category_run_id, started_at=started_at
         )
+        # 数据库快照固定配置，重试不读取今天的新规则。
         started = True
+        task = frozen_task(task, getattr(snapshot, "config_snapshot", None))
         _sync_collection_snapshot(prepared_batch.storage, snapshot)
         _safe_emit(
             runtime_logger,
@@ -222,7 +225,10 @@ def _collect_category_run(
                     "target_pages": target_pages,
                 },
             )
-        if total is None or len(raw_pages) != target_pages or len(entries) != total:
+        # 计划条数与平台总数分离，限页完成后不继续补采。
+        planned_items = pagination_counts(total or 0, 20 if task.platform == "taobao" else 10,
+                                          task.max_pages_per_category)[1]
+        if total is None or len(raw_pages) != target_pages or len(entries) != planned_items:
             raise ResponseContractError(
                 "Adapter returned incomplete scope", category="incomplete_ranking"
             )
@@ -240,7 +246,7 @@ def _collect_category_run(
             runtime_logger,
             level="INFO",
             event="category_collection_succeeded",
-            message=f"[{task.id}] 分类采集完成，共 {total} 条",
+            message=f"[{task.id}] 分类采集完成，共 {len(entries)} 条（平台总数 {total} 条）",
             stage="category_collection",
             context=LogContext(
                 batch_id=prepared_batch.batch_id,
@@ -249,7 +255,7 @@ def _collect_category_run(
             ),
             details={
                 "category_id": plan.category.key,
-                "saved_items": total,
+                "saved_items": len(entries),
                 "target_pages": target_pages,
             },
         )

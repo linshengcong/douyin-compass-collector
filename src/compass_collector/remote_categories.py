@@ -9,6 +9,7 @@ import httpx
 
 from compass_collector.category_rules import validate_rules, validate_catalog
 from compass_collector.errors import CollectorError
+from compass_collector.collection_limits import page_limit
 
 
 def remote_connection():
@@ -51,11 +52,14 @@ def fetch_category_config(platform, task_id):
         if type(payload["schema_version"]) is not int or payload["schema_version"] != 1 or payload["platform"] != platform or not payload["published"] or type(payload["revision"]) is not int or payload["revision"] < 1:
             raise ValueError("规则未发布或版本不兼容")
         validate_rules(payload["rules"])
+        page_limit({"remote_category_config": payload})
         if payload["rules"]["unresolved_names"] or not any(task["id"] == task_id for task in payload["rules"]["tasks"]):
             raise ValueError("规则任务缺失或名称未处理")
     except (ValueError, KeyError, TypeError) as error:
         raise CollectorError("分类规则未发布、不兼容或任务未注册", category="category_remote_invalid") from error
-    return {"schema_version": 1, "platform": platform, "revision": payload["revision"], "rules": payload["rules"]}
+    # 商品条件原样随版本固定在批次；旧服务端省略该字段时保留未应用语义。
+    return {"schema_version": 1, "platform": platform, "revision": payload["revision"], "rules": payload["rules"],
+            "product_filters": payload.get("product_filters"), "collection_limits": payload.get("collection_limits")}
 
 
 def upload_catalog(platform, nodes, captured_at, runtime_root, logger=None):

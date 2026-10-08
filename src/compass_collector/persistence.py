@@ -1,6 +1,7 @@
 """PostgreSQL schema, Alembic upgrades, publication identity, and scheduler state."""
 
 from dataclasses import dataclass, field
+from compass_collector.collection_limits import page_limit, pagination_counts
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -294,7 +295,7 @@ class CategoryRun(Base):
             "(status <> 'success' OR (api_total IS NOT NULL "
             "AND target_page_count IS NOT NULL "
             "AND saved_page_count = target_page_count "
-            "AND saved_item_count = api_total "
+            "AND saved_item_count = COALESCE(planned_item_count, api_total) "
             "AND failed_page IS NULL AND error_category IS NULL))",
             name="ck_category_runs_success",
         ),
@@ -336,6 +337,8 @@ class CategoryRun(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     # 分页统计保留平台 total、目标页和已落盘数量。
     api_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 首页固定的计划条数；历史 null 仍采用原平台总数。
+    planned_item_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     target_page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     saved_page_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     saved_item_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -497,6 +500,9 @@ class ProductRankEntryShopModel(Base):
     shop_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     seller_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     shop_name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    # logo 与店铺类型不从今天的商品资料回填历史。
+    image_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    is_tmall: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
 
 class SchedulerCheckpoint(Base):
@@ -586,6 +592,8 @@ class CategoryRunSnapshot:
     started_at: datetime | None
     finished_at: datetime | None
     # 通用路径不强制未来平台采用三级分类。
+    # 已固定的限页采集条数，不替代平台总数。
+    planned_item_count: int | None = None
     scope_path: tuple[str, ...] = ()
     platform_metadata: dict = field(default_factory=dict)
 
@@ -714,6 +722,7 @@ class Database:
             category_id=category_run.category_id,
             category_name=category_run.category_name,
             status=category_run.status,
+            planned_item_count=category_run.planned_item_count,
             api_total=category_run.api_total,
             target_page_count=category_run.target_page_count,
             saved_page_count=category_run.saved_page_count,
@@ -1065,6 +1074,8 @@ class Database:
                             position=shop.position,
                             shop_id=shop.shop_id,
                             shop_name=shop.shop_name,
+                            image_url=shop.image_url,
+                            is_tmall=shop.is_tmall,
                             shop_url=shop.shop_url,
                             seller_user_id=shop.seller_user_id,
                         )
@@ -1140,6 +1151,7 @@ class Database:
                 session.execute(delete(RawResponse).where(RawResponse.category_run_id == category.id))
                 category.status = "pending"
                 category.api_total = None
+                category.planned_item_count = None
                 category.target_page_count = None
                 category.saved_page_count = 0
                 category.saved_item_count = 0
@@ -1385,6 +1397,7 @@ class Database:
                 # 补采从第一页开始；只移除失败尝试索引，原始文件已由编排归档。
                 session.execute(delete(RawResponse).where(RawResponse.category_run_id == category_run_id))
                 category_run.api_total = None
+                category_run.planned_item_count = None
                 category_run.target_page_count = None
                 category_run.saved_page_count = 0
                 category_run.saved_item_count = 0
@@ -1445,6 +1458,11 @@ class Database:
                         "category pagination plan is already initialized"
                     )
                 category_run.api_total = api_total
+                # 在数据库边界重新核对原批次计划，拒绝适配器静默少采。
+                planned_pages, planned_items = pagination_counts(api_total, 20 if batch.platform == "taobao" else 10, page_limit(batch.config_snapshot))
+                if target_page_count != planned_pages:
+                    raise ValueError("target pages do not match frozen configuration")
+                category_run.planned_item_count = planned_items
                 category_run.target_page_count = target_page_count
             elif (
                 category_run.api_total != api_total
@@ -1509,7 +1527,7 @@ class Database:
                 raise RuntimeError("category pagination plan does not match page one")
             if category_run.saved_page_count != target_page_count:
                 raise RuntimeError("category has not saved every target page")
-            if category_run.saved_item_count != api_total:
+            if category_run.saved_item_count != (category_run.planned_item_count if category_run.planned_item_count is not None else api_total):
                 raise RuntimeError("category saved item count does not match api total")
             # success 状态、完成时间和批次统计一次提交。
             category_run.status = "success"

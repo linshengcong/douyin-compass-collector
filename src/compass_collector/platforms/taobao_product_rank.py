@@ -141,6 +141,14 @@ def normalize_url(value, *, required: bool = False) -> str | None:
     return normalized
 
 
+def normalize_shop_image(value):
+    """logo 只影响展示；无效地址保留商品并使用占位。"""
+    try:
+        return normalize_url(value)
+    except ResponseContractError:
+        return None
+
+
 def _value(row: dict, field: str):
     """Require the observed metric wrapper while allowing its null value."""
     # value 键缺失表示契约错误，不能伪装为缺失指标。
@@ -190,7 +198,9 @@ def parse_page_entries(payload: dict, *, page_no: int, captured_at: datetime) ->
             product_id=identity, product_name=title, newly_on_ranking=None,
             pay_amount=None, pay_combo_count=None,
             shops=(ProductShop(0, None, shop_name, normalize_url(shop.get("shopUrl")),
-                               str(seller_id) if seller_id is not None else None),),
+                               str(seller_id) if seller_id is not None else None,
+                               normalize_shop_image(shop.get("pictureUrl")),
+                               shop.get("b2CShop") if type(shop.get("b2CShop")) is bool else None),),
             image_url=normalize_url(item.get("pictUrl")),
             product_url=normalize_url(item.get("detailUrl"), required=True),
             pay_buyer_count_raw=buyers_raw, pay_buyer_count=buyers,

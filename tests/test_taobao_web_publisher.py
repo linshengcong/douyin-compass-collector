@@ -171,7 +171,9 @@ def test_taobao_primary_task_publishes_own_index_through_shared_runner(tmp_path,
             category_runs=(SimpleNamespace(
                 plan=SimpleNamespace(category_run_id="category-1", category=SimpleNamespace(
                     discovery_order=0, display_path="一级 > 二级 > 三级")),
-                entries=(SimpleNamespace(product_id="synthetic-product", rank=1, product_name="合成商品"),)),)))
+                entries=(SimpleNamespace(product_id="synthetic-product", rank=1, product_name="合成商品", shops=(SimpleNamespace(
+                    position=0, shop_id="synthetic-shop", shop_name="合成天猫店", shop_url=None,
+                    seller_user_id=None, image_url="https://example.invalid/shop.jpg", is_tmall=True),)),)),)))
     runner._publish_website_after_collection(candidates=[candidate], oss_uploader=uploader,
         execution_batch_id="b" * 32, runtime_logger=RuntimeLogger(tmp_path / "logs"),
         primary_task_id=task.id)
@@ -184,6 +186,9 @@ def test_taobao_primary_task_publishes_own_index_through_shared_runner(tmp_path,
     assert snapshot["schema_version"] == 4
     assert snapshot["records"][0]["product_id"] == "synthetic-product"
     assert len(snapshot["records"][0]["source_record_id"]) == 64
+    assert snapshot["shops_schema_version"] == 1
+    assert snapshot["records"][0]["shops"][0]["is_tmall"] is True
+    assert snapshot["records"][0]["shops"][0]["image_url"] == "https://example.invalid/shop.jpg"
 
 
 def test_aware_collection_window_matches_naive_sqlite_publication_time(tmp_path):

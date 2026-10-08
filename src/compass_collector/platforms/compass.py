@@ -2,6 +2,7 @@
 
 import json
 import random
+from compass_collector.collection_limits import pagination_counts
 from datetime import datetime
 from time import monotonic
 from urllib.parse import parse_qs, urlsplit
@@ -642,7 +643,8 @@ class CompassAdapter:
                 payload, requested_page=page_no, expected_total=total
             )
             total = contract.api_total
-            target_pages = contract.target_page_count
+            # 限页计划仍保留完整 total，响应校验按平台真实尾页执行。
+            target_pages, planned_items = pagination_counts(total, 10, task.max_pages_per_category)
             captured_at = datetime.now(TIMEZONE)
             page_entries = tuple(
                 parse_page_entries(payload, page_no=page_no, captured_at=captured_at)
@@ -668,7 +670,7 @@ class CompassAdapter:
                     self.settings.request_interval_seconds.max,
                 )
             )
-        validate_complete_ranking(entries, api_total=total)
+        validate_complete_ranking(entries, api_total=planned_items)
 
     def close(self) -> None:
         """Release listeners and Chrome even after partial session initialization."""

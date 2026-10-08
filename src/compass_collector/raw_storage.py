@@ -580,6 +580,7 @@ class BatchStorage:
                     "category_name": category_snapshot.category_name,
                     "status": category_snapshot.status,
                     "api_total": category_snapshot.api_total,
+                    "planned_item_count": category_snapshot.planned_item_count,
                     "target_page_count": category_snapshot.target_page_count,
                     "saved_page_count": category_snapshot.saved_page_count,
                     "saved_item_count": category_snapshot.saved_item_count,

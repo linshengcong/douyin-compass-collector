@@ -165,6 +165,8 @@ class SchedulerConfig(StrictModel):
 class TaskConfig(StrictModel):
     """Describe one independently runnable product ranking task."""
 
+    # 运行时由批次固定远程规则注入；默认不限页，不作为本机规则发布。
+    max_pages_per_category: int | None = Field(default=None, gt=0, strict=True)
     id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
     # 平台名称由显式注册表校验，不允许动态模块路径。
     platform: str = "compass"

@@ -1,6 +1,7 @@
 """Taobao collection orchestration; real page controls remain a verified seam."""
 
 import random
+from compass_collector.collection_limits import pagination_counts
 from datetime import datetime
 from time import monotonic
 from typing import Protocol
@@ -230,7 +231,9 @@ class TaobaoAdapter:
                     raise HttpRequestError("Taobao page timed out", category="page_response_timeout") from error
                 # 原始接口字段、页排名和跨页完整性仍使用已测试的淘宝解析器。
                 contract = validate_page_payload(payload, requested_page=page_no, expected_total=total)
-                total, target_pages = contract.api_total, contract.target_page_count
+                total = contract.api_total
+                # 每分类独立限页，过滤结果不会触发后续请求。
+                target_pages, planned_items = pagination_counts(total, 20, task.max_pages_per_category)
                 captured_at = datetime.now(TIMEZONE)
                 page_entries = tuple(parse_page_entries(payload, page_no=page_no, captured_at=captured_at))
                 self._check(business_date)
@@ -240,7 +243,7 @@ class TaobaoAdapter:
                 if page_no <= target_pages:
                     self._pump(random.uniform(self.settings.request_interval_seconds.min,
                                               self.settings.request_interval_seconds.max), business_date)
-            validate_complete_ranking(entries, api_total=total)
+            validate_complete_ranking(entries, api_total=planned_items)
         except (HttpRequestError, HttpResponseError, BrowserOperationError, ResponseContractError):
             # 下一分类或补采前重新初始化页面，不在失败页即时重试。
             self.initialized = False

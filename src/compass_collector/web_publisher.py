@@ -233,6 +233,9 @@ class WebPublisher:
             "finished_at": finished_at.isoformat() if finished_at is not None else None,
             "records": records,
         }
+        # 只为新发布标记店铺契约，历史补同步请求仍保持旧指纹。
+        if category_runs is not None:
+            data_payload["shops_schema_version"] = 1
         with gzip.open(data_path, "wt", encoding="utf-8") as file_handle:
             json.dump(
                 data_payload, file_handle, ensure_ascii=False, separators=(",", ":")
@@ -253,6 +256,8 @@ class WebPublisher:
             "data_url": data_url,
             "csv_url": csv_url,
         }
+        if category_runs is not None:
+            index_payload["shops_schema_version"] = 1
         index_path.write_text(
             json.dumps(index_payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
@@ -333,6 +338,11 @@ def attach_selection_identity(
             raise WebPublicationError("web_identity_contract_invalid")
         # JSON 编码消除分隔符歧义，同批次重试得到相同来源 ID。
         identity = json.dumps([platform, batch_id, category_run_id, position, entry.product_id])
+        # 每个店铺与自身 logo 对应，顺序随原始记录固定。
+        row["shops"] = [{"position": shop.position, "shop_id": shop.shop_id,
+                         "shop_name": shop.shop_name, "shop_url": shop.shop_url,
+                         "seller_user_id": shop.seller_user_id, "image_url": shop.image_url,
+                         "is_tmall": shop.is_tmall} for shop in entry.shops]
         row["product_id"] = entry.product_id
         row["source_record_id"] = sha256(identity.encode()).hexdigest()
         # 商品价格带来自同一条已核验采集记录，随选品来源快照保存。

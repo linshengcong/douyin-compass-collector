@@ -74,6 +74,8 @@ def build_entry(*, captured_at: datetime) -> ProductRankEntry:
                 position=0,
                 shop_id="shared-shop",
                 shop_name="共享店铺",
+                image_url="https://images.example.test/shop.jpg",
+                is_tmall=None,
             ),
         ),
         image_url="https://images.example.test/shared-product.jpg",
@@ -312,6 +314,7 @@ def test_dry_run_derives_partial_success_from_sqlite(tmp_path: Path) -> None:
 
 def test_official_publish_allows_same_product_and_rank_across_categories(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Write scoped product uniqueness, shops, CSV, and official publication time."""
 
@@ -340,6 +343,17 @@ def test_official_publish_allows_same_product_and_rank_across_categories(
             shop_count = session.scalar(
                 select(func.count()).select_from(ProductRankEntryShopModel)
             )
+            # 店铺图片独立于商品主图持久化，未知平台不能误标天猫。
+            shops = session.scalars(select(ProductRankEntryShopModel)).all()
+            assert all(shop.image_url == "https://images.example.test/shop.jpg" and shop.is_tmall is None for shop in shops)
+        from compass_collector.ranking_sync import build_sync_payload
+        monkeypatch.setenv("COMPASS_DATABASE_URL", database.engine.url.render_as_string(hide_password=False))
+        # 同步从正式数据库重建店铺数组，不依赖当前网页缓存。
+        payload = build_sync_payload({"platform": "compass", "task_id": collected_batch.task_id,
+            "batch_id": collected_batch.batch_id, "business_date": "2026-07-17", "item_count": 2,
+            "shops_schema_version": 1})
+        assert [row["shops"][0]["image_url"] for row in payload["rows"]] == ["https://images.example.test/shop.jpg"] * 2
+        assert all(row["shops"][0]["is_tmall"] is None for row in payload["rows"])
         # 只有 published_at 非空的批次能被正式幂等查询命中。
         published_batch = database.successful_batch(
             collected_batch.task_id,

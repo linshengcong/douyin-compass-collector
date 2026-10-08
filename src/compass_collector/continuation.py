@@ -3,6 +3,7 @@
 import gzip
 import json
 import zlib
+from compass_collector.collection_limits import frozen_task, pagination_counts
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -41,6 +42,8 @@ def _scope(category) -> DiscoveredScope:
 
 def _verified_entries(snapshot, category, records, task, root: Path) -> tuple:
     """完整分类验证通过后才允许跳过，禁止拼接残缺旧页与实时响应。"""
+    # 已完成分类按原批次计划验证，不能被后来限页配置改变。
+    task = frozen_task(task, snapshot.config_snapshot)
     if category.status != "success" or not records:
         raise ValueError("category is not complete")
     if len(records) != category.target_page_count or len(records) != category.saved_page_count:
@@ -63,7 +66,7 @@ def _verified_entries(snapshot, category, records, task, root: Path) -> tuple:
         # 已完成分类的总数和目标页数同数据库状态一致才可复用。
         payload = _read_payload(record.path, directory)
         contract = parser.validate_page_payload(payload, requested_page=number, expected_total=category.api_total)
-        if contract.target_page_count != category.target_page_count:
+        if pagination_counts(contract.api_total, parser.PAGE_SIZE, task.max_pages_per_category)[0] != category.target_page_count:
             raise ValueError("raw page plan mismatch")
         # PostgreSQL 保存的是无时区北京时间，恢复后保留其实际采集时刻。
         captured_at = record.captured_at.replace(tzinfo=TIMEZONE) if record.captured_at.tzinfo is None else record.captured_at
@@ -72,7 +75,7 @@ def _verified_entries(snapshot, category, records, task, root: Path) -> tuple:
         if len(page_entries) != record.item_count:
             raise ValueError("raw item count mismatch")
         entries.extend(page_entries)
-    parser.validate_complete_ranking(entries, api_total=category.api_total)
+    parser.validate_complete_ranking(entries, api_total=category.planned_item_count if category.planned_item_count is not None else category.api_total)
     if len(entries) != category.saved_item_count:
         raise ValueError("category item count mismatch")
     return tuple(entries)
@@ -143,7 +146,7 @@ def prepare_continuation(snapshot, task, database, root, logger, control=None):
                                                            category_run_id=run.plan.category_run_id),
                     details={"category_path": run.plan.category.display_path,
                              "discovery_order": run.plan.category.discovery_order,
-                             "target_pages": run.target_page_count, "saved_items": run.api_total})
+                             "target_pages": run.target_page_count, "saved_items": len(run.entries)})
     if len(completed) == len(plans):
         logger.emit(level="INFO", event="continuation_publication_only",
                     message=f"[{task.id}] 分类数据完整，直接重试发布",

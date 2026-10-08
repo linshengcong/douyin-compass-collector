@@ -21,7 +21,7 @@ def build_sync_payload(index: dict) -> dict:
             # 数据库只读事务确保同步逻辑不会意外修改采集状态。
             connection.execute(text("SET TRANSACTION READ ONLY"))
             # 已发布批次是同步依据，不凭 runtime 暂存文件判断采集成功。
-            batch = connection.execute(text("""SELECT platform, task_id, business_date, published_at
+            batch = connection.execute(text("""SELECT platform, task_id, business_date, published_at, config_snapshot
                 FROM collection_batches WHERE id = :batch AND published_at IS NOT NULL"""),
                 {"batch": index["batch_id"]}).mappings().one()
             if (batch["platform"] != index["platform"] or batch["task_id"] != index["task_id"]
@@ -33,6 +33,13 @@ def build_sync_payload(index: dict) -> dict:
                 WHERE c.batch_id = :batch ORDER BY c.discovery_order, p.rank"""),
                 {"batch": index["batch_id"]}).mappings()
             # 数值边界按十进制文本传输，避免 JSON 浮点损失精度。
+            # 所有店铺一次读取并按商品归组，避免逐行查询。
+            shops_by_entry = {}
+            for shop in connection.execute(text("""SELECT s.* FROM product_rank_entry_shops s
+                JOIN product_rank_entries p ON p.id = s.entry_id JOIN category_runs c ON c.id = p.category_run_id
+                WHERE c.batch_id = :batch ORDER BY s.entry_id, s.position"""), {"batch": index["batch_id"]}).mappings():
+                shops_by_entry.setdefault(shop["entry_id"], []).append({key: shop[key] for key in
+                    ("position", "shop_id", "shop_name", "shop_url", "seller_user_id", "image_url", "is_tmall")})
             rows = []
             for row in result:
                 # 采集库墙上时间遵循项目既有北京时间语义。
@@ -47,9 +54,19 @@ def build_sync_payload(index: dict) -> dict:
                     "product_name": row["product_name"],
                     "category": " > ".join([row["level1_category_name"], row["level2_category_name"], row["category_name"]]),
                     "metrics": metrics})
+                if index.get("shops_schema_version") == 1:
+                    rows[-1]["shops"] = shops_by_entry.get(row["id"], [])
             if len(rows) != index["item_count"]:
                 raise ValueError("ranking_sync_count_mismatch")
-            return {"index": index, "rows": rows}
+            # 只传持久化批次引用，不读取当前远程配置；续采及补同步同样固定规则。
+            remote = (batch["config_snapshot"] or {}).get("remote_category_config")
+            payload = {"index": index, "rows": rows}
+            if remote:
+                payload["collection_config"] = {"revision": remote["revision"],
+                                                "product_filters": remote.get("product_filters")}
+                if remote.get("collection_limits") is not None:
+                    payload["collection_config"]["collection_limits"] = remote["collection_limits"]
+            return payload
     finally:
         engine.dispose()
 

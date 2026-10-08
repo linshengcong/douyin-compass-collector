@@ -6,6 +6,7 @@ from datetime import date, datetime
 from math import ceil
 from typing import Any
 
+from compass_collector.platforms.taobao_product_rank import normalize_shop_image
 from compass_collector.config import TaskConfig
 from compass_collector.errors import ResponseContractError
 from compass_collector.models import (
@@ -352,7 +353,8 @@ def parse_page_entries(
                     category="invalid_product",
                 )
             shops.append(
-                ProductShop(position=position, shop_id=shop_id, shop_name=shop_name)
+                ProductShop(position=position, shop_id=shop_id, shop_name=shop_name,
+                            image_url=normalize_shop_image(shop_payload.get("image")))
             )
         # 在平台边界将金额和成交件数换算为实际单位。
         pay_amount = parse_metric_range(
