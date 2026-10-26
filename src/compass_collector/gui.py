@@ -1,9 +1,11 @@
 """PySide6 desktop control console for manual runs and an owned Scheduler."""
 
 import json
+from collections import deque
 from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
+from threading import Thread
 from typing import Any
 from uuid import uuid4
 
@@ -37,6 +39,8 @@ from PySide6.QtWidgets import (
 )
 
 from compass_collector.config import AppConfig, load_config
+from compass_collector.collection_rule_summary import collection_rule_summary
+from compass_collector.remote_categories import fetch_category_config
 from compass_collector.qt_application import ensure_qt_application
 from compass_collector.local_data import clear_local_data_with_locks
 from compass_collector.notifier import BatchSource
@@ -61,6 +65,8 @@ from compass_collector.scheduler_control import (
 RUNTIME_ROOT = runtime_root()
 # GUI 日志表限制内存事件数，持久记录仍以 JSONL 为准。
 MAX_VISIBLE_EVENTS = 2000
+# 密集事件最多每 50 毫秒刷新日志表，业务进度仍按原事件即时更新。
+LOG_RENDER_INTERVAL_MS = 50
 
 
 def category_scope_summary(task) -> str:
@@ -722,6 +728,33 @@ def _reduce_concurrent_category_progress(
     )
 
 
+class RulePreviewWorker(QObject):
+    """后台只读查询规则，不占用 GUI 线程，也不将预览作为执行配置。"""
+
+    # 请求身份让迟到预览不能覆盖已经固定的批次摘要。
+    received = Signal(str, str)
+
+    def read(self, config_path, platform, task_id, request_id):
+        """短生命周期 HTTP 查询；窗口退出时允许后台安全结束。"""
+        try:
+            # 与采集入口一样重读配置，避免显示启动时的旧来源模式。
+            config = load_config(config_path)
+            if config.platforms[platform].category_config_source != "remote":
+                summary = "本地 YAML · 未采用远程采集规则"
+            else:
+                # 只查询一次已发布配置，不上传目录或启动采集。
+                remote = fetch_category_config(platform, task_id)
+                summary = "远程预览 · " + collection_rule_summary({"remote_category_config": remote}) + " · 用于下一次新采集"
+        except Exception:
+            # 不展示异常原文，避免请求地址或身份进入界面。
+            summary = "远程规则读取失败 · 点击刷新重试；新采集读取失败会停止"
+        try:
+            self.received.emit(request_id, summary)
+        except RuntimeError:
+            # 只读守护线程不阻塞窗口退出；Qt 对象销毁后不再投递。
+            pass
+
+
 class CollectionWorker(QObject):
     """Run synchronous Playwright and HTTPX work entirely inside one QThread."""
 
@@ -880,6 +913,22 @@ class CollectorWindow(QMainWindow):
         self.progress_state = GuiProgressState(csv_path=self.current_csv_path)
         # 所有展示事件只保存在内存，超过上限丢弃最旧项。
         self.events: list[dict[str, Any]] = []
+        # 绝对序号让历史裁剪后仍能定位未显示的新事件。
+        self.log_event_start = 0
+        # 已处理事件的右边界包含被级别筛选隐藏的事件，防止重复追加。
+        self.rendered_log_event_end = 0
+        # 可见行记录对应序号，只删除超出保留窗口的旧行。
+        self.visible_log_event_ids: deque[int] = deque()
+        # 单次计时器合并一批日志事件，不为每条事件重建历史表格。
+        self.log_render_timer = QTimer(self)
+        self.log_render_timer.setSingleShot(True)
+        self.log_render_timer.setInterval(LOG_RENDER_INTERVAL_MS)
+        self.log_render_timer.timeout.connect(self._flush_log_events)
+        # 空闲预览使用独立请求身份，采集事件始终具有更高优先级。
+        self.rules_preview_request_id: str | None = None
+        # 主线程持有信号对象；HTTP 查询在短生命周期守护线程执行。
+        self.rules_preview_worker = RulePreviewWorker(self)
+        self.rules_preview_worker.received.connect(self._apply_rules_preview)
         # Scheduler 子进程由 Qt 管理生命周期和输出读取。
         self.scheduler_process = QProcess(self)
         self.scheduler_process.setProcessChannelMode(QProcess.MergedChannels)
@@ -901,6 +950,8 @@ class CollectorWindow(QMainWindow):
         self._refresh_scheduler_status()
         self.scheduler_timer.start()
         self.scheduler_event_timer.start()
+        # 窗口先完成布局；远程查询不阻塞 GUI，也不会启动商品采集。
+        QTimer.singleShot(0, self._refresh_rules_summary)
         if request.auto_start:
             # 零延迟让窗口先完成展示，再进入可能弹确认框的启动流程。
             QTimer.singleShot(0, self.start_collection)
@@ -954,6 +1005,19 @@ class CollectorWindow(QMainWindow):
         self.schedule_label = QLabel(selected_task.schedule)
         self.run_status_label = QLabel("空闲")
         self.scheduler_status_label = QLabel("未运行")
+        # 简要规则可换行，避免长条件挤压运行状态区。
+        self.rules_summary_label = QLabel("远程规则待读取" if scope_mode == "remote" else "本地 YAML · 未采用远程采集规则")
+        self.rules_summary_label.setWordWrap(True)
+        self.rules_summary_label.setToolTip("商品条件在采集后的同步阶段执行，区间按下界判断，缺失指标不通过；续采沿用原批次规则。")
+        # 刷新仅获取远程预览，不更改正在运行或历史批次。
+        self.rules_refresh_button = QPushButton("刷新规则")
+        self.rules_refresh_button.clicked.connect(self._refresh_rules_summary)
+        # 保留当前窗口任务身份供预览校验，不让多个任务摘要混用。
+        self.rules_task_id = selected_task.id
+        # 摘要跨越原有列，刷新按钮只占自身宽度，避免把长规则挤进窄列。
+        rules_layout = QHBoxLayout()
+        rules_layout.addWidget(self.rules_summary_label, 1)
+        rules_layout.addWidget(self.rules_refresh_button)
         status_layout.addWidget(QLabel("任务"), 0, 0)
         status_layout.addWidget(self.task_label, 0, 1)
         status_layout.addWidget(QLabel("账号"), 0, 2)
@@ -968,6 +1032,8 @@ class CollectorWindow(QMainWindow):
         status_layout.addWidget(self.run_status_label, 2, 3)
         status_layout.addWidget(QLabel("Scheduler"), 3, 0)
         status_layout.addWidget(self.scheduler_status_label, 3, 1, 1, 3)
+        status_layout.addWidget(QLabel("采集规则"), 4, 0)
+        status_layout.addLayout(rules_layout, 4, 1, 1, 3)
         root_layout.addWidget(status_group)
 
         # 进度区展示准确分类完成度和固定槽位的并发分类明细。
@@ -1118,11 +1184,37 @@ class CollectorWindow(QMainWindow):
         self._render_events()
 
     @Slot()
+    def _refresh_rules_summary(self) -> None:
+        """空闲时预览最新已发布版本；采集时保留批次固定摘要。"""
+        if self.collecting or self.scheduler_job_active or self.rules_preview_request_id:
+            return
+        # 每次刷新独立身份，开始采集后这个预览自动失效。
+        request_id = uuid4().hex
+        self.rules_preview_request_id = request_id
+        self.rules_summary_label.setText("正在读取远程规则……")
+        self._update_action_states()
+        Thread(target=self.rules_preview_worker.read,
+               args=(self.request.config_path, self.runtime_scope.platform, self.rules_task_id, request_id),
+               daemon=True).start()
+
+    @Slot(str, str)
+    def _apply_rules_preview(self, request_id, summary) -> None:
+        """只接收当前空闲预览，防止迟到响应覆盖批次实际规则。"""
+        if request_id != self.rules_preview_request_id:
+            return
+        self.rules_preview_request_id = None
+        self.rules_summary_label.setText(summary)
+        self._update_action_states()
+
+    @Slot()
     def start_collection(self, *, continue_run: bool | None = None) -> None:
         """Validate mode confirmation and start one QThread collection worker."""
 
         if self.collecting:
             return
+        # 开始或续采必须等 runner 确认实际快照，不能继续展示预览阈值。
+        self.rules_preview_request_id = None
+        self.rules_summary_label.setText("正在确认本批次采集规则；续采沿用原批次")
         # 命令锁定时遵循显式normal/force；空闲旧GUI保留手动更新新版本语义。
         force = self.request.force if self.request.lock_mode else True
         # control 的事件回调只发 Qt Signal，不直接操作控件。
@@ -1176,6 +1268,14 @@ class CollectorWindow(QMainWindow):
         self._append_event(event)
         # event_name 决定采集控制分支，未知事件仍只进入日志表。
         event_name = event.get("event")
+        if event_name == "collection_rules_frozen":
+            # 固定规则事件来自同一日志管道，手动与定时采集保持一致。
+            self.rules_preview_request_id = None
+            self.rules_summary_label.setText("本批次 · " + event["rules_summary"])
+        elif event_name in {"category_batch_started", "scheduled_group_started"}:
+            # 新任务读取前移除上次摘要，失败时不会把旧规则冒充本次采用。
+            self.rules_preview_request_id = None
+            self.rules_summary_label.setText("正在确认本批次采集规则")
         # 当前业务批次 ID 不能被随后到达的通知汇总执行 ID 覆盖。
         batch_id = _business_batch_id(event)
         if batch_id:
@@ -1309,36 +1409,66 @@ class CollectorWindow(QMainWindow):
         self.events.append(dict(event))
         if len(self.events) > MAX_VISIBLE_EVENTS:
             # 只裁剪界面内存，落盘 JSONL 不受影响。
-            del self.events[: len(self.events) - MAX_VISIBLE_EVENTS]
-        if render:
-            self._render_events()
+            removed_count = len(self.events) - MAX_VISIBLE_EVENTS
+            del self.events[:removed_count]
+            self.log_event_start += removed_count
+        if render and not self.log_render_timer.isActive():
+            self.log_render_timer.start()
 
     @Slot()
     def _render_events(self) -> None:
-        """Render the selected safe log level without editing persisted events."""
+        """Rebuild rows only for history restoration, reset or a filter change."""
 
-        # “全部”不应用级别过滤，其余值与日志 level 完全一致。
+        # 重建包含所有待显示事件，并取消旧计时器，避免筛选后重复追加。
+        self.log_render_timer.stop()
+        self.log_table.setRowCount(0)
+        self.visible_log_event_ids.clear()
+        self.rendered_log_event_end = self.log_event_start
+        self._flush_log_events()
+
+    @Slot()
+    def _flush_log_events(self) -> None:
+        """Append new matching events and evict expired rows without replacing survivors."""
+
+        self.log_render_timer.stop()
+        # “全部”不应用级别过滤，增量追加沿用既有级别语义。
         selected_level = self.level_filter.currentText()
-        visible_events = [
-            event
-            for event in self.events
+        # 计时器触发前可能已裁剪尚未显示的事件，只处理当前保留窗口。
+        pending_start = max(0, self.rendered_log_event_end - self.log_event_start)
+        # 新可见行携带绝对事件序号，筛选后的旧行也可准确裁剪。
+        new_rows = [
+            (self.log_event_start + index, event)
+            for index, event in enumerate(self.events[pending_start:], pending_start)
             if selected_level == "全部" or event.get("level") == selected_level
         ]
-        self.log_table.setRowCount(len(visible_events))
-        for row_index, event in enumerate(visible_events):
-            # ISO 时间只展示时分秒，空时间用于本地协调事件。
-            timestamp = str(event.get("timestamp") or "")
-            time_text = timestamp[11:19] if len(timestamp) >= 19 else "-"
-            values = (
-                time_text,
-                str(event.get("level") or ""),
-                str(event.get("stage") or ""),
-                str(event.get("message") or ""),
-            )
-            for column_index, value in enumerate(values):
-                self.log_table.setItem(row_index, column_index, QTableWidgetItem(value))
-        if visible_events:
-            self.log_table.scrollToBottom()
+        # 暂停本次批量控件绘制，结束后统一恢复，不影响事件持久化。
+        self.log_table.setUpdatesEnabled(False)
+        try:
+            while self.visible_log_event_ids and self.visible_log_event_ids[0] < self.log_event_start:
+                self.visible_log_event_ids.popleft()
+                self.log_table.removeRow(0)
+            # 仅给新增行分配单元格；保留已有行及用户的选择状态。
+            first_row = self.log_table.rowCount()
+            self.log_table.setRowCount(first_row + len(new_rows))
+            for row_index, (event_id, event) in enumerate(new_rows, first_row):
+                # ISO 时间只展示时分秒，空时间用于本地协调事件。
+                timestamp = str(event.get("timestamp") or "")
+                time_text = timestamp[11:19] if len(timestamp) >= 19 else "-"
+                # 四列仍只展示经过原事件管道审核的安全字段。
+                values = (
+                    time_text,
+                    str(event.get("level") or ""),
+                    str(event.get("stage") or ""),
+                    str(event.get("message") or ""),
+                )
+                for column_index, value in enumerate(values):
+                    self.log_table.setItem(row_index, column_index, QTableWidgetItem(value))
+                self.visible_log_event_ids.append(event_id)
+            self.rendered_log_event_end = self.log_event_start + len(self.events)
+            if new_rows:
+                self.log_table.scrollToBottom()
+        finally:
+            self.log_table.setUpdatesEnabled(True)
 
     @Slot()
     def _copy_selected_logs(self) -> None:
@@ -1574,6 +1704,9 @@ class CollectorWindow(QMainWindow):
                 )
             )
         self.start_button.setEnabled(not self.collecting)
+        self.rules_refresh_button.setEnabled(
+            not self.collecting and not self.scheduler_job_active and self.rules_preview_request_id is None
+        )
         self.continue_button.setEnabled(
             not self.collecting and not self.scheduler_job_active
             and self._selected_mode() is RunMode.OFFICIAL
@@ -1657,7 +1790,7 @@ class CollectorWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "确认清除当前平台采集数据",
-            "此操作不可恢复，将删除配置的 PostgreSQL 数据库中当前平台的批次及其本地产物，保留旧 SQLite 归档、另一平台数据、日志及登录态。\n\n确认继续吗？",
+            "此操作不可恢复，将删除配置的采集数据库中当前平台的批次及其本地产物，保留数据库文件、另一平台数据、日志及登录态。\n\n确认继续吗？",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )

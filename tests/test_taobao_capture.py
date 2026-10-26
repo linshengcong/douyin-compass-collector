@@ -72,6 +72,26 @@ def test_body_is_not_read_in_callbacks_and_finish_is_required():
     assert response.reads == 1
 
 
+def test_unarmed_seller_refresh_is_tracked_until_finished_or_failed():
+    """分组刷新完成前不能被当作空闲，且不能混入随后注册的分类动作。"""
+    # 同页排行监听跟踪中间请求，即使它不匹配目标分类白名单。
+    page = object()
+    # 生产捕获器保持业务动作与所有未结束排行请求的独立生命周期。
+    capture = TaobaoResponseCapture(page)
+    # 旧分类刷新在arm之前产生，只等待完成而不接受为采集结果。
+    response = Response(Request(page, {**PARAMS, "sellerType": 9}))
+    capture.on_request(response.request)
+    assert capture.inflight_rank_requests == {response.request}
+    # 开始新动作不会忘记尚未结束的中间请求。
+    generation = capture.arm({**PARAMS, "sellerType": 7})
+    assert capture.inflight_rank_requests == {response.request}
+    complete(capture, response)
+    assert not capture.inflight_rank_requests and capture.take(generation) is None
+    capture.on_request(response.request)
+    capture.on_failed(response.request)
+    assert not capture.inflight_rank_requests
+
+
 def test_old_and_unarmed_requests_cannot_enter_a_new_action():
     """A late requestfinished must not be assigned by its matching URL."""
     # 旧动作已收到头部但尚未完成，开始新动作时必须失效。

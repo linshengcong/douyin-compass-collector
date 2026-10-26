@@ -40,6 +40,15 @@ class TaobaoPageControls(Protocol):
     def initialize(self, page, task, business_date) -> None:
         """Select today and twenty-row mode once for a fresh page session."""
 
+    def seller_types(self, page) -> dict[str, str]:
+        """读取淘宝和天猫单选框的实际请求值。"""
+
+    def seller_type_selected(self, page, scope) -> bool:
+        """确认当前单选框与分类冻结分组一致。"""
+
+    def select_seller_type(self, page, scope) -> None:
+        """选择当前分组并确认选中状态。"""
+
     def select_scope(self, page, scope) -> None:
         """Select the complete source path, generating a fresh first-page request."""
 
@@ -68,6 +77,8 @@ class TaobaoAdapter:
         self.initialized = False
         # 分类异常后的下一次采集必须重新进入榜单页面。
         self.needs_reset = False
+        # 当前实际分类用于区分切换店铺类型的请求与普通分类请求。
+        self.current_cate_id = None
 
     def _check(self, business_date=None) -> None:
         """Keep both cooperative stop and midnight interruption at every boundary."""
@@ -146,7 +157,9 @@ class TaobaoAdapter:
                 except ResponseContractError as error:
                     error.discovery_payload = payload
                     raise
-                return DiscoveryCapture(discovery, payload)
+                # 仅新规则读取分组控件；历史批次及旧验收任务保留原“全部”语义。
+                metadata = {"seller_types": self.controls.seller_types(self.page)} if task.filters.seller_platforms else {}
+                return DiscoveryCapture(discovery, payload, metadata)
             self._pump(0.1)
         raise HttpRequestError("Taobao category response timed out", category="page_response_timeout")
 
@@ -157,6 +170,7 @@ class TaobaoAdapter:
             # 页面重建后重新初始化20条，正常分类切换不会执行此路径。
             self.capture.disarm()
             self.initialized = False
+            self.current_cate_id = None
             self.controls.enter(self.page)
             self._authenticate()
         if not self.initialized:
@@ -170,14 +184,14 @@ class TaobaoAdapter:
         params = build_expected_params(task, scope, business_date, page_no)
         generation = self.capture.arm(params)
         try:
-            # 分类点击可能已发出请求而click仍返回超时；先验证同一代次的响应，绝不重复点击。
+            # 分类或店铺点击可能已发出请求而click仍返回超时；先验证同一代次的响应。
             # 没有完整匹配响应时保留原错误，交由分类补采处理。
             action_timeout = None
             try:
                 action()
             except BrowserOperationError as error:
                 if (error.category != "browser_page_error"
-                        or error.failed_step != "taobao_category_select"
+                        or error.failed_step not in {"taobao_category_select", "taobao_seller_type_select"}
                         or error.exception_type != "TimeoutError"):
                     raise
                 action_timeout = error
@@ -191,6 +205,9 @@ class TaobaoAdapter:
                     payload = read_completed_payload(response)
                     contract = validate_page_payload(payload, requested_page=page_no)
                     self.controls.confirm_page(self.page, page_no, contract.api_total)
+                    if ("seller_platform" in scope.platform_metadata
+                            and not self.controls.seller_type_selected(self.page, scope)):
+                        raise ResponseContractError("Visible seller type changed", category="seller_type_mismatch")
                     # DOM 等待也会泵入自动刷新；确认后再查歧义，不能只检查响应刚到时。
                     self.capture.ensure_action(generation)
                     self._check(business_date)
@@ -206,6 +223,21 @@ class TaobaoAdapter:
         """每页执行一次 UI 动作，不回放或即时重试失败页。"""
         self._initialize(task, business_date)
         if page_no == 1:
+            if "seller_platform" in scope.platform_metadata:
+                if not self.controls.seller_type_selected(self.page, scope):
+                    if self.current_cate_id == scope.platform_metadata["cate_id"]:
+                        # 单分类及续采同分类时，店铺切换自身产生目标第一页，不能再点同分类。
+                        return self._action(task, scope, business_date, page_no,
+                                            lambda: self.controls.select_seller_type(self.page, scope))
+                    # 分组切换产生的旧分类刷新必须完成，再注册目标分类请求。
+                    self.capture.disarm()
+                    self.controls.select_seller_type(self.page, scope)
+                    # 按请求完成事件等待，不让晚到的旧表格覆盖目标分类。
+                    deadline = monotonic() + self.settings.response_timeout_seconds
+                    while self.capture.inflight_rank_requests:
+                        if monotonic() >= deadline:
+                            raise HttpRequestError("Seller type refresh timed out", category="page_response_timeout")
+                        self._pump(0.1, business_date)
             return self._action(task, scope, business_date, page_no,
                                 lambda: self.controls.select_scope(self.page, scope))
         return self._action(task, scope, business_date, page_no,
@@ -231,6 +263,8 @@ class TaobaoAdapter:
                     raise HttpRequestError("Taobao page timed out", category="page_response_timeout") from error
                 # 原始接口字段、页排名和跨页完整性仍使用已测试的淘宝解析器。
                 contract = validate_page_payload(payload, requested_page=page_no, expected_total=total)
+                # 只在目标第一页通过请求及可见页码校验后更新当前分类。
+                self.current_cate_id = scope.platform_metadata["cate_id"]
                 total = contract.api_total
                 # 每分类独立限页，过滤结果不会触发后续请求。
                 target_pages, planned_items = pagination_counts(total, 20, task.max_pages_per_category)

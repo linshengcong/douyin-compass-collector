@@ -1,4 +1,4 @@
-"""从采集 PostgreSQL 同步正式榜单到业务 API，失败保留可重试材料。"""
+"""从本地采集库同步正式榜单到业务 API，失败保留可重试材料。"""
 
 import gzip
 import json
@@ -7,7 +7,9 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import create_engine, text
+from sqlalchemy import select, text
+from compass_collector.database_connection import database_engine
+from compass_collector.persistence import CollectionBatch, CategoryRun, ProductRankEntryModel, ProductRankEntryShopModel
 
 
 def build_sync_payload(index: dict) -> dict:
@@ -15,29 +17,32 @@ def build_sync_payload(index: dict) -> dict:
     # 每个平台继续使用独立采集库，不复用选品业务库连接。
     variable = {"compass": "COMPASS_DATABASE_URL", "taobao": "TAOBAO_DATABASE_URL"}[index["platform"]]
     # 连接只在一次同步中存活，数据库密码不写入结果或日志。
-    engine = create_engine(os.environ[variable], pool_pre_ping=True, connect_args={"connect_timeout": 10})
+    engine = database_engine(os.environ[variable])
     try:
         with engine.connect() as connection:
             # 数据库只读事务确保同步逻辑不会意外修改采集状态。
-            connection.execute(text("SET TRANSACTION READ ONLY"))
+            connection.execute(text("PRAGMA query_only=ON" if engine.dialect.name == "sqlite" else "SET TRANSACTION READ ONLY"))
             # 已发布批次是同步依据，不凭 runtime 暂存文件判断采集成功。
-            batch = connection.execute(text("""SELECT platform, task_id, business_date, published_at, config_snapshot
-                FROM collection_batches WHERE id = :batch AND published_at IS NOT NULL"""),
-                {"batch": index["batch_id"]}).mappings().one()
+            batch = connection.execute(select(CollectionBatch.platform, CollectionBatch.task_id,
+                CollectionBatch.business_date, CollectionBatch.published_at, CollectionBatch.config_snapshot)
+                .where(CollectionBatch.id == index["batch_id"], CollectionBatch.published_at.is_not(None))).mappings().one()
             if (batch["platform"] != index["platform"] or batch["task_id"] != index["task_id"]
                     or batch["business_date"].isoformat() != index["business_date"]):
                 raise ValueError("ranking_sync_batch_mismatch")
             # 排序与 attach_selection_identity 完全一致；同商品重复上榜仍保留每行。
-            result = connection.execute(text("""SELECT p.*, c.level1_category_name, c.level2_category_name,
-                c.category_name FROM product_rank_entries p JOIN category_runs c ON c.id = p.category_run_id
-                WHERE c.batch_id = :batch ORDER BY c.discovery_order, p.rank"""),
-                {"batch": index["batch_id"]}).mappings()
+            result = connection.execute(select(ProductRankEntryModel.__table__, CategoryRun.level1_category_name,
+                CategoryRun.level2_category_name, CategoryRun.category_name, CategoryRun.platform_metadata)
+                .join(CategoryRun, CategoryRun.id == ProductRankEntryModel.category_run_id)
+                .where(CategoryRun.batch_id == index["batch_id"])
+                .order_by(CategoryRun.discovery_order, ProductRankEntryModel.rank)).mappings()
             # 数值边界按十进制文本传输，避免 JSON 浮点损失精度。
             # 所有店铺一次读取并按商品归组，避免逐行查询。
             shops_by_entry = {}
-            for shop in connection.execute(text("""SELECT s.* FROM product_rank_entry_shops s
-                JOIN product_rank_entries p ON p.id = s.entry_id JOIN category_runs c ON c.id = p.category_run_id
-                WHERE c.batch_id = :batch ORDER BY s.entry_id, s.position"""), {"batch": index["batch_id"]}).mappings():
+            for shop in connection.execute(select(ProductRankEntryShopModel.__table__)
+                .join(ProductRankEntryModel, ProductRankEntryModel.id == ProductRankEntryShopModel.entry_id)
+                .join(CategoryRun, CategoryRun.id == ProductRankEntryModel.category_run_id)
+                .where(CategoryRun.batch_id == index["batch_id"])
+                .order_by(ProductRankEntryShopModel.entry_id, ProductRankEntryShopModel.position)).mappings():
                 shops_by_entry.setdefault(shop["entry_id"], []).append({key: shop[key] for key in
                     ("position", "shop_id", "shop_name", "shop_url", "seller_user_id", "image_url", "is_tmall")})
             rows = []
@@ -52,7 +57,8 @@ def build_sync_payload(index: dict) -> dict:
                 rows.append({"collector_entry_id": row["id"], "category_run_id": row["category_run_id"],
                     "captured_at": captured_at.isoformat(), "product_id": row["product_id"], "rank": row["rank"],
                     "product_name": row["product_name"],
-                    "category": " > ".join([row["level1_category_name"], row["level2_category_name"], row["category_name"]]),
+                    "category": {"taobao": "淘宝 · ", "tmall": "天猫 · "}.get((row["platform_metadata"] or {}).get("seller_platform"), "")
+                        + " > ".join([row["level1_category_name"], row["level2_category_name"], row["category_name"]]),
                     "metrics": metrics})
                 if index.get("shops_schema_version") == 1:
                     rows[-1]["shops"] = shops_by_entry.get(row["id"], [])

@@ -44,7 +44,7 @@ def assert_ranking_error(entries, *, api_total: int, expected_category: str) -> 
 
 
 def test_real_fixture_parses_and_formats_like_the_agreed_csv_contract() -> None:
-    """Preserve raw values while formatting only the CSV presentation layer."""
+    """Keep counts unchanged and normalize cents before CSV presentation."""
 
     # 真实 Fixture 只解析为第一页十条，不伪装成 total=10 的完整榜单。
     _, captured_at, entries = load_real_entries()
@@ -55,10 +55,40 @@ def test_real_fixture_parses_and_formats_like_the_agreed_csv_contract() -> None:
     assert [entry.rank for entry in entries] == list(range(1, 11))
     assert all(entry.captured_at == captured_at for entry in entries)
     assert first_entry.pay_amount.min_value == 10_000_000
-    assert first_entry.pay_combo_count.min_value == 10_000
+    assert first_entry.pay_combo_count.min_value == 100_000
     assert first_entry.image_url == "https://images.example.test/fixture-product-1.jpg"
     assert format_metric_range(first_entry.pay_amount) == "¥1000万-¥2500万"
-    assert format_metric_range(first_entry.pay_combo_count) == "1万-2.5万"
+    assert format_metric_range(first_entry.pay_combo_count) == "10万-25万"
+
+
+@pytest.mark.parametrize("count_lower", [0, 300, 301, 2_500])
+def test_parsed_count_preserves_platform_units_and_filter_boundary(
+    count_lower: int,
+) -> None:
+    """件数直接采用接口 number，确保 > 300 不被隐式变成 > 3000。"""
+
+    # 真实形状响应仅替换首条指标，覆盖零值、严格边界和误过滤样本。
+    payload, captured_at, _ = load_real_entries()
+    # 首条商品同时携带金额和件数，验证两种单位不会共享错误缩放。
+    product = payload["data"]["data_result"][0]
+    product["pay_combo_cnt"]["value_range"] = [
+        {"unit": "number", "value": count_lower},
+        {"unit": "number", "value": count_lower + 500},
+    ]
+    product["new_pay_amt"]["value_range"] = [
+        {"unit": "price", "value": 2_000_000},
+        {"unit": "price", "value": 2_500_000},
+    ]
+    # 走生产商品解析入口，输出会直接用于持久化及服务端商品过滤。
+    entry = parse_page_entries(payload, page_no=1, captured_at=captured_at)[0]
+
+    assert entry.pay_combo_count.unit == "count"
+    assert entry.pay_combo_count.min_value == count_lower
+    assert entry.pay_combo_count.max_value == count_lower + 500
+    assert (entry.pay_combo_count.min_value > 300) is (count_lower > 300)
+    assert entry.pay_amount.unit == "CNY"
+    assert entry.pay_amount.min_value == 20_000
+    assert entry.pay_amount.max_value == 25_000
 
 
 def test_empty_category_ranking_is_complete_when_api_total_is_zero() -> None:

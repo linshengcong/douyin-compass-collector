@@ -234,11 +234,12 @@ def test_gui_start_collection_does_not_override_explicit_normal_mode(monkeypatch
         return SimpleNamespace(force=actual_force, event_received=signal, finished=signal,
                                moveToThread=lambda *args: None, run=lambda: None, deleteLater=lambda: None)
 
-    # 最小窗口状态覆盖真实方法读取的全部UI边界，避免引入屏幕或Qt平台依赖。
+    # 最小窗口状态包括规则摘要控件，覆盖真实启动方法读取的全部UI边界。
     window = SimpleNamespace(collecting=False, request=SimpleNamespace(force=force, lock_mode=True),
                              _selected_mode=lambda: gui.RunMode.OFFICIAL,
                              handle_event=lambda *args: None, _collection_finished=lambda *args: None,
                              run_status_label=SimpleNamespace(setText=lambda *args: None),
+                             rules_summary_label=SimpleNamespace(setText=lambda *args: None),
                              notification_label=SimpleNamespace(setText=lambda *args: None), current_csv_path=None,
                              _apply_progress_state=lambda: None, _update_action_states=lambda: None)
     monkeypatch.setattr(gui, "CollectionWorker", worker)

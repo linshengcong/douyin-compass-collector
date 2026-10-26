@@ -20,6 +20,10 @@ HTML = """<!doctype html><html><body>
 <div class="oui-page-size-select"><button role="combobox" onclick="options.hidden=false">
 <span class="ant-select-selection-selected-value">10</span></button></div>
 <div id="options" hidden><button role="option" onclick="setSize()">20</button></div>
+<div>店铺类型
+<label><input type="radio" name="seller" value="-1" checked>全部</label>
+<label><input type="radio" name="seller" value="7">淘宝</label>
+<label><input type="radio" name="seller" value="9">天猫</label></div>
 <button class="item-cate" onclick="showLevel(0)">分类</button>
 <div class="common-picker-menu" id="menu" hidden>
 <ul class="tree-menu tree-scroll-menu-level-1" id="level1"></ul>
@@ -85,6 +89,31 @@ def test_twenty_rows_persist_across_two_categories_and_three_pages(page):
     assert page.evaluate("window.audit") == {
         "sizeChanges": 1, "selections": ["香薰蜡烛", "香薰精油"], "nextClicks": 2,
     }
+
+
+def test_seller_types_read_dom_values_and_never_click_all(page):
+    """通过真实Chrome单选框验证淘宝→天猫，值来自DOM且不点击全部。"""
+    # 单选框动作审计与已有分类、分页测试互不影响。
+    page.evaluate("""() => {window.sellers=[];document.querySelectorAll('input[name=seller]')
+        .forEach(node=>node.addEventListener('click',()=>sellers.push(node.value)));}""")
+    # 控制器只访问本地合成DOM，完全不使用淘宝账号。
+    controls = TaobaoBrowserControls(CollectionConfig(action_timeout_seconds=0.3))
+    # 从生产控制器读取编码，确认没有写死0/1。
+    values = controls.seller_types(page)
+    assert values == {"taobao": "7", "tmall": "9"}
+    for platform in ("taobao", "tmall"):
+        # 分类参数不参与控件操作，分组来自已经冻结的值。
+        scope = DiscoveredScope(1, f"{platform}:1", ("一级", "二级", "三级"),
+                                {"seller_platform": platform, "seller_type": values[platform]})
+        controls.select_seller_type(page, scope)
+        controls.select_seller_type(page, scope)
+        assert controls.seller_type_selected(page, scope)
+    assert page.evaluate("window.sellers") == ["7", "9"]
+    # 页面编码变化必须失败，不能继续采入旧分组。
+    page.get_by_role("radio", name="天猫", exact=True).evaluate("node=>node.value='8'")
+    with pytest.raises(BrowserOperationError) as caught:
+        controls.select_seller_type(page, scope)
+    assert caught.value.failed_step == "taobao_seller_type_value"
 
 
 def test_disabled_next_page_is_not_clicked_and_saves_diagnostics(page):

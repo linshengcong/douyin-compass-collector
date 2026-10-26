@@ -56,6 +56,8 @@ class TaobaoResponseCapture:
         # 分类发现只保留一个最新已完成响应，不缓存无限自动请求。
         self.category_response = None
         self.category_requests = set()
+        # 未注册采集动作的店铺切换刷新也必须等待完成，避免跨分类晚到响应。
+        self.inflight_rank_requests = set()
         # 同一动作中多个精确匹配请求无法证明哪个由点击产生，直接拒绝歧义。
         self.match_count = 0
         # context 生命周期由正式适配器持有，监听器可成组安装及清理。
@@ -86,6 +88,7 @@ class TaobaoResponseCapture:
         self.disarm()
         self.responses.clear()
         self.category_requests.clear()
+        self.inflight_rank_requests.clear()
         self.category_response = None
 
     def arm(self, expected: dict) -> int:
@@ -119,6 +122,8 @@ class TaobaoResponseCapture:
             return
         if matches_category_request(request):
             self.category_requests.add(request)
+        if matches_rank_request(request, {}):
+            self.inflight_rank_requests.add(request)
         if self.expected is not None and matches_rank_request(request, self.expected):
             self.match_count += 1
             self.requests[request] = self.generation
@@ -132,6 +137,7 @@ class TaobaoResponseCapture:
 
     def on_finished(self, request) -> None:
         """Deliver only completed bodies from the still-active action generation."""
+        self.inflight_rank_requests.discard(request)
         # 失败或旧代次请求已被移除，不能被晚到响应重新注册。
         response = self.responses.pop(request, None)
         generation = self.requests.pop(request, None)
@@ -144,6 +150,7 @@ class TaobaoResponseCapture:
 
     def on_failed(self, request) -> None:
         """Release aborted requests; callers retain their bounded timeout policy."""
+        self.inflight_rank_requests.discard(request)
         self.requests.pop(request, None)
         self.responses.pop(request, None)
         self.category_requests.discard(request)

@@ -46,6 +46,8 @@ SAFE_DETAIL_FIELDS = {
     "site_ready",
     "website_status",
     "notification_error_category",
+    # 仅传固定版本的可读业务摘要，不传完整配置或认证信息。
+    "rules_summary",
 }
 # 日志正文和详情出现这些认证标记时直接拒绝写入。
 FORBIDDEN_TEXT_MARKERS = (

@@ -62,7 +62,7 @@ class PlatformConfig(StrictModel):
     persist_session_cookies: bool = False
     # 同一平台所有任务共用分类名称黑名单，父级命中时跳过其全部待采子分类。
     category_blacklist: list[str] = Field(default_factory=list)
-    # remote 只替换类目范围和黑名单，不改变本机运行配置。
+    # remote 固定范围、排除、限页和商品过滤；浏览器等本机参数仍由 YAML 提供。
     category_config_source: Literal["yaml", "remote"] = "yaml"
 
     @field_validator("category_blacklist")
@@ -135,9 +135,9 @@ class RetentionConfig(StrictModel):
 
 
 class DatabaseConfig(StrictModel):
-    """Reference a PostgreSQL DSN without storing credentials in configuration."""
+    """Reference a local SQLite URL or explicit PostgreSQL compatibility DSN."""
 
-    # 连接地址由环境或项目 .env 提供，只支持 PostgreSQL。
+    # 连接地址由环境或项目 .env 提供，默认示例使用无需服务的本地 SQLite。
     url_env: str = Field(pattern=r"^[A-Z][A-Z0-9_]*$")
 
     @property

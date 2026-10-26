@@ -94,6 +94,8 @@ def test_runner_blacklist_filters_before_collection_and_persistence(
     runtime = tmp_path / "runtime"
     monkeypatch.setattr("compass_collector.runner.RUNTIME_ROOT", runtime)
     config = load_config(Path("config/tasks.yaml"))
+    # 本用例验证本地 YAML 黑名单，不能随着正式配置改远程而访问业务接口。
+    config.platforms[platform].category_config_source = "yaml"
     config.platforms["taobao"].category_blacklist = ["私处护理", "其他"]
     if block_all:
         config.platforms[platform].category_blacklist = ["行业"]

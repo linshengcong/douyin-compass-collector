@@ -196,6 +196,8 @@ def test_scheduler_auth_failure_closes_browser_without_waiting(
 
     # 临时配置和 runner runtime 隔离真实 Profile 与数据库。
     config = temporary_config(tmp_path)
+    # 此用例直接验证浏览器鉴权失败；明确使用历史 YAML，不让真实远程读取抢先失败。
+    config.platforms["compass"].category_config_source = "yaml"
     monkeypatch.setattr("compass_collector.runner.RUNTIME_ROOT", tmp_path / "runtime")
     # 生命周期计数证明没有调用人工等待入口。
     lifecycle = {"closed": 0, "waited": 0}

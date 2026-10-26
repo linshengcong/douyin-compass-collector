@@ -1,4 +1,4 @@
-"""PostgreSQL schema, Alembic upgrades, publication identity, and scheduler state."""
+"""Collector schema, backend-specific Alembic upgrades and durable batch state."""
 
 from dataclasses import dataclass, field
 from compass_collector.collection_limits import page_limit, pagination_counts
@@ -32,7 +32,7 @@ from sqlalchemy.engine import Connection, URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from compass_collector.errors import PublicationError
-from compass_collector.database_connection import database_engine, database_url
+from compass_collector.database_connection import ExactDecimalText, database_engine, database_url
 from compass_collector.models import (
     CategoryDiscoveryResult,
     CategoryRunPlan,
@@ -421,6 +421,7 @@ class ProductRankEntryModel(Base):
             "product_id",
             unique=True,
             postgresql_where=text("platform = 'compass'"),
+            sqlite_where=text("platform = 'compass'"),
         ),
         CheckConstraint("platform IN ('compass', 'taobao')", name="ck_product_rank_entries_platform"),
         UniqueConstraint(
@@ -451,26 +452,26 @@ class ProductRankEntryModel(Base):
     # 淘宝没有首次上榜字段，未知状态与 false 分开保存。
     newly_on_ranking: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # 金额和成交件数保留平台原始区间与单位。
-    pay_amount_min_value: Mapped[object] = mapped_column(Numeric(24, 4), nullable=True)
-    pay_amount_max_value: Mapped[object] = mapped_column(Numeric(24, 4), nullable=True)
+    pay_amount_min_value: Mapped[object] = mapped_column(Numeric(24, 4).with_variant(ExactDecimalText(), "sqlite"), nullable=True)
+    pay_amount_max_value: Mapped[object] = mapped_column(Numeric(24, 4).with_variant(ExactDecimalText(), "sqlite"), nullable=True)
     pay_amount_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
     pay_combo_count_min_value: Mapped[object | None] = mapped_column(
-        Numeric(24, 4), nullable=True
+        Numeric(24, 4).with_variant(ExactDecimalText(), "sqlite"), nullable=True
     )
     pay_combo_count_max_value: Mapped[object | None] = mapped_column(
-        Numeric(24, 4), nullable=True
+        Numeric(24, 4).with_variant(ExactDecimalText(), "sqlite"), nullable=True
     )
     pay_combo_count_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
     # 淘宝商品跳转和原始区间独立保存，数值边界用于网站过滤与排序。
     product_url: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     pay_buyer_count_raw: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    pay_buyer_count_min_value: Mapped[object | None] = mapped_column(Numeric(24, 4), nullable=True)
-    pay_buyer_count_max_value: Mapped[object | None] = mapped_column(Numeric(24, 4), nullable=True)
+    pay_buyer_count_min_value: Mapped[object | None] = mapped_column(Numeric(24, 4).with_variant(ExactDecimalText(), "sqlite"), nullable=True)
+    pay_buyer_count_max_value: Mapped[object | None] = mapped_column(Numeric(24, 4).with_variant(ExactDecimalText(), "sqlite"), nullable=True)
     pay_buyer_count_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
     visitor_count_raw: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    visitor_count_min_value: Mapped[object | None] = mapped_column(Numeric(24, 4), nullable=True)
-    visitor_count_max_value: Mapped[object | None] = mapped_column(Numeric(24, 4), nullable=True)
+    visitor_count_min_value: Mapped[object | None] = mapped_column(Numeric(24, 4).with_variant(ExactDecimalText(), "sqlite"), nullable=True)
+    visitor_count_max_value: Mapped[object | None] = mapped_column(Numeric(24, 4).with_variant(ExactDecimalText(), "sqlite"), nullable=True)
     visitor_count_unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
 
 
@@ -660,40 +661,51 @@ def _check_platform_identity(connection: Connection, platform: str) -> None:
 
 
 def upgrade_database(value: str | URL, *, platform: str | None = None) -> None:
-    """Serialize PostgreSQL migrations with a database-wide transaction advisory lock."""
+    """Upgrade the selected backend and claim the platform in one locked transaction."""
     from compass_collector.app_paths import resource_root
 
-    # 连接创建在凭证解析后执行，绝不访问历史 SQLite 文件。
+    # 只打开显式配置的数据库，不搜索或复用旧 SQLite 归档。
     engine = database_engine(value)
+    # 文件锁覆盖首次 WAL 切换与建库；SQLite 尚未建表时也能跨进程串行初始化。
+    initialization_lock = None
     try:
+        if engine.dialect.name == "sqlite":
+            from compass_collector.runtime_locks import ProcessLock
+            initialization_lock = ProcessLock(Path(engine.url.database + ".init.lock"), "sqlite_initialization")
+            initialization_lock.acquire_wait(timeout=30)
         with engine.begin() as connection:
-            # 锁属于事务，提交、异常或连接断开后自动释放；跨主机共享。
-            connection.execute(text("SET LOCAL lock_timeout = '30s'"))
-            connection.execute(text("SELECT pg_advisory_xact_lock(172936, 1)"))
+            if engine.dialect.name == "postgresql":
+                # PostgreSQL 使用事务 advisory lock；SQLite 已在 BEGIN IMMEDIATE 加锁。
+                connection.execute(text("SET LOCAL lock_timeout = '30s'"))
+                connection.execute(text("SELECT pg_advisory_xact_lock(172936, 1)"))
             # 同一连接完成迁移、版本检查及平台认领，避免初始化竞态。
             project_root = resource_root()
             alembic_config = AlembicConfig(str(project_root / "alembic.ini"))
-            alembic_config.set_main_option("script_location", str(project_root / "migrations_postgresql"))
+            # 两个后端独立版本链，避免把旧 SQLite 当作 PostgreSQL 基线升级。
+            migration_directory = "migrations_sqlite" if engine.dialect.name == "sqlite" else "migrations_postgresql"
+            alembic_config.set_main_option("script_location", str(project_root / migration_directory))
             alembic_config.attributes["connection"] = connection
             command.upgrade(alembic_config, "head")
             if platform is not None:
                 _check_platform_identity(connection, platform)
     finally:
         engine.dispose()
+        if initialization_lock is not None:
+            initialization_lock.release()
 
 
 class Database:
     """Provide clean-baseline idempotence, status, and scheduler operations."""
 
     def __init__(self, value: str | URL) -> None:
-        """Create the configured PostgreSQL pool and transactional session factory."""
+        """Create the configured collector engine and transactional session factory."""
         # 连接、连接池参数统一由独立模块维护。
         self.engine = database_engine(value)
         # 返回摘要与快照在事务结束后仍可读取。
         self.session_factory = sessionmaker(bind=self.engine, expire_on_commit=False)
 
     def close(self) -> None:
-        """Dispose pooled PostgreSQL connections."""
+        """Dispose pooled database connections."""
 
         self.engine.dispose()
 

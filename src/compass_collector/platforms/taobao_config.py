@@ -72,14 +72,24 @@ class TaobaoRankConfig(TaobaoStrictModel):
 
 
 class TaobaoFiltersConfig(TaobaoStrictModel):
-    """Preserve the observed unrestricted filters without invented options."""
+    """固定店铺分组顺序，其余筛选沿用已观察的不限条件。"""
 
-    # 空价格与关键词、全部店铺是已观察到的页面业务条件。
+    # 空名单只兼容历史批次；正式入口显式固定淘宝→天猫，沿用同一淘宝规则。
+    seller_platforms: tuple[Literal["taobao", "tmall"], ...] = ()
+    # 价格及关键词仍保持不限。
     min_price: Literal[""] = ""
     max_price: Literal[""] = ""
     price_segment: Literal[""] = ""
+    # 历史“全部”请求值保留供旧批次续采，新分组使用页面读取的值。
     seller_type: Literal[-1] = -1
     keyword: Literal[""] = ""
+
+    @model_validator(mode="after")
+    def validate_seller_platforms(self):
+        """新规则只接受淘宝在前、天猫在后，历史空名单保持原快照语义。"""
+        if self.seller_platforms not in ((), ("taobao", "tmall")):
+            raise ValueError("seller_platforms must be taobao then tmall")
+        return self
 
 
 class TaobaoDateConfig(TaobaoStrictModel):

@@ -13,6 +13,11 @@ def test_real_config_is_valid() -> None:
 
     # 加载后的应用配置用于核对动态三级分类契约。
     config = CURRENT_CONFIG
+    # 两平台正式入口必须启用网页规则，避免保存后实际仍按 YAML 全量采集。
+    assert all(platform.category_config_source == "remote" for platform in config.platforms.values())
+    from compass_collector.config import load_config
+    from pathlib import Path
+    assert load_config(Path("config/taobao.yaml")).platforms["taobao"].category_config_source == "remote"
     assert config.collection.request_interval_seconds.min == 0.5
     assert config.collection.request_interval_seconds.max == 1
     assert config.collection.network_retry_attempts == 2

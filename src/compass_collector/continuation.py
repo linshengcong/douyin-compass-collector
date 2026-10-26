@@ -134,6 +134,12 @@ def prepare_continuation(snapshot, task, database, root, logger, control=None):
     # 数据库事务完成后同步镜像；中间再次退出也可通过同一入口恢复。
     restarted = database.restart_unpublished_batch(snapshot.batch_id, completed_ids)
     storage.sync_collection_snapshot(restarted)
+    # 续采摘要只来自原批次，不请求当前远程版本。
+    from compass_collector.collection_rule_summary import collection_rule_summary
+    logger.emit(level="INFO", event="collection_rules_frozen",
+                message=f"[{task.id}] 续采沿用原批次规则：{collection_rule_summary(snapshot.config_snapshot)}",
+                stage="continuation", context=LogContext(batch_id=snapshot.batch_id, task_id=task.id),
+                details={"rules_summary": collection_rule_summary(snapshot.config_snapshot)})
     # 让 GUI 先显示原分类总数，再逐个计入跳过的成功分类。
     logger.emit(level="INFO", event="category_discovery_succeeded",
                 message=f"[{task.id}] 继续原批次，跳过 {len(completed)} 个成功分类，补录 {len(plans) - len(completed)} 个分类",

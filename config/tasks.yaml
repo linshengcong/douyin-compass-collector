@@ -12,12 +12,16 @@ browser:
 
 platforms:
   compass:
+    # 新批次统一采用网页已发布规则；续采仍沿用原批次快照。
+    category_config_source: remote
     profile_dir: runtime/browser-profile
     # 按各层级分类完整名称跳过；只对抖音生效，例如 ["示例分类"]。
     category_blacklist: []
     # 保留当前抖音历史库，并明确其唯一平台归属。
     database_env: COMPASS_DATABASE_URL
   taobao:
+    # 同平台的范围、排除、限页和商品过滤均从远程版本固定。
+    category_config_source: remote
     # 分类路径中任一层级名称命中即跳过；只对淘宝生效。
     category_blacklist:
       - 私处护理
@@ -114,6 +118,8 @@ tasks:
       min_price: ""
       max_price: ""
       price_segment: ""
+      # 两组仍属于淘宝采集器，共用淘宝的远程采集页数。
+      seller_platforms: [taobao, tmall]
       seller_type: -1
       keyword: ""
     date:

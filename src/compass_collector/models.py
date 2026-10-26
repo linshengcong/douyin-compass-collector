@@ -135,7 +135,9 @@ class DiscoveredScope:
     @property
     def display_path(self) -> str:
         """Format the complete generic path without dropping deeper levels."""
-        return " > ".join(self.path)
+        # 分组是榜单维度，原始三级路径保持不变以兼容分类规则。
+        prefix = {"taobao": "淘宝 · ", "tmall": "天猫 · "}.get(self.platform_metadata.get("seller_platform"), "")
+        return prefix + " > ".join(self.path)
 
     @property
     def category_id(self) -> str:

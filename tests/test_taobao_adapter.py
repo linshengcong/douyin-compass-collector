@@ -1,6 +1,7 @@
 """Controlled page events prove orchestration, not real Taobao selector acceptance."""
 
 from datetime import timedelta
+from dataclasses import replace
 from time import sleep
 from types import SimpleNamespace
 
@@ -31,11 +32,31 @@ class Controls:
         self.scope = None
         self.fail_next = False
         self.total = 41
+        # 合成值刻意不使用猜测的0/1，验证请求编码来自实际控件读取。
+        self.seller_type = "-1"
+
+    def seller_types(self, page):
+        """提供合成页面控件值，供生产发现和批次冻结使用。"""
+        return {"taobao": "7", "tmall": "9"}
+
+    def seller_type_selected(self, page, scope):
+        """按真实控件状态判断，而不是直接返回目标值。"""
+        return self.seller_type == scope.platform_metadata["seller_type"]
+
+    def select_seller_type(self, page, scope):
+        """切换店铺类型时，当前分类生成一条新的第一页请求。"""
+        self.seller_type = scope.platform_metadata["seller_type"]
+        self.page_no = 1
+        if self.scope is not None:
+            self.rank(page)
 
     def enter(self, page):
         """Produce the taxonomy after listeners have actually been attached."""
         self.enters += 1
         self.page_no = 1
+        # 正常重新进入页面会恢复默认单选框，旧分类不能冒充当前控件。
+        self.seller_type = "-1"
+        self.scope = None
         # 分类响应使用现有明确标注的合成平铺树。
         request = Request(page, url="https://sycm.taobao.com/mc/common/free/getCateInfo.json?marketVersion=free")
         self.emit(Response(request, TREE))
@@ -78,7 +99,9 @@ class Controls:
     def rank(self, page):
         """Exercise the production query matcher and parser using distinct events."""
         # query 不含签名；不同页更新时间故意不同。
-        params = build_expected_params(self.task, self.scope, CAPTURED_AT.date(), self.page_no)
+        # 请求以实际单选框状态为准，避免测试替身自动满足目标期望。
+        scope = replace(self.scope, platform_metadata={**self.scope.platform_metadata, "seller_type": self.seller_type})
+        params = build_expected_params(self.task, scope, CAPTURED_AT.date(), self.page_no)
         self.emit(Response(Request(page, params), page_payload(self.page_no, total=self.total,
                                                              update_time=f"synthetic-{self.page_no}")))
 

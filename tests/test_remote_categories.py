@@ -71,6 +71,8 @@ def test_remote_plan_snapshot_and_legacy_recovery(tmp_path, monkeypatch):
     """远程计划忽略 YAML 黑名单，数据库与 Manifest 清单完全一致。"""
     # 真正执行目录展开和数据库写入，仅替换 HTTP 边界。
     arguments, response, nodes = scenario(tmp_path)
+    # 限页与商品过滤必须和分类范围采用同一远程版本。
+    response["collection_limits"] = {"max_pages_per_category": 3}
     monkeypatch.setattr(remote, "remote_request", lambda platform, suffix="", body=None: response if not suffix else {"catalog_version": "synced"})
     try:
         result = prepare_category_batch(**arguments)
@@ -84,6 +86,7 @@ def test_remote_plan_snapshot_and_legacy_recovery(tmp_path, monkeypatch):
             snapshot = session.get(CollectionBatch, arguments["batch_id"])
             assert snapshot.config_snapshot["remote_category_config"]["revision"] == 3
             assert snapshot.config_snapshot["remote_category_config"]["product_filters"] == response["product_filters"]
+            assert snapshot.config_snapshot["remote_category_config"]["collection_limits"] == {"max_pages_per_category": 3}
             assert snapshot.config_snapshot["remote_category_config"]["effective_paths"] == expected
             assert snapshot.config_snapshot["category_blacklist"] == []
             assert continuation_task(snapshot).id == arguments["task"].id
@@ -95,6 +98,11 @@ def test_remote_plan_snapshot_and_legacy_recovery(tmp_path, monkeypatch):
         continued, _ = prepare_continuation(frozen, continuation_task(frozen), arguments["database"],
             tmp_path, arguments["runtime_logger"])
         assert continued.storage.manifest["config_snapshot"]["remote_category_config"]["revision"] == 3
+        # 单一事件管道展示实际批次阈值，续采不能显示已变更的版本 4。
+        from compass_collector.runtime_logging import read_latest_batch_events
+        rule_events = [event for event in read_latest_batch_events(tmp_path / "logs") if event["event"] == "collection_rules_frozen"]
+        assert len(rule_events) == 2
+        assert all("远程 v3" in event["rules_summary"] and "最多 3 页" in event["rules_summary"] and "成交件数>300件" in event["rules_summary"] for event in rule_events)
         assert continued.storage.manifest["config_snapshot"]["remote_category_config"]["product_filters"]["conditions"]["pay_combo_count"]["threshold"] == "300"
         # 模拟已发布的空合成批次；补同步只能从数据库原快照取规则。
         from compass_collector.ranking_sync import build_sync_payload

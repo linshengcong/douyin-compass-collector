@@ -55,6 +55,9 @@ tasks:
     enabled: true
     display_name: 淘宝香薰实时榜验收
     schedule: "0 14 * * *"
+    filters:
+      # 验收与正式入口使用相同的淘宝→天猫顺序。
+      seller_platforms: [taobao, tmall]
     category_scope:
       mode: selected
       root_category_id: "50025705"

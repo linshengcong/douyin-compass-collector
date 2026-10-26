@@ -202,7 +202,7 @@ def parse_metric_range(
     expected_unit: str,
     field_name: str,
 ) -> MetricRange:
-    """Parse one verified two-value metric range without scaling raw values."""
+    """Normalize price ranges from cents to yuan and preserve number counts."""
 
     if not isinstance(metric_payload, dict):
         raise ResponseContractError(
@@ -242,9 +242,10 @@ def parse_metric_range(
             f"{field_name} range is reversed",
             category="invalid_product",
         )
+    # 金额原值为分，换算为元；number 已是实际件数，不能再除以 10 影响过滤。
     return MetricRange(
-        min_value=Decimal(parsed_values[0]) / (100 if expected_unit == "price" else 10),
-        max_value=Decimal(parsed_values[1]) / (100 if expected_unit == "price" else 10),
+        min_value=Decimal(parsed_values[0]) / (100 if expected_unit == "price" else 1),
+        max_value=Decimal(parsed_values[1]) / (100 if expected_unit == "price" else 1),
         unit="CNY" if expected_unit == "price" else "count",
     )
 

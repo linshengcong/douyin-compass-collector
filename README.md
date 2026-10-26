@@ -1,7 +1,7 @@
 # 抖音电商罗盘榜单采集器
 
 
-当前数据库运行时只支持 PostgreSQL；先阅读 [PostgreSQL 本地运行与 RDS 接入](docs/PostgreSQL迁移与运行.md)。历史 SQLite 不导入新库，采集运行仅使用 PostgreSQL。
+默认使用本地 SQLite 文件保存采集进度和历史数据，不需要本地 Docker、PostgreSQL 服务或数据库 SSH 隧道。整批正式发布后，通过已有 `/api/rankings/sync` 接口同步到云端业务数据库。PostgreSQL 连接仍保留为可选兼容方式。
 这是一个本地 macOS/Windows 工程：使用独立 Chrome Profile 保存人工登录态，通过真实 Chrome 页面点击、滚动和响应监听采集商品榜单。榜单采集不使用 Cookie 重放 HTTP 接口。淘宝可在独立 Profile 内额外备份会话 Cookie，用于浏览器重启时恢复；通知和部署查询仍使用各自的网络客户端。
 
 默认任务为个护家清实时榜，只循环 `industry_id=5` 下的全部三级分类，页面选择实时榜（`date_type=1`），品牌不限（`brand_type=-1`）、price_bin=不限。支持指定分类列表及 `all_level1` 自动发现；设置 `category_scope.industry_id` 时限定行业，未设置时发现所有行业。排除“全部”，忽略四级及更深节点。任务、分类和分页全部串行执行，页面操作间隔为 0.5～1 秒，超时后有限恢复重试；平台连续三次返回 `11001` 时安全停止本批。
@@ -12,7 +12,7 @@
 
 - 手动登录和登录态持久化；
 - 手动正式采集、`--dry-run`、`--force`；
-- PostgreSQL + SQLAlchemy + Alembic、CSV、原始响应和 Manifest；
+- 本地 SQLite + SQLAlchemy + Alembic、CSV、原始响应和 Manifest；
 - JSONL 日志、失败截图和脱敏诊断材料；
 - APScheduler 北京时间定时运行、同日宽限补采、跨天 `missed`；
 - PySide6 本地控制台、实时进度、安全日志和 Chrome 生命周期控制；
@@ -21,6 +21,22 @@
 - 用户级 `launchd` 安装、卸载和状态脚本。
 
 当前已注册罗盘和淘宝页面适配器。淘宝可通过独立配置从 CLI、GUI 运行；分类/排行解析、存储迁移、CSV、调度接入和网站平台切换已实现。淘宝两个目标分类已通过真实账号完整采集与发布验收，全根任务仍在进行，默认调度任务暂不启用。
+
+## 本地采集与云端同步
+
+数据流为：本机 Chrome 采集 → 每页保存本地 raw 和 SQLite 进度 → 整批校验并正式发布本地数据及 CSV → 发布 OSS 快照 → 调用 `/api/rankings/sync` 写入云端业务数据库。
+
+每页保存仍保留，用于中断恢复和审计；这个过程只写本地文件，不访问云端 PostgreSQL。完成发布的批次才进行 HTTP 同步，沿用成功／部分成功发布规则。同步失败保留本地发布结果，可重试同一批次，不需要重新采集。分类与采集规则仍在批次开始时通过已有接口读取，采集网页和最终发布仍需要网络。
+
+新安装从 `.env.example` 创建 `.env`，三个数据库 URL 分别指向 `runtime/local/compass.sqlite3`、`taobao.sqlite3`、`taobao_poc.sqlite3`。已有历史数据库不能直接改成新空文件：先关闭两平台 GUI、采集和 Scheduler，再运行：
+
+```bash
+PYTHONPATH=src .venv/bin/python scripts/migrate_collector_to_sqlite.py --apply
+```
+
+该命令从 `.env` 读取原数据库连接（迁移期间必须可访问），复制到新的 `runtime/local/<时间>/`，逐表核对行数和全部字段摘要，并检查外键与完整性。全部验证通过后才原子更新 `.env`；保留源数据库和 `runtime/backups/sqlite-cutover-<时间>/source.env`，验证报告为同目录 `verification.json`。正在运行的 GUI／任务会阻止切换；不会覆盖旧数据库或自动导入旧归档。raw、CSV、Profile 和历史批次 ID 保持原样，备份时应连同整个 `runtime/` 与 `.env` 保存。
+
+自动化测试默认使用隔离的临时 SQLite，不需要 Docker。仅在验证 PostgreSQL 兼容性时设置专用 `TEST_DATABASE_URL`（数据库名以 `_test` 结尾）。
 
 ## 快捷命令
 
@@ -93,7 +109,7 @@ make run PLATFORM=tt
 
 每个平台内部仍串行采集。GUI、采集和调度分别使用 `runtime/locks/<platform>/` 下的锁；日志和控制文件分别写入 `runtime/logs/<platform>/`、`runtime/controls/<platform>/`。停止或关闭一个窗口不操作另一个平台。Chrome保留检查期仍持有本平台采集锁。
 
-多平台配置使用 `platforms.<id>.database_env` 引用各自 PostgreSQL 连接环境变量，顶层 `database.url_env` 用于单平台默认连接。数据库通过 `runtime_platform` 登记唯一归属；环境变量不同但指向同一个数据库时，第二个平台也会被拒绝。Profile 仍按本地规范化路径隔离。旧 SQLite 不再用于采集或升级；新库通过独立 PostgreSQL 基线从空库创建。
+多平台配置使用 `platforms.<id>.database_env` 引用各自数据库连接环境变量，顶层 `database.url_env` 用于单平台默认连接。数据库通过 `runtime_platform` 登记唯一归属；环境变量不同但指向同一个数据库时，第二个平台也会被拒绝。Profile 仍按本地规范化路径隔离。新建 SQLite 使用 `migrations_sqlite/` 独立基线，既有 PostgreSQL 使用 `migrations_postgresql/`；不会自动打开旧 SQLite 归档。
 
 升级前关闭旧版本GUI、采集和Scheduler。检测到旧全局锁仍被占用时，新版本提示 `legacy_gui`、`legacy_collection` 或 `legacy_scheduler` 并拒绝启动，不终止旧进程。旧CLI按明确平台、任务所属平台或唯一启用平台解析；多平台歧义需要 `--platform`，清理始终必填该参数。
 
@@ -151,7 +167,7 @@ category_scope:
 先采主根，再按追加根和二级 ID 的配置顺序展开，分支内保留接口顺序。追加根必须唯一，二级 ID 必须直属该根；不存在、层级不符、重复或无三级分类时整个分类发现报错，不静默少采。多个根的批次根字段为空，各分类保留完整路径和真实根 ID。`additional_roots` 仅用于 `all_level1` 模式，不能与 `selected` 三级名单混用；两分类 PoC 配置继续只采原有香薰蜡烛、香薰精油。
 
 - `browser`：共享 Chrome 参数；
-- `platforms.<id>.database_env`：独立 PostgreSQL 连接环境变量；
+- `platforms.<id>.database_env`：独立数据库连接环境变量（默认 SQLite）；
 - `platforms.<id>.profile_dir`：每个平台独立 Profile；罗盘复用 `runtime/browser-profile`；
 - `collection`：页面动作超时、响应超时、采集间隔、有限重试及人工等待；
 - `tasks`：任务 ID、平台、启停、名称、每日时间、分类、筛选与日期；
@@ -361,7 +377,7 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 4. 执行 `login` 并人工登录；
 5. 从 `.env.example` 创建 `.env`，填入当前有效凭证并执行 `make notify PLATFORM=tt`；
 6. 执行 `make run PLATFORM=tt START=no`，检查单窗口、最近日志、通知和 Scheduler 状态；
-7. 执行一次 GUI `dry-run`，核对动态三级分类数量、完整分页、PostgreSQL/raw 审计和批次汇总；
+7. 执行一次 GUI `dry-run`，核对动态三级分类数量、完整分页、SQLite/raw 审计和批次汇总；
 8. 执行 GUI 正式 `run`，核对 `published_at`、中文 8 列 CSV、打开文件和关闭 Chrome；
 9. 前台启动 Scheduler 并用 Ctrl-C 停止；
 10. 先执行 launchd `--dry-run`；
@@ -373,7 +389,7 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 - 云主机和 systemd；
 - 重试策略与 Scheduler 逻辑后续重新梳理；
 - [x] 抖音和淘宝当天未发布批次补录：`run --continue` 跳过成功分类，其余从第一页重采；已发布或跨天时全量采集，不合并不同日期的榜单；
-- 以 PostgreSQL 权威状态重建 Manifest 和 raw 索引的崩溃恢复；
+- 以本地数据库权威状态重建 Manifest 和 raw 索引的崩溃恢复；
 - 以更多平台的页面和字段契约验证适配器扩展；
 - 多主机独立运行与监控；
 - 其他榜单 Adapter。
@@ -382,11 +398,11 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 
 ## 采集调用链与数据契约
 
-调用链为 CLI / GUI / Scheduler → 任务配置及幂等锁 → 平台适配器 → 分类发现与校验 → 页面响应采集 → 分页审计与完整性校验 → PostgreSQL / CSV 协调发布 → OSS、网站及通知。
+调用链为 CLI / GUI / Scheduler → 任务配置及幂等锁 → 平台适配器 → 分类发现与校验 → 页面响应采集 → 分页审计与完整性校验 → 本地 SQLite / CSV 协调发布 → OSS 快照发布 → 整批 HTTP 同步云端业务库及通知。
 
 `platforms/contracts.py` 规定 `open_session`、`discover_scopes`、`collect_scope`、`close`。共享编排不持有页面对象、不解析罗盘响应和请求参数；罗盘导航、选择器、日期匹配、错误码及原始指标换算集中在适配器。共享金额为实际人民币元 `CNY`、件数为实际件 `count`，导出器只负责展示。
 
-数据库仅执行 `migrations_postgresql/` 中的 Alembic 迁移。raw、artifacts、exports 按平台、日期和任务隔离，批次保存任务配置、分类路径和安全请求参数快照。
+数据库按连接类型执行 `migrations_sqlite/` 或 `migrations_postgresql/` 中的 Alembic 迁移。raw、artifacts、exports 按平台、日期和任务隔离，批次保存任务配置、分类路径和安全请求参数快照。
 
 网站不可变快照与 `latest.json` 位于 `<public_prefix>/<platform>/<task_id>/`。只有配置主任务更新兼容根 `<public_prefix>/latest.json`，其他任务不覆盖当前网页。现有网页字段和展示保持兼容。
 
@@ -394,7 +410,7 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 
 ## 淘宝采集
 
-淘宝采集编排包含响应归属、20条模式、跨午夜检查和共享 raw → PostgreSQL → Manifest → CSV 链路。普通分类失败继续首轮剩余分类，首轮结束后按下述规则补采。无法匹配控件时明确失败并保存本地截图。默认 `config/tasks.yaml` 仅启用抖音任务。
+淘宝采集编排包含响应归属、20条模式、跨午夜检查和共享 raw → SQLite → Manifest → CSV 链路。普通分类失败继续首轮剩余分类，首轮结束后按下述规则补采。无法匹配控件时明确失败并保存本地截图。默认 `config/tasks.yaml` 仅启用抖音任务。
 
 淘宝独立 Profile 登录和两个目标分类的手动试采：
 
@@ -414,6 +430,8 @@ GUI 日志直接消费同一份安全事件；JSONL 仍是唯一持久日志。�
 
 淘宝商品的店铺名称缺失、null、空字符串或纯空白时保存为“未知”，保留商品、卖家 ID 和排名，不让整页失败；错误字段类型及商品身份、排名、分页完整性仍严格校验。
 
+淘宝入口的 `filters.seller_platforms: [taobao, tmall]` 固定先采完淘宝目标分类，再采天猫目标分类，不选择“全部”。两组共用“采集配置 → 淘宝”的分类范围、排除、每分类采集页数和商品过滤，同一远程版本在批次开始时固定。例如设置 3 页，两组每个分类各采最多 3 页。店铺请求值从页面单选框读取，不猜测编码。两组拥有不同分类运行身份及原始页目录，CSV 与网页分类分别带“淘宝 · ”、“天猫 · ”前缀，排名各自从 1 开始；原始三级分类和请求 `cateId` 不变。历史快照缺少分组名单时仍按原“全部”条件续采，不在原批次插入新组。新规则在下一个新批次生效，运行中的批次不切换规则。
+
 `login` 命令保持窗口直到在终端按 Enter，正常关闭时保存登录态。`run` 的窗口在任务结束或失败后按 `browser.keep_open_after_manual_run` 控制是否保留；手动 PoC 默认 `true`，检查结束后按 Enter 或通过 GUI 关闭。该选项不用于无人值守 Scheduler；自动验收配置可显式设为 `false`，有限诊断脚本也会在取证完成后释放浏览器。淘宝长分类名会在菜单文本中缩写，控制器在对应第三列使用完整 `title` 精确匹配，并拒绝多个同名目标。
 
 分类点击返回超时不一定表示点击未生效。适配器只在已识别的分类点击超时后继续等待同一动作代次的完整匹配响应；响应通过分类、日期、页码、20条和可见页面状态校验后才接受。没有匹配响应时保留原步骤、异常类型及截图，结束当前分类尝试，由首轮完成后的分类补采统一处理。不会在原页面盲目重复点击。淘宝分类内重复商品不算失败，按原排名位置保留，不去重；条数、完整分页和排名连续性仍严格校验。罗盘继续保持原商品唯一性要求。
@@ -423,7 +441,7 @@ uv run --frozen python -m compass_collector login --config config/taobao-poc.yam
 DINGTALK_ENABLED=false uv run --frozen python -m compass_collector run --config config/taobao-poc.yaml --task taobao_household_cleaning_realtime --no-gui --dry-run
 ```
 
-PoC 配置通过 `TAOBAO_POC_DATABASE_URL` 连接独立 PostgreSQL 数据库，登录目录为 `runtime/taobao-browser-profile`，不复用内置浏览器的登录。首次需在程序打开的 Chrome 中完成正常登录。`--dry-run` 用于采集验收，不发布正式商品数据；命令中的 `DINGTALK_ENABLED=false` 仅为本次进程禁用汇总通知，不修改 `.env`；不要用 PoC 配置启动 Scheduler。两目标分类必须由当次真实分类树解析成功，控件与完整请求参数必须同时通过验证。
+PoC 配置通过 `TAOBAO_POC_DATABASE_URL` 连接独立本地 SQLite 文件，登录目录为 `runtime/taobao-browser-profile`，不复用内置浏览器的登录。首次需在程序打开的 Chrome 中完成正常登录。`--dry-run` 用于采集验收，不发布正式商品数据；命令中的 `DINGTALK_ENABLED=false` 仅为本次进程禁用汇总通知，不修改 `.env`；不要用 PoC 配置启动 Scheduler。两目标分类必须由当次真实分类树解析成功，控件与完整请求参数必须同时通过验证。
 
 采集器向独立网站交付不可变快照和 `latest.json`。带有 `product_id`、`source_record_id` 的正式快照使用 v4；兼容调用未提供商品身份时仍输出只读 v3。网站交互和部署由独立 mall-web 工程维护。
 
@@ -436,10 +454,10 @@ QT_QPA_PLATFORM=offscreen .venv/bin/python -m pytest -q
 
 ## 工程职责
 
-本项目负责 RPA 采集、调度、原始材料、PostgreSQL 持久化、CSV 与 OSS 快照发布及通知。网站源码在独立 mall-web 工程，选品 API 在独立 mall-server 工程；本项目不包含前端构建、部署或业务 API。采集器通过 `WEB_SITE_URL` 通知固定网站入口。
+本项目负责 RPA 采集、调度、原始材料、本地采集数据持久化、CSV 与 OSS 快照发布及通知。网站源码在独立 mall-web 工程，选品 API 在独立 mall-server 工程；本项目不包含前端构建、部署或业务 API。采集器通过 `WEB_SITE_URL` 通知固定网站入口。
 
 ## 分类采集管理
 
-目标范围、平台排除、每分类页数上限和采集后的商品过滤支持通过 mall-web 的“采集配置”页面管理。默认仍使用 YAML；首次导入、网页核对发布后，将实际入口的 `platforms.<平台>.category_config_source` 设置为 `remote`。新批次读取接口规则，补录沿用原快照。完整初始化、回滚和验证说明见 [采集配置](docs/分类采集管理.md)。
+目标范围、平台排除、每分类页数上限和采集后的商品过滤支持通过 mall-web 的“采集配置”页面管理。两个正式入口（`config/tasks.yaml`、`config/taobao.yaml`）统一使用 `remote`；新批次读取已发布规则，读取失败停止，补录沿用原快照。采集器“运行状态”的“采集规则”显示远程预览，支持只读刷新；开始后改为本批次实际固定的版本、限页和商品条件。重启旧控制台后可看到新增摘要。完整初始化、回滚和验证说明见 [采集配置](docs/分类采集管理.md)。
 
-远程商品过滤、采集限页与分类共用已发布版本，在批次开始时写入快照。分类按固定上限采集前 N 页，保留平台总数并另存计划条数，正常达到上限即可完成；过滤后不补采后续页。正式原始榜单和 CSV 保留所有实际采集记录，随后向业务库同步本批次固定的配置与结构化指标，业务库计算过滤后的展示快照。网页直接读取该批次通过记录，每个日期展示最新成功同步数据；旧批次和已引用的来源仍保留。店铺数组随原始商品保存并传递 logo、天猫标识。续采、自动重试和补同步不读取新规则；旧批次无过滤配置时继续展示原数据，不追溯重筛。启用新功能应先发布兼容业务服务，再升级采集器数据库到 `pg0002_limits_shops`、核对版本传递，最后发布网页并显式保存正式规则。完整接口及发布说明见 mall-server 的 `docs/COLLECTION_PRODUCT_FILTERS.md`。
+远程商品过滤、采集限页与分类共用已发布版本，在批次开始时写入快照。分类按固定上限采集前 N 页，保留平台总数并另存计划条数，正常达到上限即可完成；过滤后不补采后续页。正式原始榜单和 CSV 保留所有实际采集记录，随后向业务库同步本批次固定的配置与结构化指标，业务库计算过滤后的展示快照。网页直接读取该批次通过记录，每个日期展示最新成功同步数据；旧批次和已引用的来源仍保留。店铺数组随原始商品保存并传递 logo、天猫标识。续采、自动重试和补同步不读取新规则；旧批次无过滤配置时继续展示原数据，不追溯重筛。启用新功能应先发布兼容业务服务，再核对采集器数据库版本（SQLite 为 `sq0001_local`，PostgreSQL 为 `pg0002_limits_shops`）、核对版本传递，最后发布网页并显式保存正式规则。完整接口及发布说明见 mall-server 的 `docs/COLLECTION_PRODUCT_FILTERS.md`。

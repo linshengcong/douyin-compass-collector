@@ -1,24 +1,28 @@
-"""Real PostgreSQL test isolation; never connect to project or RDS production data."""
+"""Isolated SQLite by default, with optional real PostgreSQL compatibility tests."""
 
 import os
 from hashlib import sha256
 from uuid import uuid4
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-import pytest
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import URL
 from compass_collector.database_connection import database_url
 
 # 每次 pytest 运行使用不同前缀；只清理本进程创建的 schema。
 RUN_PREFIX = "collector_test_" + uuid4().hex[:12]
 SCHEMAS: dict[str, str] = {}
+# 无 Docker 测试使用本次 pytest 独立目录，测试结束后只清理本次创建的文件。
+SQLITE_DIRECTORY = TemporaryDirectory(prefix="collector-sqlite-test-")
 
 
 def pg_url(key):
-    """Map a test identity to a new PostgreSQL schema with the production migration."""
-    # 必须显式提供独立测试库，未配置时只跳过真实数据库集成测试。
+    """Map an existing fixture identity to an isolated real database."""
+    # 未配置专用 PostgreSQL 测试库时，完整运行本地 SQLite 集成测试。
     value = os.environ.get("TEST_DATABASE_URL")
     if not value:
-        pytest.skip("set TEST_DATABASE_URL to run PostgreSQL integration tests")
+        return URL.create("sqlite+pysqlite", database=str(Path(SQLITE_DIRECTORY.name) / (sha256(str(key).encode()).hexdigest() + ".sqlite3")))
     base = database_url(value)
     if not base.database.endswith("_test"):
         raise ValueError("TEST_DATABASE_URL must use a dedicated database ending in _test")
@@ -50,6 +54,7 @@ def pg_config(config, key):
 
 def close_test_schemas():
     """Remove only the schemas created by this test process."""
+    SQLITE_DIRECTORY.cleanup()
     value = os.environ.get("TEST_DATABASE_URL")
     if not value or not SCHEMAS:
         return

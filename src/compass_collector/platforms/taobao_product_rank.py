@@ -38,7 +38,7 @@ def build_expected_params(task, scope, business_date: date, page_no: int) -> dic
         "cateFlag": scope.platform_metadata["cate_flag"],
         "rankType": task.rank.rank_type, "minPrice": task.filters.min_price,
         "maxPrice": task.filters.max_price, "priceSeg": task.filters.price_segment,
-        "sellerType": task.filters.seller_type, "keyWord": task.filters.keyword,
+        "sellerType": int(scope.platform_metadata.get("seller_type", task.filters.seller_type)), "keyWord": task.filters.keyword,
         "indexCode": "payByrCnt,uv", "marketVersion": "free",
     }
 

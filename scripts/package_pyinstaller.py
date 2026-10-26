@@ -60,6 +60,8 @@ def build_application(project_root: Path, target: str) -> Path:
         "--add-data",
         add_data_argument(project_root / "migrations_postgresql", "migrations_postgresql"),
         "--add-data",
+        add_data_argument(project_root / "migrations_sqlite", "migrations_sqlite"),
+        "--add-data",
         add_data_argument(project_root / "alembic.ini", "."),
         "--add-data",
         add_data_argument(project_root / ".env.example", "."),

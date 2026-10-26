@@ -121,6 +121,47 @@ class TaobaoBrowserControls:
         self._wait(page, "taobao_page_size_confirm", lambda:
                    selected.count() == 1 and selected.inner_text(timeout=500).strip() == "20")
 
+    def seller_types(self, page):
+        """从真实单选控件读取两组请求值，避免猜测淘宝和天猫的接口编码。"""
+        # 按完整可访问名称定位，拒绝缺失、同名或未声明 value 的控件。
+        values = {}
+        for platform, name in (("taobao", "淘宝"), ("tmall", "天猫")):
+            # 单选框的 label 提供名称，value 是页面实际提交的业务值。
+            radio = page.get_by_role("radio", name=name, exact=True)
+            self._wait(page, "taobao_seller_type_ready", lambda:
+                       radio.count() == 1 and radio.is_visible() and radio.is_enabled())
+            # 只允许明确的非负整数，全部的 -1 不能作为任何分组。
+            value = radio.get_attribute("value", timeout=500)
+            if value is None or not value.isascii() or not value.isdecimal():
+                raise build_page_error(page, RuntimeError("Invalid seller type value"),
+                                       failed_step="taobao_seller_type_value")
+            values[platform] = value
+        if len(set(values.values())) != 2:
+            raise build_page_error(page, RuntimeError("Ambiguous seller type values"),
+                                   failed_step="taobao_seller_type_value")
+        return values
+
+    def seller_type_selected(self, page, scope):
+        """同时确认分组名称和冻结请求值，页面变更时停止而不误采。"""
+        # 只接受发现阶段已确认的两种名称。
+        name = {"taobao": "淘宝", "tmall": "天猫"}[scope.platform_metadata["seller_platform"]]
+        # 每次选择都核对冻结值，续采不能静默沿用已变化的页面编码。
+        radio = page.get_by_role("radio", name=name, exact=True)
+        self._wait(page, "taobao_seller_type_ready", lambda:
+                   radio.count() == 1 and radio.is_visible() and radio.is_enabled())
+        if radio.get_attribute("value", timeout=500) != scope.platform_metadata["seller_type"]:
+            raise build_page_error(page, RuntimeError("Seller type value changed"),
+                                   failed_step="taobao_seller_type_value")
+        return radio.is_checked(timeout=500)
+
+    def select_seller_type(self, page, scope):
+        """只选择目标淘宝或天猫单选框，已经选中时不重复点击。"""
+        if not self.seller_type_selected(page, scope):
+            # 目标名称由固定名单决定，不使用“全部”作为中间条件。
+            name = {"taobao": "淘宝", "tmall": "天猫"}[scope.platform_metadata["seller_platform"]]
+            self._click(page, page.get_by_role("radio", name=name, exact=True), "taobao_seller_type_select")
+        self._wait(page, "taobao_seller_type_confirm", lambda: self.seller_type_selected(page, scope))
+
     def select_scope(self, page, scope):
         """Choose three source names in the visible category cascade."""
         # 真实页面是自定义三列菜单：悬停一级/二级展开子列，只有三级点击提交。

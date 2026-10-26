@@ -1,7 +1,7 @@
 """Historical migration, platform publication and legacy retention regressions."""
 
 import json
-from sqlalchemy import text
+from sqlalchemy import text, select
 from pg_support import pg_url
 from datetime import date, datetime
 from pathlib import Path
@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from decimal import Decimal
 from alembic import command
 from alembic.config import Config
-from compass_collector.persistence import Database, upgrade_database
+from compass_collector.persistence import CategoryRun, Database, RawResponse, upgrade_database
 from compass_collector.exporter import format_metric_range
 from compass_collector.models import MetricRange
 from compass_collector.retention import cleanup_runtime
@@ -190,7 +190,7 @@ def test_shared_collection_accepts_one_level_non_compass_adapter(tmp_path):
         assert prepared.storage.manifest["categories"][0]["scope_path"] == ["单层类目"]
         assert prepared.storage.manifest["platform"] == "test_platform"
         with database.engine.connect() as connection:
-            assert connection.execute(text("SELECT safe_params FROM raw_responses")).scalar_one() == {"cursor": "start"}
-            assert connection.execute(text("SELECT platform_metadata FROM category_runs")).scalar_one() == {"native_id": "key"}
+            assert connection.execute(select(RawResponse.safe_params)).scalar_one() == {"cursor": "start"}
+            assert connection.execute(select(CategoryRun.platform_metadata)).scalar_one() == {"native_id": "key"}
     finally:
         database.close()

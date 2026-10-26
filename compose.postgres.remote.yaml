@@ -1,0 +1,48 @@
+# 采集器专用线上实例；凭证文件仅部署到服务器，不进入 Git。
+name: collector-postgres
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: collector-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: collector_admin
+      POSTGRES_DB: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: --auth-host=scram-sha-256
+    secrets:
+      - postgres_password
+    # 仅服务器回环地址可访问；本机通过 SSH 转发连接。
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - collector_data:/var/lib/postgresql/data
+    # 限制资源占用，避免影响同机商城和 Knowledge Hub 服务。
+    mem_limit: 512m
+    cpus: 1.0
+    shm_size: 128m
+    command:
+      - postgres
+      - -c
+      - max_connections=30
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U collector_admin -d postgres"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  collector_data:
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password

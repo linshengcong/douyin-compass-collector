@@ -8,6 +8,8 @@ browser:
   keep_open_after_manual_run: true
 platforms:
   taobao:
+    # 正式入口采用网页已发布规则，读取失败停止而不回退本地配置。
+    category_config_source: remote
     # 分类路径中任一层级名称命中即跳过；去掉首尾空白后精确匹配。
     category_blacklist:
       - 私处护理
@@ -55,6 +57,9 @@ tasks:
     enabled: true
     display_name: 淘宝洗护清洁实时榜
     schedule: "0 14 * * *"
+    filters:
+      # 两组共用远程淘宝分类、限页和商品过滤；先淘宝后天猫。
+      seller_platforms: [taobao, tmall]
     category_scope:
       mode: all_level1
       root_category_id: "50025705"

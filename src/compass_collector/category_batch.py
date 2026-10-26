@@ -313,6 +313,17 @@ def prepare_category_batch(
                 category="category_blacklist_empty",
             )
         discovery = replace(discovery, categories=tuple(retained_categories))
+        if task.platform == "taobao":
+            # 范围、排除及远程目录均先按真实分类处理，之后才展开两种店铺榜单。
+            from compass_collector.platforms.taobao_seller_scopes import split_seller_scopes
+            discovery = split_seller_scopes(discovery, task.filters.seller_platforms,
+                                            category_response.platform_metadata.get("seller_types"))
+        # 同一安全事件供终端、GUI 和调度显示本批次实际采用的规则。
+        from compass_collector.collection_rule_summary import collection_rule_summary
+        runtime_logger.emit(level="INFO", event="collection_rules_frozen",
+            message=f"[{task.id}] 本批次采集规则：{collection_rule_summary(config_snapshot)}",
+            stage="category_discovery", context=batch_context,
+            details={"rules_summary": collection_rule_summary(config_snapshot)})
         # 一级分类数量从发现结果去重得到，不制造虚假的批次根节点。
         level1_category_count = len(
             {category.level1_category_id for category in discovery.categories}

@@ -297,6 +297,13 @@ def run_packaged_smoke_test() -> int:
     # 创建 Engine 只加载 PostgreSQL 二进制驱动，不访问网络或创建数据库。
     smoke_engine = database_engine("postgresql+psycopg://localhost/packaged_smoke")
     smoke_engine.dispose()
+    from tempfile import TemporaryDirectory
+    from sqlalchemy.engine import URL
+    from compass_collector.persistence import upgrade_database
+
+    # 冻结包必须实际找到 SQLite 迁移资源并可离线建库；仅验证临时文件。
+    with TemporaryDirectory(prefix="collector-packaged-smoke-") as temporary_directory:
+        upgrade_database(URL.create("sqlite", database=str(Path(temporary_directory) / "smoke.sqlite3")), platform="compass")
     # Playwright driver 在启动时验证 PyInstaller 已收集 Node 与 driver 资源。
     from playwright.sync_api import sync_playwright
 

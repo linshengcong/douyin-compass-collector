@@ -1,6 +1,6 @@
 """Small platform interface consumed by serial task orchestration."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Iterator, Protocol
 
@@ -15,6 +15,8 @@ class DiscoveryCapture:
     discovery: CategoryDiscoveryResult
     # 原始分类响应只供本地审计保存。
     payload: dict[str, Any]
+    # 平台控件读取的安全业务值随发现返回；不含认证信息。
+    platform_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

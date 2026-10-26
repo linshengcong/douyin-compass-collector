@@ -459,7 +459,7 @@ def test_makefile_exposes_one_parameterized_collection_command() -> None:
     # Makefile 是日常执行入口的公开契约。
     makefile = Path("Makefile").read_text(encoding="utf-8")
 
-    assert "START ?= yes" in makefile
+    assert "START ?= $(if $(filter no,$(GUI)),yes,no)" in makefile
     assert "run:" in makefile
     assert "MODE ?= force" in makefile
     assert "GUI ?= yes" in makefile

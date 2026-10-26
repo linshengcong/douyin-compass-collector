@@ -94,6 +94,8 @@ def interrupted_batch(tmp_path, monkeypatch, request):
         monkeypatch.setattr(module, "datetime", FrozenDateTime)
     # 测试配置只连接每次创建的隔离 schema，不读取真实采集库。
     config = pg_config(load_config(Path("config/taobao.yaml" if platform == "taobao" else "config/tasks.yaml")), tmp_path).for_platform(platform)
+    # 本组专门覆盖历史 YAML 批次及回退全量，不依赖已切换的正式入口或真实远程 API。
+    config.platforms[platform].category_config_source = "yaml"
     config = config.model_copy(update={"tasks": [task], "browser": config.browser.model_copy(
         update={"keep_open_after_manual_run": False})})
     # 所有 raw、Manifest 和 CSV 进入 pytest 临时目录。
@@ -173,7 +175,8 @@ def test_continue_skips_success_and_publishes_same_batch(interrupted_batch):
         if config.execution_platform() == "compass":
             # 同时检查跳过分类和重采分类的金额/销量，防止抖音单位被错误恢复。
             rows = session.scalars(select(ProductRankEntryModel)).all()
-            assert all(row.pay_amount_min_value == 1000 and row.pay_combo_count_min_value == 10 for row in rows)
+            # Fixture 原始销量为 100 件，只有金额按分转元，销量不缩放。
+            assert all(row.pay_amount_min_value == 1000 and row.pay_combo_count_min_value == 100 for row in rows)
     assert list((prepared.storage.categories_dir / "attempts").glob("*/continue/page-001.json.gz"))
 
 

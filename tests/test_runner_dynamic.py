@@ -49,7 +49,11 @@ PLANNED_AT = datetime(2026, 7, 17, 14, 0, tzinfo=SHANGHAI_TIMEZONE)
 def temporary_config(tmp_path: Path) -> AppConfig:
     """Keep task settings while isolating each platform in PostgreSQL."""
     # 所有真实连接指向测试 schema，不触碰工程运行库。
-    return pg_config(load_config(Path("config/tasks.yaml")), tmp_path)
+    # 本组的浏览器 fixture 覆盖历史 YAML 执行；远程冻结在独立集成检查中验证。
+    config = pg_config(load_config(Path("config/tasks.yaml")), tmp_path)
+    for platform in config.platforms.values():
+        platform.category_config_source = "yaml"
+    return config
 
 
 def build_rank_payload(category_id: str) -> dict[str, Any]:

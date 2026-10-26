@@ -10,8 +10,8 @@ from compass_collector.persistence import Database, upgrade_database, normalize_
 from pg_support import pg_url
 
 
-@pytest.mark.parametrize("value", ["sqlite:///old.db", Path("old.db"), "mysql://user:secret@host/db", "not-a-url-secret"])
-def test_only_postgresql_urls_are_accepted_without_secret_echo(value):
+@pytest.mark.parametrize("value", ["sqlite:///:memory:", Path("old.db"), "mysql://user:secret@host/db", "not-a-url-secret"])
+def test_unsupported_database_urls_are_rejected_without_secret_echo(value):
     """Reject old paths and unsupported drivers with a safe error."""
     with pytest.raises(ValueError) as result:
         database_url(value)
@@ -43,6 +43,8 @@ def test_pg_baseline_has_native_partial_index_and_exact_numeric(tmp_path):
     """Verify PG's real index predicate and numeric precision after migration."""
     # 实际数据库检查防止 SQLite 方言参数在 PG 中被忽略。
     url = pg_url(tmp_path)
+    if url.get_backend_name() != "postgresql":
+        pytest.skip("native PostgreSQL schema check requires TEST_DATABASE_URL")
     upgrade_database(url, platform="compass")
     database = Database(url)
     try:
@@ -51,7 +53,7 @@ def test_pg_baseline_has_native_partial_index_and_exact_numeric(tmp_path):
         assert index["unique"]
         assert "compass" in index["dialect_options"]["postgresql_where"]
         with database.engine.connect() as connection:
-            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "pg0001_initial"
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == "pg0002_limits_shops"
             assert connection.execute(text("SELECT numeric_precision,numeric_scale FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='product_rank_entries' AND column_name='pay_amount_min_value'")).one() == (24, 4)
     finally:
         database.close()
